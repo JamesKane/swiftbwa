@@ -104,6 +104,7 @@ public actor BWAMemAligner {
                 try outputFile.write(record: record, header: header)
             } else {
                 for (regIdx, region) in regions.enumerated() {
+                    guard region.score >= options.scoring.minOutputScore else { continue }
                     let isPrimary = region.secondary < 0 && regIdx == 0
 
                     let genomeLen = index.genomeLength

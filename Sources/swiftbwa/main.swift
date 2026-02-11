@@ -94,31 +94,11 @@ struct Mem: AsyncParsableCommand {
         let outFile = try HTSFile(path: outputPath, mode: outputMode)
         try header.write(to: outFile)
 
-        for read in reads {
-            let regions = await aligner.alignRead(read)
-
-            if regions.isEmpty {
-                let record = try SAMOutputBuilder.buildUnmappedRecord(read: read)
-                try outFile.write(record: record, header: header)
-            } else {
-                for (regIdx, region) in regions.enumerated() {
-                    guard region.score >= scoring.minOutputScore else { continue }
-                    let isPrimary = region.secondary < 0 && regIdx == 0
-                    let alignLen = UInt32(region.qe - region.qb)
-                    let cigar = [alignLen << 4 | 0]  // M operation
-                    let record = try SAMOutputBuilder.buildRecord(
-                        read: read,
-                        region: region,
-                        allRegions: regions,
-                        metadata: index.metadata,
-                        scoring: scoring,
-                        cigar: cigar,
-                        isPrimary: isPrimary
-                    )
-                    try outFile.write(record: record, header: header)
-                }
-            }
-        }
+        try await aligner.alignBatch(
+            reads: reads,
+            outputFile: outFile,
+            header: header
+        )
 
         fputs("Done.\n", stderr)
     }
