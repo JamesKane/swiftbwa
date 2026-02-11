@@ -21,7 +21,7 @@
 
 ## Not yet implemented (vs bwa-mem2)
 
-- [ ] **Interleaved FASTQ (`-p`)** — Smart pairing from single interleaved file. Needs read-pair splitting in CLI.
+- [x] **Interleaved FASTQ (`-p`)** — `-p` flag deinterleaves single FASTQ into read1/read2 by index parity, feeds into existing `alignPairedBatch()`.
 - [ ] **Append FASTQ comment (`-C`)** — bwa-mem2 appends raw FASTQ comment as SAM tags. `ReadSequence.comment` field exists but not wired through output (htslib BAMRecord doesn't support raw tag injection).
 - [x] **Output all alignments (`-a`)** — Emit all above-threshold alignments as full SAM records with 0x100 flag instead of condensing into XA tag. XA tag skipped when `-a` is set.
 - [ ] **Manual insert size override (`-I`)** — Bypass estimation with user-provided mean, stddev, max, min.

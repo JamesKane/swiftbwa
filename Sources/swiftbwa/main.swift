@@ -108,6 +108,9 @@ struct Mem: AsyncParsableCommand {
     @Flag(name: [.customShort("a")], help: "Output all alignments for SE or unpaired PE")
     var outputAll: Bool = false
 
+    @Flag(name: .short, help: "First query file is interleaved paired-end")
+    var p: Bool = false
+
     @Argument(help: "Index prefix (reference genome)")
     var indexPrefix: String
 
@@ -164,7 +167,7 @@ struct Mem: AsyncParsableCommand {
 
         var options = BWAMemOptions()
         options.scoring = scoring
-        options.isPairedEnd = fastqFiles.count >= 2
+        options.isPairedEnd = fastqFiles.count >= 2 || p
         options.readGroupLine = readGroup
         options.ignoreAlt = j
 
@@ -197,8 +200,31 @@ struct Mem: AsyncParsableCommand {
         let outFile = try HTSFile(path: outputPath, mode: outputMode)
         try header.write(to: outFile)
 
-        if options.isPairedEnd {
-            // Paired-end mode
+        if p {
+            // Interleaved paired-end mode: single file, odd/even split
+            let allReads = try readFASTQ(path: fastqFiles[0])
+            guard allReads.count % 2 == 0 else {
+                throw BWAError.fileIOError(
+                    "Interleaved FASTQ has odd number of records: \(allReads.count)"
+                )
+            }
+            var reads1: [ReadSequence] = []
+            var reads2: [ReadSequence] = []
+            reads1.reserveCapacity(allReads.count / 2)
+            reads2.reserveCapacity(allReads.count / 2)
+            for i in stride(from: 0, to: allReads.count, by: 2) {
+                reads1.append(allReads[i])
+                reads2.append(allReads[i + 1])
+            }
+            fputs("Loaded \(reads1.count) paired reads (interleaved)\n", stderr)
+            fputs("Aligning paired-end...\n", stderr)
+
+            try await aligner.alignPairedBatch(
+                reads1: reads1, reads2: reads2,
+                outputFile: outFile, header: header
+            )
+        } else if options.isPairedEnd {
+            // Two-file paired-end mode
             let reads1 = try readFASTQ(path: fastqFiles[0])
             let reads2 = try readFASTQ(path: fastqFiles[1])
             guard reads1.count == reads2.count else {
