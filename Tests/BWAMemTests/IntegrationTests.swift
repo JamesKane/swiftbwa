@@ -101,7 +101,8 @@ func loadFASTQ(path: String) throws -> [ReadSequence] {
     var i = 0
     while i + 3 < lines.count {
         guard lines[i].hasPrefix("@") else { i += 1; continue }
-        let name = String(lines[i].dropFirst())  // strip @
+        let header = lines[i].dropFirst()  // strip @
+        let name = String(header.prefix(while: { $0 != " " && $0 != "\t" }))
         let seq = String(lines[i + 1])
         let qual = String(lines[i + 3])
         reads.append(ReadSequence(name: name, sequence: seq, qualityString: qual))
