@@ -17,7 +17,7 @@
 - [x] **Read group support** — `-R` flag accepts `@RG` header line, inserted verbatim via `addLines()`. `readGroupID` extracted and written as `RG` aux tag on all output records.
 - [x] **Clipping penalties** — `penClip5`/`penClip3` used in `ExtensionAligner.extend()` clip-vs-extend decision (bwa-mem2 logic). Creates split-read candidates when local alignment beats end-to-end minus clip penalty.
 - [x] **CLI flags** — Full bwa-mem2-compatible flag set: `-A` (match score + scaling), `-B`, `-O`/`-E` (separate ins/del), `-L` (clip penalties), `-U` (unpaired penalty), `-r` (seed split ratio), `-c` (max occurrences), `-D` (chain drop ratio), `-W` (min chain weight), `-m` (max mate rescue), `-h` (XA limits), `-M` (mark splits as secondary), `-Y` (soft-clip supplementary), `-5` (primary5 reorder), `-q` (keep supp MAPQ), `-S` (skip rescue), `-P` (skip pairing), `-j` (ignore ALT), `-H` (custom header lines).
-- [ ] **End-to-end integration tests** — Unit tests are solid but no full-pipeline tests (FASTQ in → SAM out) validated against bwa-mem2 output.
+- [x] **End-to-end integration tests** — 10 E2E tests (7 single-end, 3 paired-end) validate full pipeline (FASTQ in → SAM out) against bwa-mem2 gold-standard output on lambda phage. Uncovered and fixed two bugs: compressed SA resolution (BWT walk-back) and reverse-strand FLAG logic.
 
 ## Not yet implemented (vs bwa-mem2)
 

@@ -64,7 +64,7 @@ public actor BWAMemAligner {
         var chains = SeedChainer.chain(
             smems: smems,
             getSAEntry: { [index] pos in
-                index.suffixArray.entry(at: pos)
+                index.suffixArray.resolve(at: pos, bwt: index.bwt)
             },
             metadata: index.metadata,
             scoring: scoring,

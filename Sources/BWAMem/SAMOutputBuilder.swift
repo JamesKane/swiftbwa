@@ -125,11 +125,8 @@ public struct SAMOutputBuilder: Sendable {
             }
         }
 
-        if region.rb < metadata.totalLength && region.re > 0 {
-            let genomeLen = metadata.totalLength
-            if region.rb >= genomeLen {
-                flag.insert(.reverse)
-            }
+        if region.rb >= metadata.totalLength {
+            flag.insert(.reverse)
         }
         if isSupplementary {
             flag.insert(.supplementary)

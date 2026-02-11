@@ -37,12 +37,28 @@ public final class SuffixArray: @unchecked Sendable {
         }
     }
 
-    /// Get SA entry at position (uncompressed mode).
+    /// Get SA entry at a sampled position (direct array access).
+    /// Only valid when `pos` is a multiple of `1 << compressionShift`.
     @inlinable
     public func entry(at pos: Int64) -> Int64 {
         let idx = Int(pos)
         let ms = Int64(msBytes[idx]) & 0xFF
         let ls = Int64(lsWords[idx])
         return (ms << 32) | ls
+    }
+
+    /// Resolve SA entry at an arbitrary BWT position using walk-backs.
+    /// Implements bwa-mem2's `get_sa_entry64()`: walks through the BWT via
+    /// LF mapping until hitting a sampled position, then adds the step count.
+    @inlinable
+    public func resolve(at pos: Int64, bwt: BWT) -> Int64 {
+        let mask = Int64((1 << compressionShift) - 1)
+        var p = pos
+        var steps: Int64 = 0
+        while (p & mask) != 0 {
+            p = bwt.lfMapping(p)
+            steps += 1
+        }
+        return entry(at: p >> Int64(compressionShift)) + steps
     }
 }

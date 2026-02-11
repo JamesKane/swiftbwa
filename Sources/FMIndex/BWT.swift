@@ -71,4 +71,44 @@ public final class BWT: @unchecked Sendable {
         let matchMask = bitstring & oneHotMaskArray[y]
         return cpCount + Int64(matchMask.nonzeroBitCount)
     }
+
+    /// Get the BWT character at a position (0=A, 1=C, 2=G, 3=T).
+    /// Returns 4 for the sentinel position.
+    @inlinable
+    public func charAt(_ pos: Int64) -> UInt8 {
+        if pos == sentinelIndex { return 4 }
+
+        let cpIdx = Int(pos >> CP_SHIFT)
+        let bitPos = Int(pos & CP_MASK)
+        let checkpoint = checkpoints[cpIdx]
+
+        // Check which base's bitstring has a 1 at this position.
+        // Bit encoding: bit (63 - bitPos) corresponds to position bitPos.
+        let mask: UInt64 = 1 << (63 - bitPos)
+        if checkpoint.bitstrings.0 & mask != 0 { return 0 }
+        if checkpoint.bitstrings.1 & mask != 0 { return 1 }
+        if checkpoint.bitstrings.2 & mask != 0 { return 2 }
+        if checkpoint.bitstrings.3 & mask != 0 { return 3 }
+        return 4  // sentinel (shouldn't reach here if pos != sentinelIndex)
+    }
+
+    /// LF mapping: given BWT position, return the position of that character's
+    /// occurrence in the sorted first column. LF(pos) = C[c] + Occ(c, pos).
+    @inlinable
+    public func lfMapping(_ pos: Int64) -> Int64 {
+        let c = Int(charAt(pos))
+        guard c < 4 else {
+            // Sentinel: LF maps to position 0
+            return 0
+        }
+        let cCount: Int64
+        switch c {
+        case 0: cCount = count.0
+        case 1: cCount = count.1
+        case 2: cCount = count.2
+        case 3: cCount = count.3
+        default: return 0
+        }
+        return cCount + occ(pos, c)
+    }
 }
