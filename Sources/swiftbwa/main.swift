@@ -45,6 +45,9 @@ struct Mem: AsyncParsableCommand {
     @Option(name: [.customShort("T")], help: "Minimum alignment score to output")
     var minScore: Int32 = 30
 
+    @Option(name: [.customShort("R")], help: "Read group header line (@RG\\tID:...)")
+    var readGroup: String?
+
     @Option(name: .shortAndLong, help: "Output file [stdout]")
     var output: String?
 
@@ -71,6 +74,7 @@ struct Mem: AsyncParsableCommand {
         var options = BWAMemOptions()
         options.scoring = scoring
         options.isPairedEnd = fastqFiles.count >= 2
+        options.readGroupLine = readGroup
 
         // Load index
         fputs("Loading index from \(indexPrefix)...\n", stderr)
@@ -84,7 +88,9 @@ struct Mem: AsyncParsableCommand {
         let outputPath = output ?? "-"
 
         let aligner = BWAMemAligner(index: index, options: options)
-        let header = try SAMOutputBuilder.buildHeader(metadata: index.metadata)
+        let header = try SAMOutputBuilder.buildHeader(
+            metadata: index.metadata, readGroupLine: options.readGroupLine
+        )
         let outFile = try HTSFile(path: outputPath, mode: outputMode)
         try header.write(to: outFile)
 

@@ -981,3 +981,107 @@ struct MateRescueTests {
         #expect(rescued.isEmpty)
     }
 }
+
+// MARK: - Read Group Tests
+
+@Suite("Read Group Tests")
+struct ReadGroupTests {
+
+    @Test("readGroupID parses ID from RG line")
+    func testReadGroupIDParsing() {
+        var options = BWAMemOptions()
+        options.readGroupLine = "@RG\\tID:foo\\tSM:bar\\tPL:ILLUMINA"
+        #expect(options.readGroupID == "foo")
+    }
+
+    @Test("readGroupID returns nil when no read group set")
+    func testReadGroupIDNil() {
+        let options = BWAMemOptions()
+        #expect(options.readGroupID == nil)
+    }
+
+    @Test("readGroupID returns nil when ID field missing")
+    func testReadGroupIDMissingID() {
+        var options = BWAMemOptions()
+        options.readGroupLine = "@RG\\tSM:bar\\tPL:ILLUMINA"
+        #expect(options.readGroupID == nil)
+    }
+
+    @Test("buildRecord includes RG aux tag when readGroupID provided")
+    func testBuildRecordWithRG() throws {
+        let metadata = ReferenceMetadata(
+            totalLength: 10000, numSequences: 1,
+            annotations: [ReferenceAnnotation(offset: 0, length: 10000, name: "chr1")]
+        )
+
+        let region = MemAlnReg(
+            rb: 100, re: 200, qb: 0, qe: 100, rid: 0,
+            score: 100, trueScore: 100, sub: 0, w: 10
+        )
+
+        let read = ReadSequence(
+            name: "test_rg",
+            sequence: String(repeating: "A", count: 100),
+            qualityString: String(repeating: "I", count: 100)
+        )
+
+        let record = try SAMOutputBuilder.buildRecord(
+            read: read, region: region, allRegions: [region],
+            metadata: metadata, scoring: ScoringParameters(),
+            cigar: [100 << 4 | 0],
+            isPrimary: true,
+            readGroupID: "sample1"
+        )
+
+        let aux = record.auxiliaryData
+        let rgVal = aux.string(forTag: "RG")
+        #expect(rgVal == "sample1")
+    }
+
+    @Test("buildRecord has no RG tag when readGroupID is nil")
+    func testBuildRecordWithoutRG() throws {
+        let metadata = ReferenceMetadata(
+            totalLength: 10000, numSequences: 1,
+            annotations: [ReferenceAnnotation(offset: 0, length: 10000, name: "chr1")]
+        )
+
+        let region = MemAlnReg(
+            rb: 100, re: 200, qb: 0, qe: 100, rid: 0,
+            score: 100, trueScore: 100, sub: 0, w: 10
+        )
+
+        let read = ReadSequence(
+            name: "test_no_rg",
+            sequence: String(repeating: "A", count: 100),
+            qualityString: String(repeating: "I", count: 100)
+        )
+
+        let record = try SAMOutputBuilder.buildRecord(
+            read: read, region: region, allRegions: [region],
+            metadata: metadata, scoring: ScoringParameters(),
+            cigar: [100 << 4 | 0],
+            isPrimary: true
+        )
+
+        let aux = record.auxiliaryData
+        let rgVal = aux.string(forTag: "RG")
+        #expect(rgVal == nil)
+    }
+
+    @Test("buildUnmappedRecord includes RG tag when readGroupID provided")
+    func testUnmappedRecordWithRG() throws {
+        let read = ReadSequence(
+            name: "unmapped_rg",
+            sequence: "ACGT",
+            qualityString: "IIII"
+        )
+
+        let record = try SAMOutputBuilder.buildUnmappedRecord(
+            read: read, readGroupID: "sample2"
+        )
+
+        let aux = record.auxiliaryData
+        let rgVal = aux.string(forTag: "RG")
+        #expect(rgVal == "sample2")
+    }
+}

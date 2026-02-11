@@ -34,7 +34,10 @@ public struct PairedEndInfo: Sendable {
 public struct SAMOutputBuilder: Sendable {
 
     /// Build a SAM header from reference metadata.
-    public static func buildHeader(metadata: ReferenceMetadata) throws -> SAMHeader {
+    public static func buildHeader(
+        metadata: ReferenceMetadata,
+        readGroupLine: String? = nil
+    ) throws -> SAMHeader {
         let header = try SAMHeader()
 
         // @HD line
@@ -46,6 +49,12 @@ public struct SAMOutputBuilder: Sendable {
                 ("SN", ann.name),
                 ("LN", String(ann.length))
             ])
+        }
+
+        // @RG line (verbatim from user, with literal \t expanded)
+        if let rgLine = readGroupLine {
+            let expanded = rgLine.replacingOccurrences(of: "\\t", with: "\t")
+            try header.addLines(expanded)
         }
 
         // @PG line
@@ -77,7 +86,8 @@ public struct SAMOutputBuilder: Sendable {
         adjustedPos: Int64? = nil,
         pairedEnd: PairedEndInfo? = nil,
         saTag: String? = nil,
-        xaTag: String? = nil
+        xaTag: String? = nil,
+        readGroupID: String? = nil
     ) throws -> BAMRecord {
         let mapq = mapqOverride ?? MappingQuality.compute(
             region: region,
@@ -207,6 +217,9 @@ public struct SAMOutputBuilder: Sendable {
         if let xa = xaTag {
             try aux.updateString(tag: "XA", value: xa)
         }
+        if let rg = readGroupID {
+            try aux.updateString(tag: "RG", value: rg)
+        }
 
         return record
     }
@@ -289,7 +302,8 @@ public struct SAMOutputBuilder: Sendable {
     /// (e.g., by writing it to a file) rather than copying.
     public static func buildUnmappedRecord(
         read: ReadSequence,
-        pairedEnd: PairedEndInfo? = nil
+        pairedEnd: PairedEndInfo? = nil,
+        readGroupID: String? = nil
     ) throws -> BAMRecord {
         let seqStr = String(read.bases.map { b -> Character in
             switch b {
@@ -341,6 +355,11 @@ public struct SAMOutputBuilder: Sendable {
             seq: seqStr,
             qual: qualStr
         )
+
+        if let rg = readGroupID {
+            let aux = record.mutableAuxiliaryData
+            try aux.updateString(tag: "RG", value: rg)
+        }
 
         return record
     }

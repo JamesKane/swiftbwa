@@ -14,6 +14,6 @@
 ## Nice-to-have / advanced
 
 - [x] **ALT-aware alignment** — `.alt` file loading in `FMIndexLoader`, `isAlt` propagated through chain→region pipeline, two-phase `markSecondaryALT()` prevents ALT hits from suppressing primaries, `pa:f` tag output, ALT-aware XA limits (200), MAPQ cap skip for ALT supplementary hits.
-- [ ] **Read group support** — No `@RG` header line or RG tags on records.
+- [x] **Read group support** — `-R` flag accepts `@RG` header line, inserted verbatim via `addLines()`. `readGroupID` extracted and written as `RG` aux tag on all output records.
 - [x] **Clipping penalties** — `penClip5`/`penClip3` used in `ExtensionAligner.extend()` clip-vs-extend decision (bwa-mem2 logic). Creates split-read candidates when local alignment beats end-to-end minus clip penalty.
 - [ ] **End-to-end integration tests** — Unit tests are solid but no full-pipeline tests (FASTQ in → SAM out) validated against bwa-mem2 output.

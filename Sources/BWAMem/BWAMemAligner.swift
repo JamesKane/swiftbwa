@@ -216,11 +216,14 @@ public actor BWAMemAligner {
         }
 
         // Write output sequentially (ordered by input)
+        let rgID = options.readGroupID
         for (idx, regions) in results {
             let read = reads[idx]
 
             if regions.isEmpty {
-                let record = try SAMOutputBuilder.buildUnmappedRecord(read: read)
+                let record = try SAMOutputBuilder.buildUnmappedRecord(
+                    read: read, readGroupID: rgID
+                )
                 try outputFile.write(record: record, header: header)
             } else {
                 try emitSingleEndAlignments(
@@ -319,6 +322,7 @@ public actor BWAMemAligner {
         }
 
         // Phase 3: For each pair, resolve and write output
+        let rgID = options.readGroupID
         for i in 0..<pairCount {
             let read1 = reads1[i]
             let read2 = reads2[i]
@@ -342,9 +346,13 @@ public actor BWAMemAligner {
                     mateIsReverse: false, mateIsUnmapped: true,
                     tlen: 0
                 )
-                let rec1 = try SAMOutputBuilder.buildUnmappedRecord(read: read1, pairedEnd: pe1)
+                let rec1 = try SAMOutputBuilder.buildUnmappedRecord(
+                    read: read1, pairedEnd: pe1, readGroupID: rgID
+                )
                 try outputFile.write(record: rec1, header: header)
-                let rec2 = try SAMOutputBuilder.buildUnmappedRecord(read: read2, pairedEnd: pe2)
+                let rec2 = try SAMOutputBuilder.buildUnmappedRecord(
+                    read: read2, pairedEnd: pe2, readGroupID: rgID
+                )
                 try outputFile.write(record: rec2, header: header)
                 continue
             }
@@ -466,6 +474,7 @@ public actor BWAMemAligner {
         pairedEnd: PairedEndInfo? = nil
     ) throws {
         let scoring = options.scoring
+        let rgID = options.readGroupID
 
         // Pass 1: Classify regions into segments
         var segments: [AlnSegment] = []
@@ -523,7 +532,9 @@ public actor BWAMemAligner {
         }
 
         guard !segments.isEmpty else {
-            let record = try SAMOutputBuilder.buildUnmappedRecord(read: read, pairedEnd: pairedEnd)
+            let record = try SAMOutputBuilder.buildUnmappedRecord(
+                read: read, pairedEnd: pairedEnd, readGroupID: rgID
+            )
             try outputFile.write(record: record, header: header)
             return
         }
@@ -586,7 +597,8 @@ public actor BWAMemAligner {
                 adjustedPos: seg.cigarInfo.pos,
                 pairedEnd: pairedEnd,
                 saTag: saTag,
-                xaTag: seg.isPrimary ? xaTag : nil
+                xaTag: seg.isPrimary ? xaTag : nil,
+                readGroupID: rgID
             )
             try outputFile.write(record: record, header: header)
         }
@@ -645,6 +657,7 @@ public actor BWAMemAligner {
         let region = mappedRegions[0]
         let cigar = generateCIGAR(read: mappedRead, region: region)
         let (rid, localPos) = index.metadata.decodePosition(cigar.pos)
+        let rgID = options.readGroupID
 
         // Mapped read's PE info: mate is unmapped
         let mappedPE = PairedEndInfo(
@@ -668,23 +681,25 @@ public actor BWAMemAligner {
                     read: mappedRead, region: region, allRegions: mappedRegions,
                     metadata: index.metadata, scoring: options.scoring,
                     cigar: cigar.cigar, nm: cigar.nm, md: cigar.md,
-                    isPrimary: true, adjustedPos: cigar.pos, pairedEnd: mappedPE
+                    isPrimary: true, adjustedPos: cigar.pos, pairedEnd: mappedPE,
+                    readGroupID: rgID
                 )
                 try outputFile.write(record: rec1, header: header)
                 let rec2 = try SAMOutputBuilder.buildUnmappedRecord(
-                    read: unmappedRead, pairedEnd: unmappedPE
+                    read: unmappedRead, pairedEnd: unmappedPE, readGroupID: rgID
                 )
                 try outputFile.write(record: rec2, header: header)
             } else {
                 let rec1 = try SAMOutputBuilder.buildUnmappedRecord(
-                    read: unmappedRead, pairedEnd: unmappedPE
+                    read: unmappedRead, pairedEnd: unmappedPE, readGroupID: rgID
                 )
                 try outputFile.write(record: rec1, header: header)
                 let rec2 = try SAMOutputBuilder.buildRecord(
                     read: mappedRead, region: region, allRegions: mappedRegions,
                     metadata: index.metadata, scoring: options.scoring,
                     cigar: cigar.cigar, nm: cigar.nm, md: cigar.md,
-                    isPrimary: true, adjustedPos: cigar.pos, pairedEnd: mappedPE
+                    isPrimary: true, adjustedPos: cigar.pos, pairedEnd: mappedPE,
+                    readGroupID: rgID
                 )
                 try outputFile.write(record: rec2, header: header)
             }
