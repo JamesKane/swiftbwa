@@ -106,9 +106,54 @@ public actor BWAMemAligner {
                 for (regIdx, region) in regions.enumerated() {
                     let isPrimary = region.secondary < 0 && regIdx == 0
 
-                    // Build simple CIGAR (just M for now -- proper CIGAR from SW traceback TODO)
-                    let alignLen = UInt32(region.qe - region.qb)
-                    let cigar = [alignLen << 4 | CIGAROp.match.rawValue]
+                    let genomeLen = index.genomeLength
+                    let isReverse = region.rb >= genomeLen
+
+                    // Extract query and reference segments for global alignment
+                    let qb = Int(region.qb)
+                    let qe = Int(region.qe)
+
+                    let querySegment: [UInt8]
+                    if isReverse {
+                        let rc = read.reverseComplement()
+                        let rcQb = read.length - qe
+                        let rcQe = read.length - qb
+                        querySegment = Array(rc[rcQb..<rcQe])
+                    } else {
+                        querySegment = Array(read.bases[qb..<qe])
+                    }
+
+                    var rb = region.rb
+                    var re = region.re
+                    if isReverse {
+                        let fwdRb = 2 * genomeLen - re
+                        let fwdRe = 2 * genomeLen - rb
+                        rb = fwdRb
+                        re = fwdRe
+                    }
+                    let refLen = Int(re - rb)
+                    let safeRefLen = min(refLen, Int(index.packedRef.length - rb))
+                    let refSegment: [UInt8]
+                    if safeRefLen > 0 && rb >= 0 {
+                        refSegment = index.packedRef.subsequence(from: rb, length: safeRefLen)
+                    } else {
+                        refSegment = []
+                    }
+
+                    let cigarResult = CIGARGenerator.generate(
+                        querySegment: querySegment,
+                        refSegment: refSegment,
+                        qb: region.qb,
+                        qe: region.qe,
+                        readLength: read.length,
+                        isReverse: isReverse,
+                        trueScore: region.trueScore,
+                        initialW: region.w,
+                        scoring: options.scoring,
+                        refPos: rb
+                    )
+                    let cigar = cigarResult.cigar
+                    let nm = cigarResult.nm
 
                     let record = try SAMOutputBuilder.buildRecord(
                         read: read,
@@ -117,7 +162,9 @@ public actor BWAMemAligner {
                         metadata: index.metadata,
                         scoring: options.scoring,
                         cigar: cigar,
-                        isPrimary: isPrimary
+                        nm: nm,
+                        isPrimary: isPrimary,
+                        adjustedPos: cigarResult.pos
                     )
                     try outputFile.write(record: record, header: header)
                 }

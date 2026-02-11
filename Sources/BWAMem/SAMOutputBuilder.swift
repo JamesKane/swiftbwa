@@ -40,7 +40,9 @@ public struct SAMOutputBuilder: Sendable {
         metadata: ReferenceMetadata,
         scoring: ScoringParameters,
         cigar: [UInt32],
+        nm: Int32 = 0,
         isPrimary: Bool,
+        adjustedPos: Int64? = nil,
         mateRecord: (tid: Int32, pos: Int64, isReverse: Bool)? = nil
     ) throws -> BAMRecord {
         let mapq = MappingQuality.compute(
@@ -72,7 +74,9 @@ public struct SAMOutputBuilder: Sendable {
         }
 
         // Compute position in reference coordinates
-        let (rid, localPos) = metadata.decodePosition(region.rb)
+        // Use adjustedPos if provided (accounts for leading deletion squeeze)
+        let refPos = adjustedPos ?? region.rb
+        let (rid, localPos) = metadata.decodePosition(refPos)
 
         // Convert sequence to ASCII string
         let seqStr = String(read.bases.map { b -> Character in
@@ -111,7 +115,7 @@ public struct SAMOutputBuilder: Sendable {
         let aux = record.mutableAuxiliaryData
         try aux.updateInt(tag: "AS", value: Int64(region.score))
         try aux.updateInt(tag: "XS", value: Int64(region.sub))
-        try aux.updateInt(tag: "NM", value: 0)  // TODO: compute edit distance
+        try aux.updateInt(tag: "NM", value: Int64(nm))
 
         return record
     }
