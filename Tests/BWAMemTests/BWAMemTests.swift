@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 @testable import BWAMem
 @testable import BWACore
@@ -50,6 +51,217 @@ struct BWAMemTests {
 
         // Higher sub-optimal score should give lower MAPQ
         #expect(mapq1 < mapq2)
+    }
+
+    @Test("ScoringParameters ALT defaults")
+    func testScoringALTDefaults() {
+        let scoring = ScoringParameters()
+        #expect(scoring.maxXAHits == 5)
+        #expect(scoring.maxXAHitsAlt == 200)
+        #expect(scoring.xaDropRatio == 0.80)
+    }
+}
+
+// MARK: - ALT File Loading Tests
+
+@Suite("ALT Loading Tests")
+struct ALTLoadingTests {
+
+    @Test("loadAlt sets isAlt on matching annotations")
+    func testLoadAltSetsIsAlt() throws {
+        // Create temp directory with .alt file
+        let tmpDir = NSTemporaryDirectory() + "swiftbwa_test_alt_\(ProcessInfo.processInfo.processIdentifier)"
+        try FileManager.default.createDirectory(atPath: tmpDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: tmpDir) }
+
+        let prefix = tmpDir + "/test"
+        let altContent = "chr1_alt\nchr3_alt\n"
+        try altContent.write(toFile: prefix + ".alt", atomically: true, encoding: .utf8)
+
+        var metadata = ReferenceMetadata(
+            totalLength: 10000, numSequences: 4,
+            annotations: [
+                ReferenceAnnotation(offset: 0, length: 2500, name: "chr1"),
+                ReferenceAnnotation(offset: 2500, length: 2500, name: "chr1_alt"),
+                ReferenceAnnotation(offset: 5000, length: 2500, name: "chr2"),
+                ReferenceAnnotation(offset: 7500, length: 2500, name: "chr3_alt"),
+            ]
+        )
+
+        FMIndexLoader.loadAlt(from: prefix, metadata: &metadata)
+
+        #expect(metadata.annotations[0].isAlt == false)  // chr1
+        #expect(metadata.annotations[1].isAlt == true)   // chr1_alt
+        #expect(metadata.annotations[2].isAlt == false)  // chr2
+        #expect(metadata.annotations[3].isAlt == true)   // chr3_alt
+    }
+
+    @Test("loadAlt skips header lines starting with @")
+    func testLoadAltSkipsHeaders() throws {
+        let tmpDir = NSTemporaryDirectory() + "swiftbwa_test_alt2_\(ProcessInfo.processInfo.processIdentifier)"
+        try FileManager.default.createDirectory(atPath: tmpDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: tmpDir) }
+
+        let prefix = tmpDir + "/test"
+        let altContent = "@HD\tVN:1.0\nchr1_alt\n"
+        try altContent.write(toFile: prefix + ".alt", atomically: true, encoding: .utf8)
+
+        var metadata = ReferenceMetadata(
+            totalLength: 5000, numSequences: 2,
+            annotations: [
+                ReferenceAnnotation(offset: 0, length: 2500, name: "chr1"),
+                ReferenceAnnotation(offset: 2500, length: 2500, name: "chr1_alt"),
+            ]
+        )
+
+        FMIndexLoader.loadAlt(from: prefix, metadata: &metadata)
+
+        #expect(metadata.annotations[0].isAlt == false)
+        #expect(metadata.annotations[1].isAlt == true)
+    }
+
+    @Test("loadAlt is no-op when .alt file is missing")
+    func testLoadAltMissingFile() {
+        var metadata = ReferenceMetadata(
+            totalLength: 5000, numSequences: 1,
+            annotations: [ReferenceAnnotation(offset: 0, length: 5000, name: "chr1")]
+        )
+
+        FMIndexLoader.loadAlt(from: "/nonexistent/path/test", metadata: &metadata)
+
+        #expect(metadata.annotations[0].isAlt == false)
+    }
+
+    @Test("loadAlt handles tab-delimited lines")
+    func testLoadAltTabDelimited() throws {
+        let tmpDir = NSTemporaryDirectory() + "swiftbwa_test_alt3_\(ProcessInfo.processInfo.processIdentifier)"
+        try FileManager.default.createDirectory(atPath: tmpDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: tmpDir) }
+
+        let prefix = tmpDir + "/test"
+        let altContent = "chr1_alt\textra_field\nchr2\tmore_stuff\n"
+        try altContent.write(toFile: prefix + ".alt", atomically: true, encoding: .utf8)
+
+        var metadata = ReferenceMetadata(
+            totalLength: 5000, numSequences: 2,
+            annotations: [
+                ReferenceAnnotation(offset: 0, length: 2500, name: "chr1_alt"),
+                ReferenceAnnotation(offset: 2500, length: 2500, name: "chr2"),
+            ]
+        )
+
+        FMIndexLoader.loadAlt(from: prefix, metadata: &metadata)
+
+        #expect(metadata.annotations[0].isAlt == true)
+        #expect(metadata.annotations[1].isAlt == true)
+    }
+}
+
+// MARK: - ALT Output Tests
+
+@Suite("ALT Output Tests")
+struct ALTOutputTests {
+
+    @Test("pa tag is present when altSc > 0")
+    func testPaTagPresent() throws {
+        let metadata = ReferenceMetadata(
+            totalLength: 10000, numSequences: 1,
+            annotations: [ReferenceAnnotation(offset: 0, length: 10000, name: "chr1")]
+        )
+
+        var region = MemAlnReg(
+            rb: 100, re: 200, qb: 0, qe: 100, rid: 0,
+            score: 80, trueScore: 80, sub: 0, w: 10
+        )
+        region.altSc = 120  // ALT competitor score
+
+        let read = ReadSequence(
+            name: "test_pa",
+            sequence: String(repeating: "A", count: 100),
+            qualityString: String(repeating: "I", count: 100)
+        )
+
+        let record = try SAMOutputBuilder.buildRecord(
+            read: read, region: region, allRegions: [region],
+            metadata: metadata, scoring: ScoringParameters(),
+            cigar: [100 << 4 | 0],
+            isPrimary: true
+        )
+
+        // The pa tag should be present as a float
+        let aux = record.auxiliaryData
+        let paVal = aux.float(forTag: "pa")
+        #expect(paVal != nil)
+        // pa = score / altSc = 80 / 120 ≈ 0.667
+        if let pa = paVal {
+            #expect(pa > 0.6 && pa < 0.7)
+        }
+    }
+
+    @Test("pa tag is absent when altSc == 0")
+    func testPaTagAbsent() throws {
+        let metadata = ReferenceMetadata(
+            totalLength: 10000, numSequences: 1,
+            annotations: [ReferenceAnnotation(offset: 0, length: 10000, name: "chr1")]
+        )
+
+        let region = MemAlnReg(
+            rb: 100, re: 200, qb: 0, qe: 100, rid: 0,
+            score: 80, trueScore: 80, sub: 0, w: 10
+        )
+
+        let read = ReadSequence(
+            name: "test_no_pa",
+            sequence: String(repeating: "A", count: 100),
+            qualityString: String(repeating: "I", count: 100)
+        )
+
+        let record = try SAMOutputBuilder.buildRecord(
+            read: read, region: region, allRegions: [region],
+            metadata: metadata, scoring: ScoringParameters(),
+            cigar: [100 << 4 | 0],
+            isPrimary: true
+        )
+
+        let aux = record.auxiliaryData
+        let paVal = aux.float(forTag: "pa")
+        #expect(paVal == nil)
+    }
+
+    @Test("XA tag uses maxXAHitsAlt (200) when ALT secondaries present")
+    func testXATagALTLimit() {
+        // With ALT secondaries, up to 200 are allowed
+        let secondaries: [(rname: String, pos: Int64, isReverse: Bool,
+                           cigarString: String, nm: Int32)] = (0..<10).map { i in
+            (rname: "chr1_alt", pos: Int64(i * 100), isReverse: false,
+             cigarString: "100M", nm: Int32(0))
+        }
+
+        // With maxHits=200 (ALT limit), 10 secondaries should be included
+        let xa = SAMOutputBuilder.buildXATag(secondaries: secondaries, maxHits: 200)
+        #expect(xa != nil)
+
+        // With maxHits=5 (normal limit), 10 secondaries should be nil
+        let xaNormal = SAMOutputBuilder.buildXATag(secondaries: secondaries, maxHits: 5)
+        #expect(xaNormal == nil)
+    }
+
+    @Test("altSc tracking: primary records ALT competitor score")
+    func testAltScTracking() {
+        // Two overlapping regions: ALT with score 120, primary with score 80
+        var regions = [
+            MemAlnReg(rb: 0, re: 100, qb: 0, qe: 100, score: 120),
+            MemAlnReg(rb: 200, re: 300, qb: 0, qe: 100, score: 80),
+        ]
+        regions[0].isAlt = true
+        regions[1].isAlt = false
+
+        ChainFilter.markSecondaryALT(
+            regions: &regions, maskLevel: 0.50, scoring: ScoringParameters()
+        )
+
+        let primaryRegion = regions.first { !$0.isAlt }!
+        #expect(primaryRegion.altSc == 120)
     }
 }
 

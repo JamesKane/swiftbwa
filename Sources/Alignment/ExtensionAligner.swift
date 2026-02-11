@@ -47,6 +47,7 @@ public struct ExtensionAligner: Sendable {
             var reg = MemAlnReg()
             reg.w = bandWidth
             reg.rid = chain.rid
+            reg.isAlt = chain.isAlt
             reg.seedCov = seed.len
             reg.seedLen0 = Int32(seeds.count)
 

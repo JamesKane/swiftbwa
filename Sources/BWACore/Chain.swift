@@ -14,14 +14,18 @@ public struct MemChain: Sendable {
     public var first: Int32
     /// Reference start of the first seed
     public var pos: Int64
+    /// Whether this chain maps to an ALT contig
+    public var isAlt: Bool
 
     public init(seeds: [MemSeed] = [], weight: Int32 = 0, rid: Int32 = -1,
-                kept: Int32 = 0, first: Int32 = -1, pos: Int64 = 0) {
+                kept: Int32 = 0, first: Int32 = -1, pos: Int64 = 0,
+                isAlt: Bool = false) {
         self.seeds = seeds
         self.weight = weight
         self.rid = rid
         self.kept = kept
         self.first = first
         self.pos = pos
+        self.isAlt = isAlt
     }
 }

@@ -28,6 +28,12 @@ public struct ScoringParameters: Sendable {
     public var penClip3: Int32 = 5
     /// Flag bits (controls algorithm behavior)
     public var flag: Int32 = 0
+    /// Maximum XA hits for primary-only secondaries
+    public var maxXAHits: Int32 = 5
+    /// Maximum XA hits when ALT secondaries are present
+    public var maxXAHitsAlt: Int32 = 200
+    /// XA drop ratio threshold
+    public var xaDropRatio: Float = 0.80
 
     /// -M: Mark shorter split hits as secondary instead of supplementary
     public static let flagNoMulti: Int32 = 0x10

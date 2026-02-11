@@ -93,8 +93,24 @@ public actor BWAMemAligner {
             regions.append(contentsOf: chainRegions)
         }
 
-        // Phase 5: Mark secondary alignments
-        ChainFilter.markSecondary(regions: &regions, maskLevel: scoring.maskLevel)
+        // Safety net: ensure isAlt is set from metadata (matches bwa-mem2 line 1166-1167)
+        for i in 0..<regions.count {
+            if regions[i].rid >= 0
+                && regions[i].rid < index.metadata.numSequences
+                && index.metadata.annotations[Int(regions[i].rid)].isAlt {
+                regions[i].isAlt = true
+            }
+        }
+
+        // Phase 5: Mark secondary alignments (ALT-aware if any ALT regions)
+        let hasAlt = regions.contains { $0.isAlt }
+        if hasAlt {
+            ChainFilter.markSecondaryALT(
+                regions: &regions, maskLevel: scoring.maskLevel, scoring: scoring
+            )
+        } else {
+            ChainFilter.markSecondary(regions: &regions, maskLevel: scoring.maskLevel)
+        }
 
         return regions
     }
@@ -512,10 +528,12 @@ public actor BWAMemAligner {
             return
         }
 
-        // Cap supplementary MAPQ at primary's MAPQ
+        // Cap supplementary MAPQ at primary's MAPQ, except for ALT hits
         let primaryMapq = segments[0].mapq
         for i in 1..<segments.count {
-            segments[i].mapq = min(segments[i].mapq, primaryMapq)
+            if !regions[segments[i].regionIndex].isAlt {
+                segments[i].mapq = min(segments[i].mapq, primaryMapq)
+            }
         }
 
         // Build SA tag info from all non-secondary segments
@@ -528,7 +546,21 @@ public actor BWAMemAligner {
             }
 
         // Build XA tag from qualifying secondaries (on primary record only)
-        let xaTag = SAMOutputBuilder.buildXATag(secondaries: secondaryInfos)
+        // Use higher XA limit when ALT secondaries are present
+        let hasAltSecondary = secondaryInfos.contains { sec in
+            // Check if any secondary region is ALT
+            regions.contains { r in
+                r.secondary >= 0 && r.isAlt
+                    && index.metadata.annotations.indices.contains(Int(r.rid))
+                    && index.metadata.annotations[Int(r.rid)].name == sec.rname
+            }
+        }
+        let effectiveMaxXA = hasAltSecondary
+            ? Int(scoring.maxXAHitsAlt)
+            : Int(scoring.maxXAHits)
+        let xaTag = SAMOutputBuilder.buildXATag(
+            secondaries: secondaryInfos, maxHits: effectiveMaxXA
+        )
 
         // Pass 2: Emit records
         for (segIdx, seg) in segments.enumerated() {

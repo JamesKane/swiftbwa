@@ -7,13 +7,13 @@
 
 ## Important (real-world usability)
 
-- [ ] **Paired-end alignment** — `PairedEndResolver` and `InsertSizeEstimator` exist but are unwired. Missing: mate rescue, insert size inference, TLEN, proper pair orientation, MC tag.
-- [ ] **CLI parallelization** — Actor + TaskGroup infrastructure exists in `alignBatch()` but CLI processes reads serially. Wire up batching and honor `-t` thread flag.
-- [ ] **Supplementary/chimeric alignments** — No SA or XA tag generation. All non-primary alignments are secondary, never supplementary. No split-read detection.
+- [x] **Paired-end alignment** — `alignPairedBatch()` wired into CLI. `PairedEndResolver` resolves best pair, `InsertSizeEstimator` infers distribution, TLEN set, proper-pair flagged, MC tag written. Mate rescue implemented (`MateRescue.rescue()` via `LocalSWAligner`) as Phase 2.5 in the paired-end pipeline.
+- [~] **CLI parallelization** — `alignBatch()`/`alignPairedBatch()` use TaskGroup; reads DO run concurrently. Remaining gap: `-t` flag is stored in `ScoringParameters.numThreads` but **never limits concurrency** — all reads launch as concurrent tasks regardless of `-t` value.
+- [x] **Supplementary/chimeric alignments** — Two-pass output classification (primary/supplementary/secondary) in `BWAMemAligner.emitSingleEndAlignments()`. SA and XA tag generation. Hard-clip conversion for supplementary records. MAPQ capping. Paired-end path emits supplementary alignments with proper mate info.
 
 ## Nice-to-have / advanced
 
-- [ ] **ALT-aware alignment** — `MemAlnReg.isAlt` field exists but always `false`. No `.alt` file loading or ALT-contig logic.
+- [x] **ALT-aware alignment** — `.alt` file loading in `FMIndexLoader`, `isAlt` propagated through chain→region pipeline, two-phase `markSecondaryALT()` prevents ALT hits from suppressing primaries, `pa:f` tag output, ALT-aware XA limits (200), MAPQ cap skip for ALT supplementary hits.
 - [ ] **Read group support** — No `@RG` header line or RG tags on records.
-- [ ] **Clipping penalties** — `penClip5`/`penClip3` in `ScoringParameters` are unused in scoring decisions.
+- [x] **Clipping penalties** — `penClip5`/`penClip3` used in `ExtensionAligner.extend()` clip-vs-extend decision (bwa-mem2 logic). Creates split-read candidates when local alignment beats end-to-end minus clip penalty.
 - [ ] **End-to-end integration tests** — Unit tests are solid but no full-pipeline tests (FASTQ in → SAM out) validated against bwa-mem2 output.

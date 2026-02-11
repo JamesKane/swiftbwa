@@ -676,6 +676,137 @@ struct AlignmentTests {
         #expect(reg.qe <= 40)
     }
 
+    // MARK: - ALT-Aware Chain Filter Tests
+
+    @Test("ChainFilter.filter does not suppress primary chain overlapping ALT chain")
+    func testChainFilterALTPreservesPrimary() {
+        // ALT chain (i=0) has higher weight, primary chain (j=1) overlaps it.
+        // The primary chain should NOT be suppressed even though it overlaps the ALT.
+        var chains = [
+            MemChain(
+                seeds: [MemSeed(rbeg: 0, qbeg: 0, len: 30, score: 30)],
+                weight: 30, rid: 0, kept: 3, isAlt: true
+            ),
+            MemChain(
+                seeds: [MemSeed(rbeg: 100, qbeg: 5, len: 20, score: 20)],
+                weight: 20, rid: 1, kept: 3, isAlt: false
+            ),
+        ]
+        let scoring = ScoringParameters()
+        ChainFilter.filter(chains: &chains, scoring: scoring)
+
+        // Both chains should survive: primary is protected from ALT suppression
+        #expect(chains.count == 2)
+    }
+
+    @Test("ChainFilter.filter suppresses ALT chain overlapping higher-weight ALT")
+    func testChainFilterALTSuppressesALT() {
+        // Two ALT chains: higher-weight one suppresses lower-weight overlapping one
+        var chains = [
+            MemChain(
+                seeds: [MemSeed(rbeg: 0, qbeg: 0, len: 30, score: 30)],
+                weight: 30, rid: 0, kept: 3, isAlt: true
+            ),
+            MemChain(
+                seeds: [MemSeed(rbeg: 100, qbeg: 5, len: 20, score: 20)],
+                weight: 10, rid: 1, kept: 3, isAlt: true  // low weight, will be removed by min weight filter
+            ),
+        ]
+        let scoring = ScoringParameters()
+        ChainFilter.filter(chains: &chains, scoring: scoring)
+
+        // Low weight ALT removed by minimum weight filter (< minSeedLength=19)
+        #expect(chains.count == 1)
+        #expect(chains[0].isAlt == true)
+        #expect(chains[0].weight == 30)
+    }
+
+    @Test("markSecondaryALT: primary hit stays primary even with higher-scoring ALT")
+    func testMarkSecondaryALTPrimaryPreserved() {
+        // ALT hit with score 100, primary hit with score 80, overlapping query ranges
+        var regions = [
+            MemAlnReg(rb: 0, re: 100, qb: 0, qe: 100, score: 100),
+            MemAlnReg(rb: 200, re: 300, qb: 0, qe: 100, score: 80),
+        ]
+        regions[0].isAlt = true
+        regions[1].isAlt = false
+
+        let scoring = ScoringParameters()
+        ChainFilter.markSecondaryALT(
+            regions: &regions, maskLevel: 0.50, scoring: scoring
+        )
+
+        // After Phase 2 re-marking among primary-only, the primary hit
+        // should have secondary == -1 (it's the only primary)
+        let primaryRegion = regions.first { !$0.isAlt }!
+        #expect(primaryRegion.secondary == -1)
+    }
+
+    @Test("markSecondaryALT tracks altSc for primary with ALT competitor")
+    func testMarkSecondaryALTAltSc() {
+        // Primary hit that overlaps with a higher-scoring ALT hit
+        var regions = [
+            MemAlnReg(rb: 0, re: 100, qb: 0, qe: 100, score: 120),
+            MemAlnReg(rb: 200, re: 300, qb: 0, qe: 100, score: 80),
+        ]
+        regions[0].isAlt = true
+        regions[1].isAlt = false
+
+        let scoring = ScoringParameters()
+        ChainFilter.markSecondaryALT(
+            regions: &regions, maskLevel: 0.50, scoring: scoring
+        )
+
+        // The primary hit should record the ALT competitor's score
+        let primaryRegion = regions.first { !$0.isAlt }!
+        #expect(primaryRegion.altSc == 120)
+    }
+
+    @Test("markSecondaryALT: pure primary regions behave like markSecondary")
+    func testMarkSecondaryALTNonMixed() {
+        // No ALT regions: secondaryAll should equal secondary
+        var regions = [
+            MemAlnReg(rb: 0, re: 100, qb: 0, qe: 100, score: 100),
+            MemAlnReg(rb: 10, re: 90, qb: 10, qe: 90, score: 50),
+        ]
+
+        let scoring = ScoringParameters()
+        ChainFilter.markSecondaryALT(
+            regions: &regions, maskLevel: 0.50, scoring: scoring
+        )
+
+        // First should be primary
+        #expect(regions[0].secondary == -1)
+        // Second should be secondary of first
+        #expect(regions[1].secondary == 0)
+        // secondaryAll should match secondary when no ALT
+        #expect(regions[0].secondaryAll == -1)
+        #expect(regions[1].secondaryAll == regions[1].secondary)
+    }
+
+    @Test("markSecondaryCore ALT-aware subN logic")
+    func testMarkSecondaryALTSubN() {
+        // Two overlapping hits: primary and ALT
+        // subN should only increment when (primary.isAlt || !secondary.isAlt)
+        var regions = [
+            MemAlnReg(rb: 0, re: 100, qb: 0, qe: 100, score: 100),
+            MemAlnReg(rb: 200, re: 300, qb: 0, qe: 100, score: 95),
+        ]
+        regions[0].isAlt = false
+        regions[1].isAlt = true
+
+        let scoring = ScoringParameters()
+        ChainFilter.markSecondaryALT(
+            regions: &regions, maskLevel: 0.50, scoring: scoring
+        )
+
+        // In Phase 1: primary hit (score 100) encounters ALT hit (score 95)
+        // Since primary.isAlt=false and secondary.isAlt=true, the condition
+        // (primary.isAlt || !secondary.isAlt) is false, so subN should NOT increment
+        let primaryRegion = regions.first { !$0.isAlt }!
+        #expect(primaryRegion.subN == 0)
+    }
+
     @Test("ExtensionAligner extends to read boundary with high penClip")
     func testExtensionAlignerExtendsWithHighPenClip() {
         // With a very high clip penalty, extension should prefer extending

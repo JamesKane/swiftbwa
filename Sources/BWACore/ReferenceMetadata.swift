@@ -14,15 +14,19 @@ public struct ReferenceAnnotation: Sendable {
     public var name: String
     /// Annotation string (e.g., description line)
     public var anno: String
+    /// Whether this sequence is an ALT contig
+    public var isAlt: Bool
 
     public init(offset: Int64 = 0, length: Int32 = 0, nAmb: Int32 = 0,
-                gi: UInt32 = 0, name: String = "", anno: String = "") {
+                gi: UInt32 = 0, name: String = "", anno: String = "",
+                isAlt: Bool = false) {
         self.offset = offset
         self.length = length
         self.nAmb = nAmb
         self.gi = gi
         self.name = name
         self.anno = anno
+        self.isAlt = isAlt
     }
 }
 

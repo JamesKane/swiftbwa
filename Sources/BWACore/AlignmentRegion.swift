@@ -36,6 +36,10 @@ public struct MemAlnReg: Sendable {
     public var flapLen: Int32 = 0
     /// Whether this is an ALT hit
     public var isAlt: Bool = false
+    /// Best ALT hit score (when this is a primary hit that has an ALT competitor)
+    public var altSc: Int32 = 0
+    /// Secondary index from Phase 1 (all-hits) marking, before primary-only re-ranking
+    public var secondaryAll: Int32 = -1
 
     public init(rb: Int64 = 0, re: Int64 = 0, qb: Int32 = 0, qe: Int32 = 0,
                 rid: Int32 = -1, score: Int32 = 0, trueScore: Int32 = 0,

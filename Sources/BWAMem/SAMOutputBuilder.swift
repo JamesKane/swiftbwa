@@ -197,6 +197,10 @@ public struct SAMOutputBuilder: Sendable {
         if let pe = pairedEnd, let mc = pe.mateCigarString {
             try aux.updateString(tag: "MC", value: mc)
         }
+        if region.altSc > 0 {
+            let paValue = Float(region.score) / Float(region.altSc)
+            try aux.updateFloat(tag: "pa", value: paValue)
+        }
         if let sa = saTag {
             try aux.updateString(tag: "SA", value: sa)
         }

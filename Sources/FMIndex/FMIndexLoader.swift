@@ -9,7 +9,8 @@ public struct FMIndexLoader: Sendable {
         let bwtResult = try loadBWT(from: prefix)
         let sa = try loadSA(from: prefix, referenceSeqLen: bwtResult.length)
         let pac = try loadPac(from: prefix)
-        let metadata = try loadMetadata(from: prefix)
+        var metadata = try loadMetadata(from: prefix)
+        loadAlt(from: prefix, metadata: &metadata)
 
         return FMIndex(bwt: bwtResult, suffixArray: sa, packedRef: pac, metadata: metadata)
     }
@@ -180,6 +181,31 @@ public struct FMIndexLoader: Sendable {
             length: pacLen,
             ownedBase: UnsafeMutableRawPointer(buffer)
         )
+    }
+
+    // MARK: - .alt Loading
+
+    /// Load ALT contig annotations from .alt file.
+    /// Lines starting with `@` are headers and skipped. Each other line's first
+    /// field (before tab) is matched against annotation names to set `isAlt`.
+    public static func loadAlt(from prefix: String, metadata: inout ReferenceMetadata) {
+        let altPath = prefix + ".alt"
+        guard let content = try? String(contentsOfFile: altPath, encoding: .utf8) else { return }
+
+        // Build name -> index lookup
+        var nameToIdx: [String: Int] = [:]
+        for (i, ann) in metadata.annotations.enumerated() {
+            nameToIdx[ann.name] = i
+        }
+
+        // Parse .alt file: each line's first field (before tab) is a sequence name
+        for line in content.split(separator: "\n") {
+            let name = String(line.prefix(while: { $0 != "\t" && $0 != "\r" }))
+            guard !name.isEmpty && !name.hasPrefix("@") else { continue }
+            if let idx = nameToIdx[name] {
+                metadata.annotations[idx].isAlt = true
+            }
+        }
     }
 
     // MARK: - .ann/.amb Loading

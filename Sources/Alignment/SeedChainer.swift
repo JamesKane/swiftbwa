@@ -49,6 +49,7 @@ public struct SeedChainer: Sendable {
                 }
 
                 let rid = metadata.sequenceID(for: min(rbeg, genomeLen - 1))
+                let isAltContig = metadata.annotations[Int(rid)].isAlt
 
                 let seed = MemSeed(
                     rbeg: refPos,
@@ -82,6 +83,7 @@ public struct SeedChainer: Sendable {
                     chain.rid = rid
                     chain.pos = refPos
                     chain.kept = 3
+                    chain.isAlt = isAltContig
                     chains.append(chain)
                 }
 
