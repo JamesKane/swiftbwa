@@ -90,8 +90,8 @@ struct Mem: AsyncParsableCommand {
 
         if options.isPairedEnd {
             // Paired-end mode
-            let reads1 = try parseFASTQ(path: fastqFiles[0])
-            let reads2 = try parseFASTQ(path: fastqFiles[1])
+            let reads1 = try readFASTQ(path: fastqFiles[0])
+            let reads2 = try readFASTQ(path: fastqFiles[1])
             guard reads1.count == reads2.count else {
                 throw BWAError.fileIOError(
                     "R1 and R2 have different read counts: "
@@ -107,7 +107,7 @@ struct Mem: AsyncParsableCommand {
             )
         } else {
             // Single-end mode
-            let reads = try parseFASTQ(path: fastqFiles[0])
+            let reads = try readFASTQ(path: fastqFiles[0])
             fputs("Loaded \(reads.count) reads from \(fastqFiles[0])\n", stderr)
             fputs("Aligning...\n", stderr)
 
@@ -122,42 +122,31 @@ struct Mem: AsyncParsableCommand {
     }
 }
 
-// MARK: - Simple FASTQ Parser
+// MARK: - FASTQ Reader
 
-func parseFASTQ(path: String) throws -> [ReadSequence] {
-    guard let data = FileManager.default.contents(atPath: path),
-          let content = String(data: data, encoding: .utf8) else {
-        throw BWAError.fileIOError("Cannot read FASTQ file: \(path)")
-    }
+func readFASTQ(path: String) throws -> [ReadSequence] {
+    let file = try HTSFile(path: path, mode: "r")
+    let header = try file.samHeader()
+    let iterator = file.samIterator(header: header)
 
     var reads: [ReadSequence] = []
-    let lines = content.split(separator: "\n", omittingEmptySubsequences: false)
-    var i = 0
+    while let record = iterator.next() {
+        let name = record.queryName
+        let seq = record.sequence
+        let quals = record.qualities
 
-    while i + 3 < lines.count {
-        let header = lines[i]
-        let sequence = lines[i + 1]
-        let qualStr = lines[i + 3]
-
-        guard header.hasPrefix("@") else {
-            i += 1
-            continue
+        let bases: [UInt8] = (0..<seq.count).map { i in
+            switch seq[i] {
+            case "A", "a": return 0
+            case "C", "c": return 1
+            case "G", "g": return 2
+            case "T", "t": return 3
+            default:       return 4  // N
+            }
         }
+        let qualities: [UInt8] = (0..<quals.count).map { quals[$0] }
 
-        let name = String(header.dropFirst().split(separator: " ", maxSplits: 1).first ?? "")
-        let comment = header.contains(" ")
-            ? String(header.dropFirst().split(separator: " ", maxSplits: 1).last ?? "")
-            : ""
-
-        let read = ReadSequence(
-            name: name,
-            sequence: String(sequence),
-            qualityString: String(qualStr),
-            comment: comment
-        )
-        reads.append(read)
-        i += 4
+        reads.append(ReadSequence(name: name, bases: bases, qualities: qualities))
     }
-
     return reads
 }
