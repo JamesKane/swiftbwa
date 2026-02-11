@@ -1154,4 +1154,370 @@ struct AlignmentTests {
         #expect(regions[1].score == 40)
         #expect(regions[2].score == 20)
     }
+
+    // MARK: - Bug 1: AS Score Double-Counting Tests
+
+    @Test("Extension score correct when seed covers entire read (no double-counting)")
+    func testExtensionScoreSeedOnly() {
+        // Seed covers entire 10bp read: qbeg=0, len=10.
+        // Neither left nor right extension runs, so score = 0 + 10*1 + 0 = 10.
+        let scoring = ScoringParameters()
+        let seed = MemSeed(rbeg: 100, qbeg: 0, len: 10, score: 10)
+        let chain = MemChain(seeds: [seed], weight: 10, rid: 0, kept: 3)
+
+        let readBases = [UInt8](repeating: 0, count: 10)  // 10bp all A's
+        let read = ReadSequence(
+            name: "test", bases: readBases,
+            qualities: [UInt8](repeating: 30, count: 10)
+        )
+        let refBases = [UInt8](repeating: 0, count: 200)
+
+        let regions = ExtensionAligner.extend(
+            chain: chain, read: read,
+            getReference: { pos, length in
+                let start = max(0, Int(pos))
+                let end = min(refBases.count, start + length)
+                return Array(refBases[start..<end])
+            },
+            scoring: scoring
+        )
+
+        #expect(!regions.isEmpty)
+        // No extensions run → score = 0 + 10*1 + 0 = 10. Correct.
+        #expect(regions[0].score == 10)
+    }
+
+    @Test("Extension score correct when left extension runs")
+    func testExtensionScoreLeftOnly() {
+        // 5bp seed at read positions 5-10, 5bp left flank, no right flank.
+        // Perfect match reference. All 10 bases match → score = 10.
+        var scoring = ScoringParameters()
+        scoring.penClip5 = 100  // Force extend-to-end
+
+        let seed = MemSeed(rbeg: 105, qbeg: 5, len: 5, score: 5)
+        let chain = MemChain(seeds: [seed], weight: 5, rid: 0, kept: 3)
+
+        let readBases = [UInt8](repeating: 0, count: 10)
+        let read = ReadSequence(
+            name: "test", bases: readBases,
+            qualities: [UInt8](repeating: 30, count: 10)
+        )
+        let refBases = [UInt8](repeating: 0, count: 200)
+
+        let regions = ExtensionAligner.extend(
+            chain: chain, read: read,
+            getReference: { pos, length in
+                let start = max(0, Int(pos))
+                let end = min(refBases.count, start + length)
+                return Array(refBases[start..<end])
+            },
+            scoring: scoring
+        )
+
+        #expect(!regions.isEmpty)
+        let reg = regions[0]
+        // h0 subtracted from left extension score → no double-counting
+        #expect(reg.score == 10)
+    }
+
+    @Test("Extension score correct when right extension runs")
+    func testExtensionScoreRightOnly() {
+        // 5bp seed at read positions 0-5, no left flank, 5bp right flank.
+        // Perfect match. All 10 bases match → score = 10.
+        var scoring = ScoringParameters()
+        scoring.penClip3 = 100  // Force extend-to-end
+
+        let seed = MemSeed(rbeg: 100, qbeg: 0, len: 5, score: 5)
+        let chain = MemChain(seeds: [seed], weight: 5, rid: 0, kept: 3)
+
+        let readBases = [UInt8](repeating: 0, count: 10)
+        let read = ReadSequence(
+            name: "test", bases: readBases,
+            qualities: [UInt8](repeating: 30, count: 10)
+        )
+        let refBases = [UInt8](repeating: 0, count: 200)
+
+        let regions = ExtensionAligner.extend(
+            chain: chain, read: read,
+            getReference: { pos, length in
+                let start = max(0, Int(pos))
+                let end = min(refBases.count, start + length)
+                return Array(refBases[start..<end])
+            },
+            scoring: scoring
+        )
+
+        #expect(!regions.isEmpty)
+        let reg = regions[0]
+        // h0 subtracted from right extension score → no double-counting
+        #expect(reg.score == 10)
+    }
+
+    @Test("Extension score correct when both sides extend")
+    func testExtensionScoreBothSides() {
+        // 4bp seed at positions 3-7. 3bp left, 3bp right. All match.
+        // All 10 bases match → score = 10.
+        var scoring = ScoringParameters()
+        scoring.penClip5 = 100
+        scoring.penClip3 = 100
+
+        let seed = MemSeed(rbeg: 103, qbeg: 3, len: 4, score: 4)
+        let chain = MemChain(seeds: [seed], weight: 4, rid: 0, kept: 3)
+
+        let readBases = [UInt8](repeating: 0, count: 10)
+        let read = ReadSequence(
+            name: "test", bases: readBases,
+            qualities: [UInt8](repeating: 30, count: 10)
+        )
+        let refBases = [UInt8](repeating: 0, count: 200)
+
+        let regions = ExtensionAligner.extend(
+            chain: chain, read: read,
+            getReference: { pos, length in
+                let start = max(0, Int(pos))
+                let end = min(refBases.count, start + length)
+                return Array(refBases[start..<end])
+            },
+            scoring: scoring
+        )
+
+        #expect(!regions.isEmpty)
+        let reg = regions[0]
+        // h0 subtracted from both extensions → no triple-counting
+        #expect(reg.score == 10)
+    }
+
+    // MARK: - Bug 2: Sub-Optimal Score / XS Always Zero Tests
+
+    @Test("markSecondaryCore sets sub from overlapping secondary")
+    func testSubScoreSetByOverlappingSecondary() {
+        // Two regions with overlapping query ranges. Primary score=100, secondary score=80.
+        // markSecondaryCore should set primary's sub = secondary's score.
+        var regions = [
+            MemAlnReg(rb: 0, re: 100, qb: 0, qe: 100, score: 100),
+            MemAlnReg(rb: 200, re: 300, qb: 0, qe: 100, score: 80),
+        ]
+
+        let scoring = ScoringParameters()
+        ChainFilter.markSecondaryALT(
+            regions: &regions, maskLevel: 0.50, scoring: scoring
+        )
+
+        // Primary's sub should be set to secondary's score
+        #expect(regions[0].sub == 80)
+        #expect(regions[1].secondary == 0)
+    }
+
+    @Test("Sub score stays zero for single region (unique mapper inflated MAPQ)")
+    func testSubScoreZeroForSingleRegion() {
+        // Single region: no overlapping secondary exists, so sub stays 0.
+        // This means unique mappers always get sub=0, inflating MAPQ.
+        var regions = [
+            MemAlnReg(rb: 0, re: 100, qb: 0, qe: 100, score: 100),
+        ]
+
+        let scoring = ScoringParameters()
+        ChainFilter.markSecondaryALT(
+            regions: &regions, maskLevel: 0.50, scoring: scoring
+        )
+
+        // Documents that unique mappers always get sub=0
+        #expect(regions[0].sub == 0)
+        #expect(regions[0].secondary == -1)
+    }
+
+    @Test("Sub score set from covered seed within same chain")
+    func testSubScoreFromCoveredSeed() {
+        // Chain with two seeds. First seed extends to cover the second.
+        // The covered seed's score (seed.len * matchScore) becomes sub for the region.
+        var scoring = ScoringParameters()
+        scoring.penClip5 = 100
+        scoring.penClip3 = 100
+        // minSeedLength defaults to 19; second seed must be >= 19bp to pass threshold
+
+        // Seed 1: 30bp at positions 0-30 (will extend to cover entire 50bp read)
+        // Seed 2: 20bp at positions 10-30 (will be covered by seed 1's extension)
+        let seed1 = MemSeed(rbeg: 100, qbeg: 0, len: 30, score: 30)
+        let seed2 = MemSeed(rbeg: 110, qbeg: 10, len: 20, score: 20)
+        let chain = MemChain(seeds: [seed1, seed2], weight: 30, rid: 0, kept: 3)
+
+        let readBases = [UInt8](repeating: 0, count: 50)
+        let read = ReadSequence(
+            name: "test", bases: readBases,
+            qualities: [UInt8](repeating: 30, count: 50)
+        )
+        let refBases = [UInt8](repeating: 0, count: 300)
+
+        let regions = ExtensionAligner.extend(
+            chain: chain, read: read,
+            getReference: { pos, length in
+                let start = max(0, Int(pos))
+                let end = min(refBases.count, start + length)
+                return Array(refBases[start..<end])
+            },
+            scoring: scoring
+        )
+
+        #expect(regions.count == 1, "Both seeds produce one region (seed 2 covered)")
+        let reg = regions[0]
+        // Seed 2 (20bp, score=20) is covered → sub = 20 (>= minSeedLength * matchScore = 19)
+        #expect(reg.sub == 20, "Covered seed contributes sub-optimal score")
+    }
+
+    @Test("Sub score zero when covered seed is below minSeedLength threshold")
+    func testSubScoreBelowThreshold() {
+        // Chain with two seeds. Covered seed is shorter than minSeedLength (19bp).
+        // Its score doesn't meet the threshold, so sub stays 0.
+        var scoring = ScoringParameters()
+        scoring.penClip5 = 100
+        scoring.penClip3 = 100
+
+        // Seed 1: 30bp at positions 0-30. Seed 2: 10bp at positions 5-15 (covered, too short).
+        let seed1 = MemSeed(rbeg: 100, qbeg: 0, len: 30, score: 30)
+        let seed2 = MemSeed(rbeg: 105, qbeg: 5, len: 10, score: 10)
+        let chain = MemChain(seeds: [seed1, seed2], weight: 30, rid: 0, kept: 3)
+
+        let readBases = [UInt8](repeating: 0, count: 50)
+        let read = ReadSequence(
+            name: "test", bases: readBases,
+            qualities: [UInt8](repeating: 30, count: 50)
+        )
+        let refBases = [UInt8](repeating: 0, count: 300)
+
+        let regions = ExtensionAligner.extend(
+            chain: chain, read: read,
+            getReference: { pos, length in
+                let start = max(0, Int(pos))
+                let end = min(refBases.count, start + length)
+                return Array(refBases[start..<end])
+            },
+            scoring: scoring
+        )
+
+        #expect(regions.count == 1)
+        // Covered seed score (10) < minSeedLength * matchScore (19) → sub stays 0
+        #expect(regions[0].sub == 0, "Short covered seed below threshold does not set sub")
+    }
+
+    // MARK: - Bug 3: Extension / Soft-Clipping Behavior Tests
+
+    @Test("Extension extends through mismatches when clip penalty is high")
+    func testExtensionThroughMismatchesWithHighClipPenalty() {
+        // 20bp read, 10bp seed at positions 5-15. Left: 5 matches. Right: 3 matches + 2 mismatches.
+        // penClip3 = 100: very high, so extension should prefer extending to end.
+        var scoring = ScoringParameters()
+        scoring.penClip5 = 100
+        scoring.penClip3 = 100
+
+        let seed = MemSeed(rbeg: 105, qbeg: 5, len: 10, score: 10)
+        let chain = MemChain(seeds: [seed], weight: 10, rid: 0, kept: 3)
+
+        // Left flank: 5 A's (match). Seed: 10 A's. Right flank: 3 A's + 2 T's (mismatch).
+        var readBases = [UInt8](repeating: 0, count: 18)  // 18 A's
+        readBases += [UInt8](repeating: 3, count: 2)       // 2 T's at positions 18-19
+        let read = ReadSequence(
+            name: "test", bases: readBases,
+            qualities: [UInt8](repeating: 30, count: 20)
+        )
+
+        // Reference: all A's, so positions 18-19 of read (T) mismatch
+        let refBases = [UInt8](repeating: 0, count: 200)
+
+        let regions = ExtensionAligner.extend(
+            chain: chain, read: read,
+            getReference: { pos, length in
+                let start = max(0, Int(pos))
+                let end = min(refBases.count, start + length)
+                return Array(refBases[start..<end])
+            },
+            scoring: scoring
+        )
+
+        #expect(!regions.isEmpty)
+        let reg = regions[0]
+        // With very high clip penalty, should extend to read end despite mismatches
+        #expect(reg.qe == 20, "Should extend to read end with high penClip3")
+        #expect(reg.qb == 0, "Should extend to read start with high penClip5")
+    }
+
+    @Test("Extension clips mismatching tail when clip penalty is low")
+    func testExtensionClipsWithLowClipPenalty() {
+        // Same layout but penClip3 = 1. With 2 mismatches (penalty 8) at the tail,
+        // clipping at penalty 1 is much cheaper than extending through mismatches.
+        var scoring = ScoringParameters()
+        scoring.penClip5 = 100  // Still extend left
+        scoring.penClip3 = 1    // Cheap to clip right
+
+        let seed = MemSeed(rbeg: 105, qbeg: 5, len: 10, score: 10)
+        let chain = MemChain(seeds: [seed], weight: 10, rid: 0, kept: 3)
+
+        var readBases = [UInt8](repeating: 0, count: 18)
+        readBases += [UInt8](repeating: 3, count: 2)
+        let read = ReadSequence(
+            name: "test", bases: readBases,
+            qualities: [UInt8](repeating: 30, count: 20)
+        )
+
+        let refBases = [UInt8](repeating: 0, count: 200)
+
+        let regions = ExtensionAligner.extend(
+            chain: chain, read: read,
+            getReference: { pos, length in
+                let start = max(0, Int(pos))
+                let end = min(refBases.count, start + length)
+                return Array(refBases[start..<end])
+            },
+            scoring: scoring
+        )
+
+        #expect(!regions.isEmpty)
+        let reg = regions[0]
+        // With low clip penalty, should clip the mismatching tail
+        #expect(reg.qe < 20, "Should clip mismatching tail with low penClip3")
+        #expect(reg.qb == 0, "Should still extend to read start")
+    }
+
+    @Test("Extension score accounts for mismatch in flank alongside h0 issue")
+    func testExtensionScoreWithMismatchInFlank() {
+        // 10bp read, 4bp seed at positions 3-7. Left: 3 matches. Right: 2 matches + 1 mismatch.
+        // This tests score computation when mismatches are present.
+        var scoring = ScoringParameters()
+        scoring.penClip5 = 100
+        scoring.penClip3 = 100
+
+        let seed = MemSeed(rbeg: 103, qbeg: 3, len: 4, score: 4)
+        let chain = MemChain(seeds: [seed], weight: 4, rid: 0, kept: 3)
+
+        // Left flank: 3 A's (match). Seed: 4 A's. Right: 2 A's + 1 T (mismatch at pos 9).
+        var readBases = [UInt8](repeating: 0, count: 9)  // 9 A's
+        readBases += [3]  // 1 T at position 9
+        let read = ReadSequence(
+            name: "test", bases: readBases,
+            qualities: [UInt8](repeating: 30, count: 10)
+        )
+
+        // Reference: all A's, so position 9 of read (T) mismatches
+        let refBases = [UInt8](repeating: 0, count: 200)
+
+        let regions = ExtensionAligner.extend(
+            chain: chain, read: read,
+            getReference: { pos, length in
+                let start = max(0, Int(pos))
+                let end = min(refBases.count, start + length)
+                return Array(refBases[start..<end])
+            },
+            scoring: scoring
+        )
+
+        #expect(!regions.isEmpty)
+        let reg = regions[0]
+        // With high clip penalty, should extend through mismatch to read end
+        #expect(reg.qe == 10, "Should extend to read end with high penClip3")
+        #expect(reg.qb == 0)
+        // Score should reflect mismatch penalty.
+        // Perfect 10bp match scores 10. With 1 mismatch (lose 1 match + pay 4 penalty):
+        // 9 matches * 1 - 1 mismatch * 4 = 5.
+        #expect(reg.score < 10, "Score should be less than perfect match (mismatch penalty applied)")
+        #expect(reg.score > 0, "Score should still be positive")
+    }
 }

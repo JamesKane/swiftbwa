@@ -28,6 +28,13 @@ public struct ExtensionAligner: Sendable {
         // Process each seed as potential extension anchor
         var coveredRegions: [(qb: Int32, qe: Int32, rb: Int64, re: Int64)] = []
 
+        // tmp = max single-event penalty (for subN threshold, matches markSecondaryCore)
+        let tmp = max(
+            scoring.matchScore + scoring.mismatchPenalty,
+            max(scoring.gapOpenPenalty + scoring.gapExtendPenalty,
+                scoring.gapOpenPenaltyDeletion + scoring.gapExtendPenaltyDeletion)
+        )
+
         for seedIdx in 0..<seeds.count {
             let seed = seeds[seedIdx]
 
@@ -36,13 +43,26 @@ public struct ExtensionAligner: Sendable {
             let seedREnd = seed.rbeg + Int64(seed.len)
 
             var alreadyCovered = false
-            for covered in coveredRegions {
+            var coveringRegIdx = -1
+            for (idx, covered) in coveredRegions.enumerated() {
                 if seed.qbeg >= covered.qb && seedQEnd <= covered.qe {
                     alreadyCovered = true
+                    coveringRegIdx = idx
                     break
                 }
             }
-            if alreadyCovered { continue }
+            if alreadyCovered {
+                // Track sub-optimal score from covered seed (matches bwa-mem2's csub logic).
+                // The seed's alignment score estimate is seed.len * matchScore.
+                let seedAlnScore = seed.len * scoring.matchScore
+                if seedAlnScore > regions[coveringRegIdx].sub {
+                    regions[coveringRegIdx].sub = seedAlnScore
+                }
+                if seedAlnScore >= regions[coveringRegIdx].score - tmp {
+                    regions[coveringRegIdx].subN += 1
+                }
+                continue
+            }
 
             var reg = MemAlnReg()
             reg.w = bandWidth
@@ -138,12 +158,24 @@ public struct ExtensionAligner: Sendable {
             reg.qe = seedQEnd + rightQLen
             reg.rb = seed.rbeg - Int64(leftTLen)
             reg.re = seedREnd + Int64(rightTLen)
-            reg.score = leftScore + Int32(seed.len) * scoring.matchScore + rightScore
+            // Each extension score includes h0 (= seed.score) as a baseline from the
+            // banded SW initialization (maxScore = h0). Subtract it to avoid counting
+            // the seed contribution twice per extension side.
+            let leftAdj = leftScore > 0 ? seed.score : Int32(0)
+            let rightAdj = rightScore > 0 ? seed.score : Int32(0)
+            reg.score = (leftScore - leftAdj) + Int32(seed.len) * scoring.matchScore + (rightScore - rightAdj)
             reg.trueScore = reg.score
-            reg.sub = 0
 
             coveredRegions.append((reg.qb, reg.qe, reg.rb, reg.re))
             regions.append(reg)
+        }
+
+        // Threshold: sub must exceed minSeedLength * matchScore (matches bwa-mem2)
+        let subThreshold = scoring.minSeedLength * scoring.matchScore
+        for i in 0..<regions.count {
+            if regions[i].sub > 0 && regions[i].sub < subThreshold {
+                regions[i].sub = 0
+            }
         }
 
         return regions
