@@ -48,6 +48,26 @@ public struct InsertSizeEstimator: Sendable {
     /// Minimum number of samples per orientation to compute stats.
     public static let minSamples = 25
 
+    /// Build an insert size distribution from manual override values (-I flag).
+    ///
+    /// Constructs FR-orientation stats from user-provided values, matching bwa-mem2's
+    /// behavior for `-I mean,stddev[,max[,min]]`.
+    public static func buildManualDistribution(override ov: InsertSizeOverride) -> InsertSizeDistribution {
+        var dist = InsertSizeDistribution()
+        var stats = OrientationStats()
+        stats.failed = false
+        stats.mean = ov.mean
+        stats.stddev = ov.stddev
+        stats.low = Int64(ov.min)
+        stats.high = Int64(ov.max)
+        stats.count = 1000  // synthetic count so it doesn't look failed
+        stats.properLow = Int64(Swift.max(ov.mean - 4.0 * ov.stddev, 1.0))
+        stats.properHigh = Int64(ov.mean + 4.0 * ov.stddev)
+        dist.stats[PairOrientation.fr.rawValue] = stats
+        dist.primaryOrientation = .fr
+        return dist
+    }
+
     /// Infer pair orientation and unsigned insert size from two alignment regions.
     ///
     /// Uses bwa-mem2's `mem_infer_dir` algorithm with start-to-start distance metric

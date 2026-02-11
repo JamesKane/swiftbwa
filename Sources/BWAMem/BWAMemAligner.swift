@@ -52,13 +52,47 @@ public actor BWAMemAligner {
         let scoring = options.scoring
 
         // Phase 1: Find SMEMs
-        let smems = SMEMFinder.findAllSMEMs(
+        var smems = SMEMFinder.findAllSMEMs(
             query: read.bases,
             bwt: index.bwt,
             minSeedLen: scoring.minSeedLength
         )
 
         guard !smems.isEmpty else { return [] }
+
+        // Phase 1.5: Re-seeding (-y) — for long reads with high-occurrence seeds,
+        // re-run SMEM finding with relaxed occurrence threshold to find additional
+        // shorter, more specific seeds. Matches bwa-mem2's mem_collect_intv behavior.
+        if scoring.reseedLength > 0 {
+            let maxOcc = Int64(scoring.maxOccurrences)
+            let hasHighOcc = smems.contains { $0.count > maxOcc }
+            if hasHighOcc {
+                let reseeded = SMEMFinder.findAllSMEMs(
+                    query: read.bases,
+                    bwt: index.bwt,
+                    minSeedLen: scoring.reseedLength,
+                    minIntv: maxOcc
+                )
+                // Merge and deduplicate: keep unique seeds by (queryBegin, queryEnd, k)
+                var seen = Set<Int64>()
+                for s in smems {
+                    // Simple hash combining position and SA interval
+                    seen.insert(Int64(s.queryBegin) << 32 | Int64(s.queryEnd) << 16 | (s.k & 0xFFFF))
+                }
+                for s in reseeded {
+                    let key = Int64(s.queryBegin) << 32 | Int64(s.queryEnd) << 16 | (s.k & 0xFFFF)
+                    if !seen.contains(key) {
+                        smems.append(s)
+                        seen.insert(key)
+                    }
+                }
+                // Re-sort
+                smems.sort {
+                    if $0.queryBegin != $1.queryBegin { return $0.queryBegin < $1.queryBegin }
+                    return $0.length > $1.length
+                }
+            }
+        }
 
         // Phase 2: Chain seeds
         var chains = SeedChainer.chain(
@@ -247,12 +281,14 @@ public actor BWAMemAligner {
 
         // Write output sequentially (ordered by input)
         let rgID = options.readGroupID
+        let comment = options.appendComment
         for (idx, regions) in results {
             let read = reads[idx]
 
             if regions.isEmpty {
                 let record = try SAMOutputBuilder.buildUnmappedRecord(
-                    read: read, readGroupID: rgID
+                    read: read, readGroupID: rgID,
+                    appendComment: comment
                 )
                 try outputFile.write(record: record, header: header)
             } else {
@@ -284,22 +320,31 @@ public actor BWAMemAligner {
         let allRegions1 = await alignAllReads(reads1)
         let allRegions2 = await alignAllReads(reads2)
 
-        // Phase 2: Estimate insert size distribution
-        let dist = InsertSizeEstimator.estimate(
-            regions1: allRegions1,
-            regions2: allRegions2,
-            genomeLength: genomeLen
-        )
+        // Phase 2: Estimate insert size distribution (or use manual override)
+        let dist: InsertSizeDistribution
+        if let manual = options.manualInsertSize {
+            dist = InsertSizeEstimator.buildManualDistribution(override: manual)
+        } else {
+            dist = InsertSizeEstimator.estimate(
+                regions1: allRegions1,
+                regions2: allRegions2,
+                genomeLength: genomeLen
+            )
+        }
 
         let primaryStats = dist.stats[dist.primaryOrientation.rawValue]
         if !primaryStats.failed {
-            fputs("[PE] Insert size: mean=\(String(format: "%.1f", primaryStats.mean)), "
-                  + "stddev=\(String(format: "%.1f", primaryStats.stddev)), "
-                  + "orientation=\(dist.primaryOrientation), "
-                  + "n=\(primaryStats.count)\n", stderr)
+            if options.verbosity >= 3 {
+                fputs("[PE] Insert size: mean=\(String(format: "%.1f", primaryStats.mean)), "
+                      + "stddev=\(String(format: "%.1f", primaryStats.stddev)), "
+                      + "orientation=\(dist.primaryOrientation), "
+                      + "n=\(primaryStats.count)\n", stderr)
+            }
         } else {
-            fputs("[PE] Warning: insert size estimation failed, "
-                  + "treating as unpaired for scoring\n", stderr)
+            if options.verbosity >= 2 {
+                fputs("[PE] Warning: insert size estimation failed, "
+                      + "treating as unpaired for scoring\n", stderr)
+            }
         }
 
         // Phase 2.5: Mate rescue (skip if -S)
@@ -355,6 +400,7 @@ public actor BWAMemAligner {
         // Phase 3: For each pair, resolve and write output
         let skipPairing = (options.scoring.flag & ScoringParameters.flagNoPairing) != 0
         let rgID = options.readGroupID
+        let comment = options.appendComment
         for i in 0..<pairCount {
             let read1 = reads1[i]
             let read2 = reads2[i]
@@ -379,11 +425,13 @@ public actor BWAMemAligner {
                     tlen: 0
                 )
                 let rec1 = try SAMOutputBuilder.buildUnmappedRecord(
-                    read: read1, pairedEnd: pe1, readGroupID: rgID
+                    read: read1, pairedEnd: pe1, readGroupID: rgID,
+                    appendComment: comment
                 )
                 try outputFile.write(record: rec1, header: header)
                 let rec2 = try SAMOutputBuilder.buildUnmappedRecord(
-                    read: read2, pairedEnd: pe2, readGroupID: rgID
+                    read: read2, pairedEnd: pe2, readGroupID: rgID,
+                    appendComment: comment
                 )
                 try outputFile.write(record: rec2, header: header)
                 continue
@@ -507,6 +555,8 @@ public actor BWAMemAligner {
     ) throws {
         let scoring = options.scoring
         let rgID = options.readGroupID
+        let refHeader = options.outputRefHeader
+        let comment = options.appendComment
         let outputAll = (scoring.flag & ScoringParameters.flagAll) != 0
 
         // Pass 1: Classify regions into segments
@@ -583,7 +633,8 @@ public actor BWAMemAligner {
 
         guard !segments.isEmpty else {
             let record = try SAMOutputBuilder.buildUnmappedRecord(
-                read: read, pairedEnd: pairedEnd, readGroupID: rgID
+                read: read, pairedEnd: pairedEnd, readGroupID: rgID,
+                appendComment: comment
             )
             try outputFile.write(record: record, header: header)
             return
@@ -681,7 +732,9 @@ public actor BWAMemAligner {
                 pairedEnd: pairedEnd,
                 saTag: saTag,
                 xaTag: seg.isPrimary ? xaTag : nil,
-                readGroupID: rgID
+                readGroupID: rgID,
+                outputRefHeader: refHeader,
+                appendComment: comment
             )
             try outputFile.write(record: record, header: header)
         }
@@ -758,6 +811,8 @@ public actor BWAMemAligner {
         let cigar = generateCIGAR(read: mappedRead, region: region)
         let (rid, localPos) = index.metadata.decodePosition(cigar.pos)
         let rgID = options.readGroupID
+        let refHeader = options.outputRefHeader
+        let comment = options.appendComment
 
         // Mapped read's PE info: mate is unmapped
         let mappedPE = PairedEndInfo(
@@ -782,16 +837,19 @@ public actor BWAMemAligner {
                     metadata: index.metadata, scoring: options.scoring,
                     cigar: cigar.cigar, nm: cigar.nm, md: cigar.md,
                     isPrimary: true, adjustedPos: cigar.pos, pairedEnd: mappedPE,
-                    readGroupID: rgID
+                    readGroupID: rgID,
+                    outputRefHeader: refHeader, appendComment: comment
                 )
                 try outputFile.write(record: rec1, header: header)
                 let rec2 = try SAMOutputBuilder.buildUnmappedRecord(
-                    read: unmappedRead, pairedEnd: unmappedPE, readGroupID: rgID
+                    read: unmappedRead, pairedEnd: unmappedPE, readGroupID: rgID,
+                    appendComment: comment
                 )
                 try outputFile.write(record: rec2, header: header)
             } else {
                 let rec1 = try SAMOutputBuilder.buildUnmappedRecord(
-                    read: unmappedRead, pairedEnd: unmappedPE, readGroupID: rgID
+                    read: unmappedRead, pairedEnd: unmappedPE, readGroupID: rgID,
+                    appendComment: comment
                 )
                 try outputFile.write(record: rec1, header: header)
                 let rec2 = try SAMOutputBuilder.buildRecord(
@@ -799,12 +857,15 @@ public actor BWAMemAligner {
                     metadata: index.metadata, scoring: options.scoring,
                     cigar: cigar.cigar, nm: cigar.nm, md: cigar.md,
                     isPrimary: true, adjustedPos: cigar.pos, pairedEnd: mappedPE,
-                    readGroupID: rgID
+                    readGroupID: rgID,
+                    outputRefHeader: refHeader, appendComment: comment
                 )
                 try outputFile.write(record: rec2, header: header)
             }
         } catch {
-            fputs("[PE] Error writing mapped/unmapped pair: \(error)\n", stderr)
+            if options.verbosity >= 1 {
+                fputs("[PE] Error writing mapped/unmapped pair: \(error)\n", stderr)
+            }
         }
     }
 }

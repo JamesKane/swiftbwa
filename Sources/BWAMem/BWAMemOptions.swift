@@ -1,5 +1,20 @@
 import BWACore
 
+/// Manual insert size override values (-I flag).
+public struct InsertSizeOverride: Sendable {
+    public var mean: Double
+    public var stddev: Double
+    public var max: Double
+    public var min: Double
+
+    public init(mean: Double, stddev: Double, max: Double? = nil, min: Double? = nil) {
+        self.mean = mean
+        self.stddev = stddev
+        self.max = max ?? (mean + 3.5 * stddev)
+        self.min = min ?? Swift.max(mean - 7.0 * stddev, 1.0)
+    }
+}
+
 /// User-facing configuration for BWA-MEM alignment.
 public struct BWAMemOptions: Sendable {
     public var scoring: ScoringParameters
@@ -12,6 +27,12 @@ public struct BWAMemOptions: Sendable {
     public var appendComment: Bool = false
     /// Skip ALT contig loading (-j)
     public var ignoreAlt: Bool = false
+    /// Output reference header in XR tag (-V)
+    public var outputRefHeader: Bool = false
+    /// Manual insert size override (-I)
+    public var manualInsertSize: InsertSizeOverride? = nil
+    /// Verbosity level (-v): 1=error, 2=warning, 3=info (default), 4+=debug
+    public var verbosity: Int = 3
 
     public enum OutputMode: Sendable {
         case sam

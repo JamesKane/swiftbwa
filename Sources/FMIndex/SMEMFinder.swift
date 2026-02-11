@@ -21,6 +21,45 @@ public struct SMEMFinder: Sendable {
     ///   - bwt: The BWT structure for backward search
     ///   - minSeedLen: Minimum seed length to report
     /// - Returns: Array of SMEMs sorted by query position
+    /// Find all SMEMs with a custom minimum SA interval threshold.
+    ///
+    /// Used for re-seeding: `minIntv > 1` causes the search to ignore seeds with
+    /// fewer occurrences, finding additional shorter but more specific seeds.
+    public static func findAllSMEMs(
+        query: [UInt8],
+        bwt: BWT,
+        minSeedLen: Int32,
+        minIntv: Int64
+    ) -> [SMEM] {
+        let readLength = query.count
+        guard readLength > 0 else { return [] }
+
+        var allSMEMs: [SMEM] = []
+        var pos: Int = 0
+
+        while pos < readLength {
+            let (smems, nextPos) = findSMEMsAtPosition(
+                query: query,
+                bwt: bwt,
+                startPos: pos,
+                minSeedLen: minSeedLen,
+                minIntv: minIntv
+            )
+            allSMEMs.append(contentsOf: smems)
+            pos = nextPos
+        }
+
+        allSMEMs.sort {
+            if $0.queryBegin != $1.queryBegin {
+                return $0.queryBegin < $1.queryBegin
+            }
+            return $0.length > $1.length
+        }
+
+        return allSMEMs
+    }
+
+    /// Find all SMEMs with default minIntv=1.
     public static func findAllSMEMs(
         query: [UInt8],
         bwt: BWT,

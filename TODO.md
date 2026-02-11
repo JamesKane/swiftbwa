@@ -22,13 +22,13 @@
 ## Not yet implemented (vs bwa-mem2)
 
 - [x] **Interleaved FASTQ (`-p`)** — `-p` flag deinterleaves single FASTQ into read1/read2 by index parity, feeds into existing `alignPairedBatch()`.
-- [ ] **Append FASTQ comment (`-C`)** — bwa-mem2 appends raw FASTQ comment as SAM tags. `ReadSequence.comment` field exists but not wired through output (htslib BAMRecord doesn't support raw tag injection).
+- [x] **Append FASTQ comment (`-C`)** — FASTQ comment preserved via `readFASTQWithComments()` line-by-line reader (handles gzip), written as `CO:Z` aux tag via `SAMOutputBuilder`.
 - [x] **Output all alignments (`-a`)** — Emit all above-threshold alignments as full SAM records with 0x100 flag instead of condensing into XA tag. XA tag skipped when `-a` is set.
-- [ ] **Manual insert size override (`-I`)** — Bypass estimation with user-provided mean, stddev, max, min.
-- [ ] **Fixed batch size (`-K`)** — Process fixed number of input bases per batch for reproducibility across thread counts.
-- [ ] **Reference header in XR tag (`-V`)** — Output FASTA header annotation in XR:Z aux tag.
-- [ ] **Verbosity levels (`-v`)** — Gate stderr diagnostic output by level (1=error, 2=warning, 3=message, 4+=debug).
-- [ ] **Re-seeding (`-y`)** — Additional seeding rounds for long reads with high-occurrence seeds.
+- [x] **Manual insert size override (`-I`)** — `InsertSizeOverride` struct with bwa-mem2 defaults for omitted max/min. `InsertSizeEstimator.buildManualDistribution()` constructs FR-orientation stats.
+- [x] **Fixed batch size (`-K`)** — `alignSEInChunks`/`alignPairedInChunks` process reads in chunks of K input bases. Insert size estimated per chunk.
+- [x] **Reference header in XR tag (`-V`)** — `outputRefHeader` option writes `XR:Z:<anno>` aux tag from `ReferenceAnnotation.anno`.
+- [x] **Verbosity levels (`-v`)** — `options.verbosity` gates all `fputs` calls: 1=error, 2=warning, 3=info (default), 4+=debug.
+- [x] **Re-seeding (`-y`)** — Phase 1.5 in `alignRead()`: re-runs SMEM finding with `minIntv=maxOccurrences` for high-occurrence seeds, merges/deduplicates results.
 - [x] **Dedup/patch overlapping hits** — `mem_sort_dedup_patch` merges overlapping alignment regions via global re-alignment. Implemented as `RegionDedup.sortDedupPatch()` in Phase 4.5 of the alignment pipeline.
 - [x] **Z-dropoff in SW extension** — SIMD implementations (BandedSW8/BandedSW16) rewritten with proper Farrar striped algorithm: diagonal shift, lazy-F correction, h0 initialization, z-dropoff, globalScore/globalTargetEnd/maxOff tracking. ExtensionAligner now uses tiered SIMD (8-bit → 16-bit fallback).
-- [ ] **Match score scaling validation** — bwa-mem2 only scales when `-A` differs from user defaults; current implementation always scales.
+- [x] **Match score scaling validation** — Penalty scaling now guarded by `if a != 1`, matching bwa-mem2 behavior.

@@ -94,7 +94,9 @@ public struct SAMOutputBuilder: Sendable {
         pairedEnd: PairedEndInfo? = nil,
         saTag: String? = nil,
         xaTag: String? = nil,
-        readGroupID: String? = nil
+        readGroupID: String? = nil,
+        outputRefHeader: Bool = false,
+        appendComment: Bool = false
     ) throws -> BAMRecord {
         let mapq = mapqOverride ?? MappingQuality.compute(
             region: region,
@@ -224,6 +226,15 @@ public struct SAMOutputBuilder: Sendable {
         if let rg = readGroupID {
             try aux.updateString(tag: "RG", value: rg)
         }
+        if outputRefHeader && rid >= 0 && rid < metadata.annotations.count {
+            let anno = metadata.annotations[Int(rid)].anno
+            if !anno.isEmpty {
+                try aux.updateString(tag: "XR", value: anno)
+            }
+        }
+        if appendComment && !read.comment.isEmpty {
+            try aux.updateString(tag: "CO", value: read.comment)
+        }
 
         return record
     }
@@ -307,7 +318,8 @@ public struct SAMOutputBuilder: Sendable {
     public static func buildUnmappedRecord(
         read: ReadSequence,
         pairedEnd: PairedEndInfo? = nil,
-        readGroupID: String? = nil
+        readGroupID: String? = nil,
+        appendComment: Bool = false
     ) throws -> BAMRecord {
         let seqStr = String(read.bases.map { b -> Character in
             switch b {
@@ -363,6 +375,10 @@ public struct SAMOutputBuilder: Sendable {
         if let rg = readGroupID {
             let aux = record.mutableAuxiliaryData
             try aux.updateString(tag: "RG", value: rg)
+        }
+        if appendComment && !read.comment.isEmpty {
+            let aux = record.mutableAuxiliaryData
+            try aux.updateString(tag: "CO", value: read.comment)
         }
 
         return record

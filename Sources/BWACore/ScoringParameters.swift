@@ -39,6 +39,8 @@ public struct ScoringParameters: Sendable {
     public var chainDropRatio: Float = 0.50
     /// Minimum chain weight (-W): discard chains with seeded bases shorter than this
     public var minChainWeight: Int32 = 0
+    /// Re-seeding length threshold (-y): 0 = disabled, >0 = min seed length for re-seeding
+    public var reseedLength: Int32 = 0
 
     // MARK: - Flag constants
 
