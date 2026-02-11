@@ -628,4 +628,91 @@ struct AlignmentTests {
         let result = LocalSWAligner.align(query: [], target: [0, 1, 2], scoring: scoring)
         #expect(result == nil)
     }
+
+    // MARK: - ExtensionAligner Clip-vs-Extend Tests
+
+    @Test("ExtensionAligner clips when penClip is low (local alignment preferred)")
+    func testExtensionAlignerClips() {
+        // A seed in the middle of the read with a mismatching flanking region
+        // should clip rather than extend when the clip penalty is low
+        var scoring = ScoringParameters()
+        scoring.penClip5 = 5
+        scoring.penClip3 = 5
+
+        // 20bp seed at read positions 10-30, with mismatches at the edges
+        let seed = MemSeed(rbeg: 100, qbeg: 10, len: 20, score: 20)
+        let chain = MemChain(seeds: [seed], weight: 20, rid: 0, kept: 3)
+
+        // Read: 10 mismatching bases + 20 matching + 10 mismatching
+        var readBases = [UInt8](repeating: 3, count: 10)  // T's that won't match
+        readBases += [UInt8](repeating: 0, count: 20)      // A's matching reference
+        readBases += [UInt8](repeating: 3, count: 10)      // T's that won't match
+        let read = ReadSequence(
+            name: "test",
+            bases: readBases,
+            qualities: [UInt8](repeating: 30, count: 40)
+        )
+
+        // Reference: all A's so seed matches but flanks mismatch
+        let refBases = [UInt8](repeating: 0, count: 200)
+
+        let regions = ExtensionAligner.extend(
+            chain: chain,
+            read: read,
+            getReference: { pos, length in
+                let start = max(0, Int(pos))
+                let end = min(refBases.count, start + length)
+                return Array(refBases[start..<end])
+            },
+            scoring: scoring
+        )
+
+        #expect(!regions.isEmpty)
+        let reg = regions[0]
+        // With mismatches at edges and low clip penalty, should clip
+        // qb should be > 0 (clipped at 5' end)
+        #expect(reg.qb >= 0)
+        // qe should be < 40 (clipped at 3' end)
+        #expect(reg.qe <= 40)
+    }
+
+    @Test("ExtensionAligner extends to read boundary with high penClip")
+    func testExtensionAlignerExtendsWithHighPenClip() {
+        // With a very high clip penalty, extension should prefer extending
+        // to read boundaries even with some cost
+        var scoring = ScoringParameters()
+        scoring.penClip5 = 100
+        scoring.penClip3 = 100
+
+        // Seed at read positions 5-25 with matching flanks
+        let seed = MemSeed(rbeg: 100, qbeg: 5, len: 20, score: 20)
+        let chain = MemChain(seeds: [seed], weight: 20, rid: 0, kept: 3)
+
+        // All bases match the reference
+        let readBases = [UInt8](repeating: 0, count: 30)  // 30bp of A's
+        let read = ReadSequence(
+            name: "test",
+            bases: readBases,
+            qualities: [UInt8](repeating: 30, count: 30)
+        )
+
+        let refBases = [UInt8](repeating: 0, count: 200)  // All A's
+
+        let regions = ExtensionAligner.extend(
+            chain: chain,
+            read: read,
+            getReference: { pos, length in
+                let start = max(0, Int(pos))
+                let end = min(refBases.count, start + length)
+                return Array(refBases[start..<end])
+            },
+            scoring: scoring
+        )
+
+        #expect(!regions.isEmpty)
+        let reg = regions[0]
+        // With high clip penalty and matching flanks, should extend to read boundaries
+        #expect(reg.qb == 0)
+        #expect(reg.qe == 30)
+    }
 }

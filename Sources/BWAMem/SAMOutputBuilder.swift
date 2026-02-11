@@ -1,3 +1,4 @@
+import Alignment
 import BWACore
 import Htslib
 
@@ -71,10 +72,14 @@ public struct SAMOutputBuilder: Sendable {
         nm: Int32 = 0,
         md: String? = nil,
         isPrimary: Bool,
+        isSupplementary: Bool = false,
+        mapqOverride: UInt8? = nil,
         adjustedPos: Int64? = nil,
-        pairedEnd: PairedEndInfo? = nil
+        pairedEnd: PairedEndInfo? = nil,
+        saTag: String? = nil,
+        xaTag: String? = nil
     ) throws -> BAMRecord {
-        let mapq = MappingQuality.compute(
+        let mapq = mapqOverride ?? MappingQuality.compute(
             region: region,
             allRegions: allRegions,
             scoring: scoring,
@@ -109,7 +114,9 @@ public struct SAMOutputBuilder: Sendable {
                 flag.insert(.reverse)
             }
         }
-        if !isPrimary {
+        if isSupplementary {
+            flag.insert(.supplementary)
+        } else if !isPrimary {
             flag.insert(.secondary)
         }
 
@@ -117,8 +124,12 @@ public struct SAMOutputBuilder: Sendable {
         let refPos = adjustedPos ?? region.rb
         let (rid, localPos) = metadata.decodePosition(refPos)
 
-        // Convert sequence to ASCII string
-        let seqStr = String(read.bases.map { b -> Character in
+        // Determine CIGAR, SEQ, QUAL — apply hard-clip for supplementary if not soft-clip mode
+        var finalCigar = cigar
+        var seqStr: String
+        var qualStr: String
+
+        let fullSeq = read.bases.map { b -> Character in
             switch b {
             case 0: return "A"
             case 1: return "C"
@@ -126,10 +137,25 @@ public struct SAMOutputBuilder: Sendable {
             case 3: return "T"
             default: return "N"
             }
-        })
+        }
+        let fullQual = read.qualities.map { Character(UnicodeScalar($0 + 33)) }
 
-        // Convert qualities to ASCII string (Phred+33)
-        let qualStr = String(read.qualities.map { Character(UnicodeScalar($0 + 33)) })
+        if isSupplementary && (scoring.flag & ScoringParameters.flagSoftClip) == 0 {
+            let (hardCigar, trimLeft, trimRight) = convertToHardClip(cigar: cigar)
+            finalCigar = hardCigar
+            let seqEnd = fullSeq.count - trimRight
+            let seqStart = trimLeft
+            if seqStart < seqEnd {
+                seqStr = String(fullSeq[seqStart..<seqEnd])
+                qualStr = String(fullQual[seqStart..<seqEnd])
+            } else {
+                seqStr = String(fullSeq)
+                qualStr = String(fullQual)
+            }
+        } else {
+            seqStr = String(fullSeq)
+            qualStr = String(fullQual)
+        }
 
         let mtid: Int32
         let mpos: Int64
@@ -152,7 +178,7 @@ public struct SAMOutputBuilder: Sendable {
             tid: rid,
             pos: localPos,
             mapq: mapq,
-            cigar: cigar,
+            cigar: finalCigar,
             mtid: mtid,
             mpos: mpos,
             isize: isize,
@@ -171,8 +197,86 @@ public struct SAMOutputBuilder: Sendable {
         if let pe = pairedEnd, let mc = pe.mateCigarString {
             try aux.updateString(tag: "MC", value: mc)
         }
+        if let sa = saTag {
+            try aux.updateString(tag: "SA", value: sa)
+        }
+        if let xa = xaTag {
+            try aux.updateString(tag: "XA", value: xa)
+        }
 
         return record
+    }
+
+    // MARK: - Hard-clip conversion
+
+    /// Convert leading/trailing soft-clips to hard-clips.
+    /// Returns the new CIGAR and trim lengths so the caller can substring SEQ/QUAL.
+    public static func convertToHardClip(cigar: [UInt32]) -> (cigar: [UInt32], trimLeft: Int, trimRight: Int) {
+        guard !cigar.isEmpty else { return (cigar, 0, 0) }
+        var result = cigar
+        var trimLeft = 0
+        var trimRight = 0
+
+        // Check leading op
+        let firstOp = result[0] & 0xF
+        if firstOp == CIGAROp.softClip.rawValue {
+            let len = result[0] >> 4
+            trimLeft = Int(len)
+            result[0] = len << 4 | CIGAROp.hardClip.rawValue
+        }
+
+        // Check trailing op
+        if result.count > 1 {
+            let lastIdx = result.count - 1
+            let lastOp = result[lastIdx] & 0xF
+            if lastOp == CIGAROp.softClip.rawValue {
+                let len = result[lastIdx] >> 4
+                trimRight = Int(len)
+                result[lastIdx] = len << 4 | CIGAROp.hardClip.rawValue
+            }
+        }
+
+        return (result, trimLeft, trimRight)
+    }
+
+    // MARK: - SA tag builder
+
+    /// Build an SA auxiliary tag string from alignment segments.
+    /// Format per segment: `rname,pos,strand,CIGAR,mapQ,NM;`
+    /// The SA CIGAR always uses soft-clips (not hard-clips), per bwa-mem2 convention.
+    public static func buildSATag(
+        segments: [(rname: String, pos: Int64, isReverse: Bool,
+                    cigarString: String, mapq: UInt8, nm: Int32)],
+        excludeIndex: Int
+    ) -> String {
+        var parts: [String] = []
+        for (i, seg) in segments.enumerated() {
+            if i == excludeIndex { continue }
+            let strand = seg.isReverse ? "-" : "+"
+            // SAM positions are 1-based
+            parts.append("\(seg.rname),\(seg.pos + 1),\(strand),\(seg.cigarString),\(seg.mapq),\(seg.nm);")
+        }
+        return parts.joined()
+    }
+
+    // MARK: - XA tag builder
+
+    /// Build an XA auxiliary tag string from secondary alignment info.
+    /// Format per hit: `chr,{+|-}pos,CIGAR,NM;`
+    /// Returns nil if count exceeds `maxHits` (bwa-mem2 behavior: too many hits → no XA tag).
+    public static func buildXATag(
+        secondaries: [(rname: String, pos: Int64, isReverse: Bool,
+                       cigarString: String, nm: Int32)],
+        maxHits: Int = 5
+    ) -> String? {
+        guard secondaries.count <= maxHits else { return nil }
+        var parts: [String] = []
+        for sec in secondaries {
+            let strand = sec.isReverse ? "-" : "+"
+            // SAM positions are 1-based
+            parts.append("\(sec.rname),\(strand)\(sec.pos + 1),\(sec.cigarString),\(sec.nm);")
+        }
+        return parts.joined()
     }
 
     /// Build an unmapped BAM record.

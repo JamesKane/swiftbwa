@@ -29,6 +29,11 @@ public struct ScoringParameters: Sendable {
     /// Flag bits (controls algorithm behavior)
     public var flag: Int32 = 0
 
+    /// -M: Mark shorter split hits as secondary instead of supplementary
+    public static let flagNoMulti: Int32 = 0x10
+    /// -Y: Use soft clipping for supplementary alignments
+    public static let flagSoftClip: Int32 = 0x200
+
     public init() {}
 
     /// Build the scoring matrix (5x5: A,C,G,T,N)

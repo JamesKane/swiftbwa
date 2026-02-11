@@ -23,6 +23,19 @@ struct CIGARInfo: Sendable {
     var cigarString: String
 }
 
+/// Classification of an alignment segment for output.
+struct AlnSegment: Sendable {
+    let regionIndex: Int
+    let cigarInfo: CIGARInfo
+    var mapq: UInt8
+    let isPrimary: Bool
+    let isSupplementary: Bool
+    let isSecondary: Bool
+    let rname: String
+    let localPos: Int64
+    let rid: Int32
+}
+
 /// Main BWA-MEM alignment pipeline.
 /// Orchestrates SMEM finding, chaining, extension, and SAM output.
 public actor BWAMemAligner {
@@ -194,26 +207,12 @@ public actor BWAMemAligner {
                 let record = try SAMOutputBuilder.buildUnmappedRecord(read: read)
                 try outputFile.write(record: record, header: header)
             } else {
-                for (regIdx, region) in regions.enumerated() {
-                    guard region.score >= options.scoring.minOutputScore else { continue }
-                    let isPrimary = region.secondary < 0 && regIdx == 0
-
-                    let cigarInfo = generateCIGAR(read: read, region: region)
-
-                    let record = try SAMOutputBuilder.buildRecord(
-                        read: read,
-                        region: region,
-                        allRegions: regions,
-                        metadata: index.metadata,
-                        scoring: options.scoring,
-                        cigar: cigarInfo.cigar,
-                        nm: cigarInfo.nm,
-                        md: cigarInfo.md,
-                        isPrimary: isPrimary,
-                        adjustedPos: cigarInfo.pos
-                    )
-                    try outputFile.write(record: record, header: header)
-                }
+                try emitSingleEndAlignments(
+                    read: read,
+                    regions: regions,
+                    outputFile: outputFile,
+                    header: header
+                )
             }
         }
     }
@@ -372,21 +371,19 @@ public actor BWAMemAligner {
                     tlen: tlen2, mateCigarString: cigar1.cigarString
                 )
 
-                let rec1 = try SAMOutputBuilder.buildRecord(
-                    read: read1, region: reg1, allRegions: regions1,
-                    metadata: index.metadata, scoring: options.scoring,
-                    cigar: cigar1.cigar, nm: cigar1.nm, md: cigar1.md,
-                    isPrimary: true, adjustedPos: cigar1.pos, pairedEnd: pe1
+                // Emit primary read1 using emitSingleEndAlignments for full supplementary handling
+                try emitSingleEndAlignments(
+                    read: read1, regions: regions1,
+                    outputFile: outputFile, header: header,
+                    pairedEnd: pe1
                 )
-                try outputFile.write(record: rec1, header: header)
 
-                let rec2 = try SAMOutputBuilder.buildRecord(
-                    read: read2, region: reg2, allRegions: regions2,
-                    metadata: index.metadata, scoring: options.scoring,
-                    cigar: cigar2.cigar, nm: cigar2.nm, md: cigar2.md,
-                    isPrimary: true, adjustedPos: cigar2.pos, pairedEnd: pe2
+                // Emit primary read2 using emitSingleEndAlignments for full supplementary handling
+                try emitSingleEndAlignments(
+                    read: read2, regions: regions2,
+                    outputFile: outputFile, header: header,
+                    pairedEnd: pe2
                 )
-                try outputFile.write(record: rec2, header: header)
             } else if !r1Empty && r2Empty {
                 // Read 1 mapped, read 2 unmapped
                 writeMappedUnmappedPair(
@@ -405,7 +402,7 @@ public actor BWAMemAligner {
                 )
             } else {
                 // Both have regions but no valid pairing (e.g., different chromosomes)
-                // Write best region for each as unpaired
+                // Use best region for mate info, then emit with full supplementary handling
                 let bestReg1 = regions1[0]
                 let bestReg2 = regions2[0]
                 let cigar1 = generateCIGAR(read: read1, region: bestReg1)
@@ -427,22 +424,139 @@ public actor BWAMemAligner {
                     tlen: 0, mateCigarString: cigar1.cigarString
                 )
 
-                let rec1 = try SAMOutputBuilder.buildRecord(
-                    read: read1, region: bestReg1, allRegions: regions1,
-                    metadata: index.metadata, scoring: options.scoring,
-                    cigar: cigar1.cigar, nm: cigar1.nm, md: cigar1.md,
-                    isPrimary: true, adjustedPos: cigar1.pos, pairedEnd: pe1
+                try emitSingleEndAlignments(
+                    read: read1, regions: regions1,
+                    outputFile: outputFile, header: header,
+                    pairedEnd: pe1
                 )
-                try outputFile.write(record: rec1, header: header)
-
-                let rec2 = try SAMOutputBuilder.buildRecord(
-                    read: read2, region: bestReg2, allRegions: regions2,
-                    metadata: index.metadata, scoring: options.scoring,
-                    cigar: cigar2.cigar, nm: cigar2.nm, md: cigar2.md,
-                    isPrimary: true, adjustedPos: cigar2.pos, pairedEnd: pe2
+                try emitSingleEndAlignments(
+                    read: read2, regions: regions2,
+                    outputFile: outputFile, header: header,
+                    pairedEnd: pe2
                 )
-                try outputFile.write(record: rec2, header: header)
             }
+        }
+    }
+
+    // MARK: - Supplementary/Chimeric Output
+
+    /// Classify and emit alignments for a single read with proper primary/supplementary/secondary handling.
+    /// Matches bwa-mem2's mem_reg2sam() two-pass approach.
+    func emitSingleEndAlignments(
+        read: ReadSequence,
+        regions: [MemAlnReg],
+        outputFile: borrowing HTSFile,
+        header: SAMHeader,
+        pairedEnd: PairedEndInfo? = nil
+    ) throws {
+        let scoring = options.scoring
+
+        // Pass 1: Classify regions into segments
+        var segments: [AlnSegment] = []
+        var secondaryInfos: [(rname: String, pos: Int64, isReverse: Bool,
+                              cigarString: String, nm: Int32)] = []
+        var nonSecondaryCount = 0
+
+        for (regIdx, region) in regions.enumerated() {
+            guard region.score >= scoring.minOutputScore else { continue }
+
+            let cigarInfo = generateCIGAR(read: read, region: region)
+            let (rid, localPos) = index.metadata.decodePosition(cigarInfo.pos)
+            let rname = rid >= 0 && rid < index.metadata.annotations.count
+                ? index.metadata.annotations[Int(rid)].name : "*"
+
+            let mapq = MappingQuality.compute(
+                region: region,
+                allRegions: regions,
+                scoring: scoring,
+                readLength: Int32(read.length)
+            )
+
+            if region.secondary >= 0 {
+                // True secondary: overlaps a better region
+                // Check drop ratio: skip if score < parent score * 0.5
+                let parentIdx = Int(region.secondary)
+                if parentIdx < regions.count && region.score < regions[parentIdx].score / 2 {
+                    continue
+                }
+                secondaryInfos.append((
+                    rname: rname,
+                    pos: localPos,
+                    isReverse: cigarInfo.isReverse,
+                    cigarString: cigarInfo.cigarString,
+                    nm: cigarInfo.nm
+                ))
+            } else {
+                // Independent region (primary or supplementary)
+                let isPrimary = nonSecondaryCount == 0
+                let isSupplementary = nonSecondaryCount > 0
+
+                segments.append(AlnSegment(
+                    regionIndex: regIdx,
+                    cigarInfo: cigarInfo,
+                    mapq: mapq,
+                    isPrimary: isPrimary,
+                    isSupplementary: isSupplementary,
+                    isSecondary: false,
+                    rname: rname,
+                    localPos: localPos,
+                    rid: rid
+                ))
+                nonSecondaryCount += 1
+            }
+        }
+
+        guard !segments.isEmpty else {
+            let record = try SAMOutputBuilder.buildUnmappedRecord(read: read, pairedEnd: pairedEnd)
+            try outputFile.write(record: record, header: header)
+            return
+        }
+
+        // Cap supplementary MAPQ at primary's MAPQ
+        let primaryMapq = segments[0].mapq
+        for i in 1..<segments.count {
+            segments[i].mapq = min(segments[i].mapq, primaryMapq)
+        }
+
+        // Build SA tag info from all non-secondary segments
+        let saSegmentInfos: [(rname: String, pos: Int64, isReverse: Bool,
+                              cigarString: String, mapq: UInt8, nm: Int32)] =
+            segments.map { seg in
+                (rname: seg.rname, pos: seg.localPos, isReverse: seg.cigarInfo.isReverse,
+                 cigarString: seg.cigarInfo.cigarString, mapq: seg.mapq,
+                 nm: seg.cigarInfo.nm)
+            }
+
+        // Build XA tag from qualifying secondaries (on primary record only)
+        let xaTag = SAMOutputBuilder.buildXATag(secondaries: secondaryInfos)
+
+        // Pass 2: Emit records
+        for (segIdx, seg) in segments.enumerated() {
+            let region = regions[seg.regionIndex]
+
+            // SA tag: present on all non-secondary segments, excluding self
+            let saTag = segments.count > 1
+                ? SAMOutputBuilder.buildSATag(segments: saSegmentInfos, excludeIndex: segIdx)
+                : nil
+
+            let record = try SAMOutputBuilder.buildRecord(
+                read: read,
+                region: region,
+                allRegions: regions,
+                metadata: index.metadata,
+                scoring: scoring,
+                cigar: seg.cigarInfo.cigar,
+                nm: seg.cigarInfo.nm,
+                md: seg.cigarInfo.md,
+                isPrimary: seg.isPrimary,
+                isSupplementary: seg.isSupplementary,
+                mapqOverride: seg.mapq,
+                adjustedPos: seg.cigarInfo.pos,
+                pairedEnd: pairedEnd,
+                saTag: saTag,
+                xaTag: seg.isPrimary ? xaTag : nil
+            )
+            try outputFile.write(record: record, header: header)
         }
     }
 

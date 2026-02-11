@@ -76,9 +76,19 @@ public struct ExtensionAligner: Sendable {
                         }
                     }
 
-                    leftScore = result.score
-                    leftQLen = result.queryEnd
-                    leftTLen = result.targetEnd
+                    // Clip-vs-extend decision (bwa-mem2 lines 2499-2505)
+                    if result.globalScore <= 0
+                        || result.globalScore <= result.score - scoring.penClip5 {
+                        // CLIP: local alignment is better than paying the clip penalty
+                        leftQLen = result.queryEnd
+                        leftTLen = result.targetEnd
+                        leftScore = result.score
+                    } else {
+                        // EXTEND TO END: end-to-end alignment preferred
+                        leftQLen = seed.qbeg       // extends all the way to position 0
+                        leftTLen = result.globalTargetEnd
+                        leftScore = result.globalScore
+                    }
                 }
             }
 
@@ -106,9 +116,19 @@ public struct ExtensionAligner: Sendable {
                         }
                     }
 
-                    rightScore = result.score
-                    rightQLen = result.queryEnd
-                    rightTLen = result.targetEnd
+                    // Clip-vs-extend decision (bwa-mem2 lines 2716-2723)
+                    if result.globalScore <= 0
+                        || result.globalScore <= result.score - scoring.penClip3 {
+                        // CLIP: local alignment is better than paying the clip penalty
+                        rightQLen = result.queryEnd
+                        rightTLen = result.targetEnd
+                        rightScore = result.score
+                    } else {
+                        // EXTEND TO END: end-to-end alignment preferred
+                        rightQLen = readLen - seedQEnd  // extends to end of read
+                        rightTLen = result.globalTargetEnd
+                        rightScore = result.globalScore
+                    }
                 }
             }
 

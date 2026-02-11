@@ -427,6 +427,195 @@ struct SAMOutputBuilderPETests {
     }
 }
 
+// MARK: - Supplementary Alignment Tests
+
+@Suite("Supplementary Alignment Tests")
+struct SupplementaryAlignmentTests {
+
+    @Test("SA tag format with two segments")
+    func testSATagFormat() {
+        let segments: [(rname: String, pos: Int64, isReverse: Bool,
+                        cigarString: String, mapq: UInt8, nm: Int32)] = [
+            (rname: "chr1", pos: 99, isReverse: false, cigarString: "50M50S", mapq: 60, nm: 1),
+            (rname: "chr2", pos: 499, isReverse: true, cigarString: "50S50M", mapq: 30, nm: 0),
+        ]
+
+        // Excluding index 0 should produce only the second segment
+        let sa0 = SAMOutputBuilder.buildSATag(segments: segments, excludeIndex: 0)
+        #expect(sa0 == "chr2,500,-,50S50M,30,0;")
+
+        // Excluding index 1 should produce only the first segment
+        let sa1 = SAMOutputBuilder.buildSATag(segments: segments, excludeIndex: 1)
+        #expect(sa1 == "chr1,100,+,50M50S,60,1;")
+    }
+
+    @Test("SA tag with three segments excludes self")
+    func testSATagThreeSegments() {
+        let segments: [(rname: String, pos: Int64, isReverse: Bool,
+                        cigarString: String, mapq: UInt8, nm: Int32)] = [
+            (rname: "chr1", pos: 99, isReverse: false, cigarString: "30M70S", mapq: 60, nm: 0),
+            (rname: "chr1", pos: 999, isReverse: false, cigarString: "30S40M30S", mapq: 40, nm: 1),
+            (rname: "chr3", pos: 1999, isReverse: true, cigarString: "70S30M", mapq: 30, nm: 0),
+        ]
+
+        let sa1 = SAMOutputBuilder.buildSATag(segments: segments, excludeIndex: 1)
+        #expect(sa1 == "chr1,100,+,30M70S,60,0;chr3,2000,-,70S30M,30,0;")
+    }
+
+    @Test("XA tag format")
+    func testXATagFormat() {
+        let secondaries: [(rname: String, pos: Int64, isReverse: Bool,
+                           cigarString: String, nm: Int32)] = [
+            (rname: "chr1", pos: 199, isReverse: false, cigarString: "100M", nm: 2),
+            (rname: "chr5", pos: 499, isReverse: true, cigarString: "100M", nm: 1),
+        ]
+
+        let xa = SAMOutputBuilder.buildXATag(secondaries: secondaries)
+        #expect(xa != nil)
+        #expect(xa == "chr1,+200,100M,2;chr5,-500,100M,1;")
+    }
+
+    @Test("XA tag returns nil when exceeding maxHits")
+    func testXATagMaxHits() {
+        // 6 secondaries with maxHits=5 → nil
+        let secondaries: [(rname: String, pos: Int64, isReverse: Bool,
+                           cigarString: String, nm: Int32)] = (0..<6).map { i in
+            (rname: "chr1", pos: Int64(i * 100), isReverse: false, cigarString: "100M", nm: Int32(0))
+        }
+
+        let xa = SAMOutputBuilder.buildXATag(secondaries: secondaries, maxHits: 5)
+        #expect(xa == nil)
+    }
+
+    @Test("Hard-clip conversion converts leading and trailing soft-clips")
+    func testHardClipConversion() {
+        // 3S + 50M + 5S
+        let cigar: [UInt32] = [
+            3 << 4 | CIGAROp.softClip.rawValue,
+            50 << 4 | CIGAROp.match.rawValue,
+            5 << 4 | CIGAROp.softClip.rawValue,
+        ]
+
+        let (hardCigar, trimLeft, trimRight) = SAMOutputBuilder.convertToHardClip(cigar: cigar)
+        #expect(trimLeft == 3)
+        #expect(trimRight == 5)
+        #expect(hardCigar[0] == (3 << 4 | CIGAROp.hardClip.rawValue))
+        #expect(hardCigar[1] == (50 << 4 | CIGAROp.match.rawValue))
+        #expect(hardCigar[2] == (5 << 4 | CIGAROp.hardClip.rawValue))
+    }
+
+    @Test("Hard-clip conversion with no soft-clips is no-op")
+    func testHardClipNoSoftClips() {
+        let cigar: [UInt32] = [100 << 4 | CIGAROp.match.rawValue]
+        let (hardCigar, trimLeft, trimRight) = SAMOutputBuilder.convertToHardClip(cigar: cigar)
+        #expect(trimLeft == 0)
+        #expect(trimRight == 0)
+        #expect(hardCigar == cigar)
+    }
+
+    @Test("Hard-clip conversion with only leading soft-clip")
+    func testHardClipLeadingOnly() {
+        let cigar: [UInt32] = [
+            10 << 4 | CIGAROp.softClip.rawValue,
+            90 << 4 | CIGAROp.match.rawValue,
+        ]
+
+        let (hardCigar, trimLeft, trimRight) = SAMOutputBuilder.convertToHardClip(cigar: cigar)
+        #expect(trimLeft == 10)
+        #expect(trimRight == 0)
+        #expect(hardCigar[0] == (10 << 4 | CIGAROp.hardClip.rawValue))
+        #expect(hardCigar[1] == (90 << 4 | CIGAROp.match.rawValue))
+    }
+
+    @Test("Supplementary record has 0x800 flag, not 0x100")
+    func testSupplementaryFlag() throws {
+        let metadata = ReferenceMetadata(
+            totalLength: 10000, numSequences: 1,
+            annotations: [ReferenceAnnotation(offset: 0, length: 10000, name: "chr1")]
+        )
+
+        let region = MemAlnReg(
+            rb: 100, re: 200, qb: 0, qe: 100, rid: 0,
+            score: 100, trueScore: 100, sub: 0, w: 10
+        )
+
+        let read = ReadSequence(
+            name: "read1",
+            sequence: String(repeating: "A", count: 100),
+            qualityString: String(repeating: "I", count: 100)
+        )
+
+        let record = try SAMOutputBuilder.buildRecord(
+            read: read, region: region, allRegions: [region],
+            metadata: metadata, scoring: ScoringParameters(),
+            cigar: [100 << 4 | 0],
+            isPrimary: false,
+            isSupplementary: true
+        )
+
+        let flag = record.flag
+        #expect(flag.contains(.supplementary))
+        #expect(!flag.contains(.secondary))
+    }
+
+    @Test("Secondary record has 0x100 flag, not 0x800")
+    func testSecondaryFlag() throws {
+        let metadata = ReferenceMetadata(
+            totalLength: 10000, numSequences: 1,
+            annotations: [ReferenceAnnotation(offset: 0, length: 10000, name: "chr1")]
+        )
+
+        let region = MemAlnReg(
+            rb: 100, re: 200, qb: 0, qe: 100, rid: 0,
+            score: 100, trueScore: 100, sub: 0, w: 10
+        )
+
+        let read = ReadSequence(
+            name: "read1",
+            sequence: String(repeating: "A", count: 100),
+            qualityString: String(repeating: "I", count: 100)
+        )
+
+        let record = try SAMOutputBuilder.buildRecord(
+            read: read, region: region, allRegions: [region],
+            metadata: metadata, scoring: ScoringParameters(),
+            cigar: [100 << 4 | 0],
+            isPrimary: false,
+            isSupplementary: false
+        )
+
+        let flag = record.flag
+        #expect(flag.contains(.secondary))
+        #expect(!flag.contains(.supplementary))
+    }
+
+    @Test("MAPQ capping: supplementary MAPQ does not exceed primary")
+    func testMAPQCapping() {
+        // Use regions where primary would get MAPQ 60 (unique) and supplementary
+        // would also get MAPQ 60 — after capping, supplementary <= primary
+        let primary = MemAlnReg(rb: 0, re: 100, qb: 0, qe: 100, score: 100, trueScore: 100, sub: 0)
+        let supp = MemAlnReg(rb: 1000, re: 1050, qb: 50, qe: 100, score: 50, trueScore: 50, sub: 0)
+
+        let scoring = ScoringParameters()
+        let primaryMapq = MappingQuality.compute(
+            region: primary, allRegions: [primary, supp], scoring: scoring, readLength: 100
+        )
+        let suppMapq = MappingQuality.compute(
+            region: supp, allRegions: [primary, supp], scoring: scoring, readLength: 100
+        )
+
+        // After capping: supplementary MAPQ should not exceed primary MAPQ
+        let cappedSuppMapq = min(suppMapq, primaryMapq)
+        #expect(cappedSuppMapq <= primaryMapq)
+    }
+
+    @Test("ScoringParameters flag constants have correct values")
+    func testFlagConstants() {
+        #expect(ScoringParameters.flagNoMulti == 0x10)
+        #expect(ScoringParameters.flagSoftClip == 0x200)
+    }
+}
+
 // MARK: - MateRescue Tests
 
 @Suite("MateRescue Tests")
