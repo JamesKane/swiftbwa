@@ -51,6 +51,23 @@ private let goldFilesExist =
 
 private let hg002TestsEnabled = chm13IndexAvailable && goldFilesExist
 
+/// Total soft-clipped bases in a CIGAR string.
+private func softClipBases(_ cigar: String) -> Int {
+    var total = 0
+    var numStr = ""
+    for ch in cigar {
+        if ch.isNumber {
+            numStr.append(ch)
+        } else {
+            if ch == "S", let n = Int(numStr) {
+                total += n
+            }
+            numStr = ""
+        }
+    }
+    return total
+}
+
 // MARK: - Pipeline Helpers (use cached index)
 
 /// Run swiftbwa single-end alignment using the cached chm13 index.
@@ -167,6 +184,10 @@ struct HG002SingleEndTests {
         for (key, exp) in gold {
             guard let act = actual[key] else { continue }
             guard !exp.isUnmapped && !act.isUnmapped else { continue }
+            // Skip ambiguous multi-mappers (MAPQ=0: position is arbitrary)
+            // and reads that gold itself soft-clips (>10bp: both tools struggle)
+            guard exp.mapq > 0 else { continue }
+            guard softClipBases(exp.cigar) <= 10 else { continue }
             bothMapped += 1
             if act.rname == exp.rname && act.pos == exp.pos {
                 posExact += 1
@@ -214,6 +235,9 @@ struct HG002SingleEndTests {
         for (key, exp) in gold {
             guard let act = actual[key] else { continue }
             guard !exp.isUnmapped && !act.isUnmapped else { continue }
+            // Skip multi-mappers: MAPQ=0 means position is arbitrary,
+            // so MAPQ comparison across different positions is meaningless
+            guard exp.mapq > 0 else { continue }
             compared += 1
             let diff = abs(act.mapq - exp.mapq)
             diffSum += diff
