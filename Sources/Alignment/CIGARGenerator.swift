@@ -71,13 +71,15 @@ public struct CIGARGenerator: Sendable {
 
         var cigar = result.cigar
         var pos = refPos
+        var refOffset = 0  // bases squeezed from leading deletions
 
         // Squeeze leading deletions (adjust position instead)
         while !cigar.isEmpty {
             let op = cigar[0] & 0xF
             if op == CIGAROp.deletion.rawValue {
-                let len = Int64(cigar[0] >> 4)
-                pos += len
+                let len = Int(cigar[0] >> 4)
+                pos += Int64(len)
+                refOffset += len
                 cigar.removeFirst()
             } else {
                 break
@@ -94,9 +96,12 @@ public struct CIGARGenerator: Sendable {
             }
         }
 
-        // Compute NM from the (possibly trimmed) CIGAR
-        // NM is computed on the aligned portion after deletion squeeze
-        let nm = computeNMFromCigar(cigar: cigar, query: querySegment, target: refSegment)
+        // NM and MD are computed on the aligned portion after deletion squeeze.
+        // refOffset accounts for leading bases consumed by squeezed deletions.
+        let nm = computeNMFromCigar(cigar: cigar, query: querySegment,
+                                     target: refSegment, targetOffset: refOffset)
+        let md = generateMD(cigar: cigar, query: querySegment,
+                            target: refSegment, targetOffset: refOffset)
 
         // Add soft-clips
         let intQb = Int(qb)
@@ -119,7 +124,7 @@ public struct CIGARGenerator: Sendable {
             }
         }
 
-        return CIGARResult(cigar: cigar, nm: nm, score: result.score, pos: pos)
+        return CIGARResult(cigar: cigar, nm: nm, md: md, score: result.score, pos: pos)
     }
 
     /// Infer band width from score difference and gap penalties.
@@ -154,11 +159,12 @@ public struct CIGARGenerator: Sendable {
     private static func computeNMFromCigar(
         cigar: [UInt32],
         query: [UInt8],
-        target: [UInt8]
+        target: [UInt8],
+        targetOffset: Int = 0
     ) -> Int32 {
         var nm: Int32 = 0
         var qi = 0
-        var ti = 0
+        var ti = targetOffset
 
         for c in cigar {
             let op = c & 0xF
@@ -187,5 +193,74 @@ public struct CIGARGenerator: Sendable {
         }
 
         return nm
+    }
+
+    /// Generate the MD tag string from CIGAR and reference bases.
+    ///
+    /// MD format: match counts interspersed with mismatched ref bases and
+    /// `^`-prefixed deleted ref bases. E.g. `50A^GC49` means 50 matches,
+    /// mismatch (ref=A), 2bp deletion (ref=GC), 49 matches.
+    ///
+    /// Only M/I/D operations affect MD. Soft-clips are skipped.
+    private static func generateMD(
+        cigar: [UInt32],
+        query: [UInt8],
+        target: [UInt8],
+        targetOffset: Int = 0
+    ) -> String {
+        var md = ""
+        var matchCount = 0
+        var qi = 0
+        var ti = targetOffset
+
+        for c in cigar {
+            let op = c & 0xF
+            let len = Int(c >> 4)
+
+            switch op {
+            case CIGAROp.match.rawValue:
+                for _ in 0..<len {
+                    if qi < query.count && ti < target.count {
+                        if query[qi] == target[ti] {
+                            matchCount += 1
+                        } else {
+                            md += String(matchCount)
+                            md += baseChar(target[ti])
+                            matchCount = 0
+                        }
+                        qi += 1
+                        ti += 1
+                    }
+                }
+            case CIGAROp.insertion.rawValue:
+                qi += len  // insertions don't appear in MD
+            case CIGAROp.deletion.rawValue:
+                md += String(matchCount)
+                md += "^"
+                for _ in 0..<len {
+                    if ti < target.count {
+                        md += baseChar(target[ti])
+                        ti += 1
+                    }
+                }
+                matchCount = 0
+            default:
+                break
+            }
+        }
+
+        md += String(matchCount)
+        return md
+    }
+
+    /// Convert 2-bit encoded base to character.
+    private static func baseChar(_ base: UInt8) -> String {
+        switch base {
+        case 0: return "A"
+        case 1: return "C"
+        case 2: return "G"
+        case 3: return "T"
+        default: return "N"
+        }
     }
 }

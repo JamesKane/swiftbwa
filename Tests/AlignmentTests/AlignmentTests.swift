@@ -420,6 +420,124 @@ struct AlignmentTests {
         #expect(totalT == 8)
     }
 
+    // MARK: - MD Tag Tests
+
+    @Test("MD tag for perfect match")
+    func testMDPerfectMatch() {
+        let scoring = ScoringParameters()
+        let query: [UInt8] = [0, 1, 2, 3, 0, 1, 2, 3]  // ACGTACGT
+        let target: [UInt8] = [0, 1, 2, 3, 0, 1, 2, 3]
+
+        let result = CIGARGenerator.generate(
+            querySegment: query,
+            refSegment: target,
+            qb: 0, qe: 8,
+            readLength: 8,
+            isReverse: false,
+            trueScore: 8,
+            initialW: 10,
+            scoring: scoring,
+            refPos: 0
+        )
+
+        // Perfect match: MD = "8" (8 consecutive matches)
+        #expect(result.md == "8")
+    }
+
+    @Test("MD tag for single mismatch")
+    func testMDSingleMismatch() {
+        let scoring = ScoringParameters()
+        let query: [UInt8]  = [0, 1, 2, 3, 0, 1, 2, 3]  // ACGTACGT
+        let target: [UInt8] = [0, 1, 2, 3, 3, 1, 2, 3]  // ACGTTCGT (A->T at pos 4)
+
+        let result = CIGARGenerator.generate(
+            querySegment: query,
+            refSegment: target,
+            qb: 0, qe: 8,
+            readLength: 8,
+            isReverse: false,
+            trueScore: 3,
+            initialW: 10,
+            scoring: scoring,
+            refPos: 0
+        )
+
+        // 4 matches, ref=T mismatch, 3 matches: "4T3"
+        #expect(result.md == "4T3")
+        #expect(result.nm == 1)
+    }
+
+    @Test("MD tag for deletion")
+    func testMDDeletion() {
+        let scoring = ScoringParameters()
+        // Query is missing a base that's in the reference
+        let query: [UInt8]  = [0, 1, 2, 3, 0, 1]      // ACGTAC  (6bp)
+        let target: [UInt8] = [0, 1, 2, 3, 2, 0, 1]    // ACGTGAC (7bp, extra G)
+
+        let result = CIGARGenerator.generate(
+            querySegment: query,
+            refSegment: target,
+            qb: 0, qe: 6,
+            readLength: 6,
+            isReverse: false,
+            trueScore: -1,
+            initialW: 10,
+            scoring: scoring,
+            refPos: 0
+        )
+
+        // Should contain ^G or ^-prefixed deletion in MD
+        #expect(result.md.contains("^"))
+    }
+
+    @Test("MD tag for insertion has no insertion marker")
+    func testMDInsertion() {
+        let scoring = ScoringParameters()
+        // Query has an extra base not in reference
+        let query: [UInt8]  = [0, 1, 2, 3, 2, 0, 1]  // ACGTGAC (7bp, extra G)
+        let target: [UInt8] = [0, 1, 2, 3, 0, 1]      // ACGTAC  (6bp)
+
+        let result = CIGARGenerator.generate(
+            querySegment: query,
+            refSegment: target,
+            qb: 0, qe: 7,
+            readLength: 7,
+            isReverse: false,
+            trueScore: -1,
+            initialW: 10,
+            scoring: scoring,
+            refPos: 0
+        )
+
+        // Insertions don't appear in MD (no ^ marker for insertions)
+        // MD should only show matched ref bases
+        #expect(!result.md.contains("^"))
+    }
+
+    @Test("MD tag for multiple mismatches")
+    func testMDMultipleMismatches() {
+        let scoring = ScoringParameters()
+        let query: [UInt8]  = [0, 1, 2, 3, 0, 1, 2, 3, 0, 1]  // ACGTACGTAC
+        let target: [UInt8] = [0, 3, 2, 3, 0, 1, 2, 0, 0, 1]  // ATGTACGAAC
+        //                         ^                 ^           mismatches at 1,7
+
+        let result = CIGARGenerator.generate(
+            querySegment: query,
+            refSegment: target,
+            qb: 0, qe: 10,
+            readLength: 10,
+            isReverse: false,
+            trueScore: 0,
+            initialW: 10,
+            scoring: scoring,
+            refPos: 0
+        )
+
+        // 1 match, ref=T mismatch, 5 matches, ref=A mismatch, 2 matches: "1T5A2"
+        #expect(result.md == "1T5A2")
+        #expect(result.nm == 2)
+    }
+
     @Test("SeedChainer basic chaining")
     func testSeedChainer() {
         let smems = [

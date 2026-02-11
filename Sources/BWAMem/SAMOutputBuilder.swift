@@ -41,6 +41,7 @@ public struct SAMOutputBuilder: Sendable {
         scoring: ScoringParameters,
         cigar: [UInt32],
         nm: Int32 = 0,
+        md: String? = nil,
         isPrimary: Bool,
         adjustedPos: Int64? = nil,
         mateRecord: (tid: Int32, pos: Int64, isReverse: Bool)? = nil
@@ -116,6 +117,9 @@ public struct SAMOutputBuilder: Sendable {
         try aux.updateInt(tag: "AS", value: Int64(region.score))
         try aux.updateInt(tag: "XS", value: Int64(region.sub))
         try aux.updateInt(tag: "NM", value: Int64(nm))
+        if let md = md {
+            try aux.updateString(tag: "MD", value: md)
+        }
 
         return record
     }

@@ -22,14 +22,18 @@ public struct CIGARResult: Sendable {
     public var cigar: [UInt32]
     /// Edit distance
     public var nm: Int32
+    /// MD tag string (mismatches and deletions vs reference)
+    public var md: String
     /// Alignment score from global DP
     public var score: Int32
     /// Adjusted reference position (after leading deletion squeeze)
     public var pos: Int64
 
-    public init(cigar: [UInt32] = [], nm: Int32 = 0, score: Int32 = 0, pos: Int64 = 0) {
+    public init(cigar: [UInt32] = [], nm: Int32 = 0, md: String = "0",
+                score: Int32 = 0, pos: Int64 = 0) {
         self.cigar = cigar
         self.nm = nm
+        self.md = md
         self.score = score
         self.pos = pos
     }

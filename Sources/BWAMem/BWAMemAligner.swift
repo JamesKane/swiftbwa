@@ -164,6 +164,7 @@ public actor BWAMemAligner {
                         scoring: options.scoring,
                         cigar: cigar,
                         nm: nm,
+                        md: cigarResult.md,
                         isPrimary: isPrimary,
                         adjustedPos: cigarResult.pos
                     )

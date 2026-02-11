@@ -3,7 +3,7 @@
 ## Critical (output correctness)
 
 - [x] **CLI CIGAR fix** — `Sources/swiftbwa/main.swift` has its own hardcoded all-M CIGAR, bypassing `CIGARGenerator`. Needs to use `alignBatch()` or call `CIGARGenerator` directly.
-- [ ] **MD tag** — Not implemented. Required by GATK, samtools calmd, most variant callers. Walk CIGAR + reference bases to produce MD string.
+- [x] **MD tag** — Computed in `CIGARGenerator.generateMD()`, written via `aux.updateString(tag: "MD", ...)`.
 
 ## Important (real-world usability)
 
