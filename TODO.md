@@ -23,7 +23,7 @@
 
 - [ ] **Interleaved FASTQ (`-p`)** — Smart pairing from single interleaved file. Needs read-pair splitting in CLI.
 - [ ] **Append FASTQ comment (`-C`)** — bwa-mem2 appends raw FASTQ comment as SAM tags. `ReadSequence.comment` field exists but not wired through output (htslib BAMRecord doesn't support raw tag injection).
-- [ ] **Output all alignments (`-a`)** — Emit all above-threshold alignments instead of condensing into XA tag. `flagAll` constant defined but output path not modified.
+- [x] **Output all alignments (`-a`)** — Emit all above-threshold alignments as full SAM records with 0x100 flag instead of condensing into XA tag. XA tag skipped when `-a` is set.
 - [ ] **Manual insert size override (`-I`)** — Bypass estimation with user-provided mean, stddev, max, min.
 - [ ] **Fixed batch size (`-K`)** — Process fixed number of input bases per batch for reproducibility across thread counts.
 - [ ] **Reference header in XR tag (`-V`)** — Output FASTA header annotation in XR:Z aux tag.

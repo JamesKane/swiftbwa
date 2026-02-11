@@ -507,6 +507,7 @@ public actor BWAMemAligner {
     ) throws {
         let scoring = options.scoring
         let rgID = options.readGroupID
+        let outputAll = (scoring.flag & ScoringParameters.flagAll) != 0
 
         // Pass 1: Classify regions into segments
         var segments: [AlnSegment] = []
@@ -536,13 +537,28 @@ public actor BWAMemAligner {
                 if parentIdx < regions.count && region.score < regions[parentIdx].score / 2 {
                     continue
                 }
-                secondaryInfos.append((
-                    rname: rname,
-                    pos: localPos,
-                    isReverse: cigarInfo.isReverse,
-                    cigarString: cigarInfo.cigarString,
-                    nm: cigarInfo.nm
-                ))
+                if outputAll {
+                    // -a: emit as full SAM record with 0x100 flag
+                    segments.append(AlnSegment(
+                        regionIndex: regIdx,
+                        cigarInfo: cigarInfo,
+                        mapq: mapq,
+                        isPrimary: false,
+                        isSupplementary: false,
+                        isSecondary: true,
+                        rname: rname,
+                        localPos: localPos,
+                        rid: rid
+                    ))
+                } else {
+                    secondaryInfos.append((
+                        rname: rname,
+                        pos: localPos,
+                        isReverse: cigarInfo.isReverse,
+                        cigarString: cigarInfo.cigarString,
+                        nm: cigarInfo.nm
+                    ))
+                }
             } else {
                 // Independent region (primary or supplementary)
                 let noMulti = (scoring.flag & ScoringParameters.flagNoMulti) != 0
@@ -620,21 +636,25 @@ public actor BWAMemAligner {
             }
 
         // Build XA tag from qualifying secondaries (on primary record only)
-        // Use higher XA limit when ALT secondaries are present
-        let hasAltSecondary = secondaryInfos.contains { sec in
-            // Check if any secondary region is ALT
-            regions.contains { r in
-                r.secondary >= 0 && r.isAlt
-                    && index.metadata.annotations.indices.contains(Int(r.rid))
-                    && index.metadata.annotations[Int(r.rid)].name == sec.rname
+        // When -a is set, secondaries are emitted as full records, so skip XA
+        let xaTag: String?
+        if outputAll {
+            xaTag = nil
+        } else {
+            let hasAltSecondary = secondaryInfos.contains { sec in
+                regions.contains { r in
+                    r.secondary >= 0 && r.isAlt
+                        && index.metadata.annotations.indices.contains(Int(r.rid))
+                        && index.metadata.annotations[Int(r.rid)].name == sec.rname
+                }
             }
+            let effectiveMaxXA = hasAltSecondary
+                ? Int(scoring.maxXAHitsAlt)
+                : Int(scoring.maxXAHits)
+            xaTag = SAMOutputBuilder.buildXATag(
+                secondaries: secondaryInfos, maxHits: effectiveMaxXA
+            )
         }
-        let effectiveMaxXA = hasAltSecondary
-            ? Int(scoring.maxXAHitsAlt)
-            : Int(scoring.maxXAHits)
-        let xaTag = SAMOutputBuilder.buildXATag(
-            secondaries: secondaryInfos, maxHits: effectiveMaxXA
-        )
 
         // Pass 2: Emit records
         for (segIdx, seg) in segments.enumerated() {

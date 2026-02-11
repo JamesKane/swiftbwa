@@ -105,6 +105,9 @@ struct Mem: AsyncParsableCommand {
     @Flag(name: .short, help: "Treat ALT contigs as part of primary assembly")
     var j: Bool = false
 
+    @Flag(name: [.customShort("a")], help: "Output all alignments for SE or unpaired PE")
+    var outputAll: Bool = false
+
     @Argument(help: "Index prefix (reference genome)")
     var indexPrefix: String
 
@@ -156,6 +159,7 @@ struct Mem: AsyncParsableCommand {
         if skipRescue { flagBits |= ScoringParameters.flagNoRescue }
         if skipPairing { flagBits |= ScoringParameters.flagNoPairing }
         if j { flagBits |= ScoringParameters.flagNoAlt }
+        if outputAll { flagBits |= ScoringParameters.flagAll }
         scoring.flag = flagBits
 
         var options = BWAMemOptions()
