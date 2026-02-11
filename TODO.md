@@ -29,6 +29,6 @@
 - [ ] **Reference header in XR tag (`-V`)** — Output FASTA header annotation in XR:Z aux tag.
 - [ ] **Verbosity levels (`-v`)** — Gate stderr diagnostic output by level (1=error, 2=warning, 3=message, 4+=debug).
 - [ ] **Re-seeding (`-y`)** — Additional seeding rounds for long reads with high-occurrence seeds.
-- [ ] **Dedup/patch overlapping hits** — `mem_sort_dedup_patch` merges overlapping alignment regions via global re-alignment.
+- [x] **Dedup/patch overlapping hits** — `mem_sort_dedup_patch` merges overlapping alignment regions via global re-alignment. Implemented as `RegionDedup.sortDedupPatch()` in Phase 4.5 of the alignment pipeline.
 - [x] **Z-dropoff in SW extension** — SIMD implementations (BandedSW8/BandedSW16) rewritten with proper Farrar striped algorithm: diagonal shift, lazy-F correction, h0 initialization, z-dropoff, globalScore/globalTargetEnd/maxOff tracking. ExtensionAligner now uses tiered SIMD (8-bit → 16-bit fallback).
 - [ ] **Match score scaling validation** — bwa-mem2 only scales when `-A` differs from user defaults; current implementation always scales.

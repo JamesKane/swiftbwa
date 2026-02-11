@@ -1015,4 +1015,143 @@ struct AlignmentTests {
         #expect(reg.qb == 0)
         #expect(reg.qe == 30)
     }
+
+    // MARK: - RegionDedup Tests
+
+    @Test("RegionDedup no-op for 0 or 1 regions")
+    func testRegionDedupTrivial() {
+        let scoring = ScoringParameters()
+        var empty: [MemAlnReg] = []
+        RegionDedup.sortDedupPatch(
+            regions: &empty,
+            query: [0, 1, 2, 3],
+            getReference: { _, _ in [] },
+            genomeLength: 1000,
+            scoring: scoring
+        )
+        #expect(empty.isEmpty)
+
+        var single = [MemAlnReg(rb: 0, re: 50, qb: 0, qe: 50, score: 50)]
+        RegionDedup.sortDedupPatch(
+            regions: &single,
+            query: [UInt8](repeating: 0, count: 50),
+            getReference: { _, _ in [] },
+            genomeLength: 1000,
+            scoring: scoring
+        )
+        #expect(single.count == 1)
+        #expect(single[0].score == 50)
+    }
+
+    @Test("RegionDedup removes redundant overlapping region (>95% overlap)")
+    func testRegionDedupRedundant() {
+        let scoring = ScoringParameters()
+        // Two regions on same rid with >95% overlap on both ref and query
+        var regions = [
+            MemAlnReg(rb: 0, re: 100, qb: 0, qe: 100, rid: 0, score: 80),
+            MemAlnReg(rb: 1, re: 99, qb: 1, qe: 99, rid: 0, score: 60),
+        ]
+        RegionDedup.sortDedupPatch(
+            regions: &regions,
+            query: [UInt8](repeating: 0, count: 100),
+            getReference: { _, _ in [] },
+            genomeLength: 1000,
+            scoring: scoring
+        )
+        // Lower-scoring region should be removed
+        #expect(regions.count == 1)
+        #expect(regions[0].score == 80)
+    }
+
+    @Test("RegionDedup preserves non-overlapping regions on different rids")
+    func testRegionDedupDifferentRids() {
+        let scoring = ScoringParameters()
+        var regions = [
+            MemAlnReg(rb: 0, re: 100, qb: 0, qe: 50, rid: 0, score: 50),
+            MemAlnReg(rb: 200, re: 300, qb: 50, qe: 100, rid: 1, score: 40),
+        ]
+        RegionDedup.sortDedupPatch(
+            regions: &regions,
+            query: [UInt8](repeating: 0, count: 100),
+            getReference: { _, _ in [] },
+            genomeLength: 1000,
+            scoring: scoring
+        )
+        #expect(regions.count == 2)
+    }
+
+    @Test("RegionDedup removes exact duplicates (same score, rb, qb)")
+    func testRegionDedupExactDuplicates() {
+        let scoring = ScoringParameters()
+        var regions = [
+            MemAlnReg(rb: 0, re: 100, qb: 0, qe: 100, rid: 0, score: 80),
+            MemAlnReg(rb: 0, re: 100, qb: 0, qe: 100, rid: 0, score: 80),
+        ]
+        RegionDedup.sortDedupPatch(
+            regions: &regions,
+            query: [UInt8](repeating: 0, count: 100),
+            getReference: { _, _ in [] },
+            genomeLength: 1000,
+            scoring: scoring
+        )
+        #expect(regions.count == 1)
+    }
+
+    @Test("RegionDedup patches colinear adjacent regions")
+    func testRegionDedupPatch() {
+        let scoring = ScoringParameters()
+        // Two colinear regions on same rid with a small gap
+        // Region a: ref 0..50, query 0..50
+        // Region b: ref 50..100, query 50..100
+        var regions = [
+            MemAlnReg(rb: 0, re: 50, qb: 0, qe: 50, rid: 0, score: 50, w: 10),
+            MemAlnReg(rb: 50, re: 100, qb: 50, qe: 100, rid: 0, score: 50, w: 10),
+        ]
+
+        // Perfect-match reference so global alignment will produce a good score
+        let refBases = [UInt8](repeating: 0, count: 200)
+        let queryBases = [UInt8](repeating: 0, count: 100)
+
+        RegionDedup.sortDedupPatch(
+            regions: &regions,
+            query: queryBases,
+            getReference: { pos, length in
+                let start = max(0, Int(pos))
+                let end = min(refBases.count, start + length)
+                guard start < end else { return [] }
+                return Array(refBases[start..<end])
+            },
+            genomeLength: 1000,
+            scoring: scoring
+        )
+
+        // Should be merged into one region covering 0..100
+        #expect(regions.count == 1)
+        #expect(regions[0].qb == 0)
+        #expect(regions[0].qe == 100)
+        #expect(regions[0].rb == 0)
+        #expect(regions[0].re == 100)
+    }
+
+    @Test("RegionDedup output sorted by score descending")
+    func testRegionDedupScoreOrder() {
+        let scoring = ScoringParameters()
+        // Three non-overlapping regions on different rids
+        var regions = [
+            MemAlnReg(rb: 0, re: 30, qb: 0, qe: 30, rid: 0, score: 20),
+            MemAlnReg(rb: 100, re: 160, qb: 30, qe: 60, rid: 1, score: 60),
+            MemAlnReg(rb: 200, re: 240, qb: 60, qe: 100, rid: 2, score: 40),
+        ]
+        RegionDedup.sortDedupPatch(
+            regions: &regions,
+            query: [UInt8](repeating: 0, count: 100),
+            getReference: { _, _ in [] },
+            genomeLength: 1000,
+            scoring: scoring
+        )
+        #expect(regions.count == 3)
+        #expect(regions[0].score == 60)
+        #expect(regions[1].score == 40)
+        #expect(regions[2].score == 20)
+    }
 }

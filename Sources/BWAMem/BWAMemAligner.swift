@@ -102,6 +102,19 @@ public actor BWAMemAligner {
             }
         }
 
+        // Phase 4.5: Sort, deduplicate, and patch overlapping regions
+        RegionDedup.sortDedupPatch(
+            regions: &regions,
+            query: read.bases,
+            getReference: { [index] pos, length in
+                let safeLen = min(length, Int(index.packedRef.length - pos))
+                guard safeLen > 0 && pos >= 0 else { return [] }
+                return index.packedRef.subsequence(from: pos, length: safeLen)
+            },
+            genomeLength: index.genomeLength,
+            scoring: scoring
+        )
+
         // Phase 5: Mark secondary alignments (ALT-aware if any ALT regions)
         let hasAlt = regions.contains { $0.isAlt }
         if hasAlt {

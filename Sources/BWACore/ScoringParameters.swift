@@ -15,6 +15,7 @@ public struct ScoringParameters: Sendable {
     public var seedSplitRatio: Float = 1.5
     public var maxChainGap: Int32 = 10000
     public var maskLevel: Float = 0.50
+    public var maskLevelRedun: Float = 0.95
     public var unpairedPenalty: Int32 = 17
     public var maxMatesw: Int32 = 50
     public var splitWidth: Int32 = 10
