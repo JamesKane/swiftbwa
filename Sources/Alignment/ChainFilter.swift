@@ -11,8 +11,8 @@ public struct ChainFilter: Sendable {
     ) {
         guard !chains.isEmpty else { return }
 
-        let dropRatio: Float = 0.50
-        let minWeight = scoring.minSeedLength
+        let dropRatio = scoring.chainDropRatio
+        let minWeight = scoring.minChainWeight > 0 ? scoring.minChainWeight : scoring.minSeedLength
 
         // Remove chains below minimum weight
         chains.removeAll { $0.weight < minWeight }

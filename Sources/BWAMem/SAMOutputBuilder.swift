@@ -36,7 +36,8 @@ public struct SAMOutputBuilder: Sendable {
     /// Build a SAM header from reference metadata.
     public static func buildHeader(
         metadata: ReferenceMetadata,
-        readGroupLine: String? = nil
+        readGroupLine: String? = nil,
+        headerLines: String? = nil
     ) throws -> SAMHeader {
         let header = try SAMHeader()
 
@@ -54,6 +55,12 @@ public struct SAMOutputBuilder: Sendable {
         // @RG line (verbatim from user, with literal \t expanded)
         if let rgLine = readGroupLine {
             let expanded = rgLine.replacingOccurrences(of: "\\t", with: "\t")
+            try header.addLines(expanded)
+        }
+
+        // Custom header lines (-H)
+        if let hLines = headerLines {
+            let expanded = hLines.replacingOccurrences(of: "\\t", with: "\t")
             try header.addLines(expanded)
         }
 

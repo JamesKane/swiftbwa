@@ -5,12 +5,14 @@ public struct FMIndexLoader: Sendable {
 
     /// Load a complete FM-Index from the given prefix path.
     /// Expects files: {prefix}.bwt.2bit.64, {prefix}.ann, {prefix}.amb, {prefix}.pac
-    public static func load(from prefix: String) throws -> FMIndex {
+    public static func load(from prefix: String, skipAlt: Bool = false) throws -> FMIndex {
         let bwtResult = try loadBWT(from: prefix)
         let sa = try loadSA(from: prefix, referenceSeqLen: bwtResult.length)
         let pac = try loadPac(from: prefix)
         var metadata = try loadMetadata(from: prefix)
-        loadAlt(from: prefix, metadata: &metadata)
+        if !skipAlt {
+            loadAlt(from: prefix, metadata: &metadata)
+        }
 
         return FMIndex(bwt: bwtResult, suffixArray: sa, packedRef: pac, metadata: metadata)
     }

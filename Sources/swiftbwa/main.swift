@@ -21,6 +21,7 @@ struct Mem: AsyncParsableCommand {
         abstract: "Align reads using BWA-MEM algorithm"
     )
 
+    // Algorithm options
     @Option(name: .shortAndLong, help: "Number of threads")
     var threads: Int = 1
 
@@ -33,23 +34,76 @@ struct Mem: AsyncParsableCommand {
     @Option(name: .short, help: "Off-diagonal X-dropoff")
     var d: Int32 = 100
 
+    @Option(name: .short, help: "Seed split ratio")
+    var r: Float = 1.5
+
+    @Option(name: .short, help: "Skip seeds with more than INT occurrences")
+    var c: Int32 = 500
+
+    @Option(name: [.customShort("D")], help: "Drop chains shorter than FLOAT fraction of longest overlapping chain")
+    var chainDrop: Float = 0.50
+
+    @Option(name: [.customShort("W")], help: "Discard chains with seeded bases shorter than INT")
+    var minChainWeight: Int32 = 0
+
+    @Option(name: .short, help: "Max mate rescue rounds per read")
+    var m: Int32 = 50
+
+    @Flag(name: [.customShort("S")], help: "Skip mate rescue")
+    var skipRescue: Bool = false
+
+    @Flag(name: [.customShort("P")], help: "Skip pairing; mate rescue still performed unless -S")
+    var skipPairing: Bool = false
+
+    // Scoring options
+    @Option(name: [.customShort("A")], help: "Score for a sequence match (scales -TdBOELU)")
+    var matchScore: Int32 = 1
+
     @Option(name: [.customShort("B")], help: "Mismatch penalty")
     var mismatch: Int32 = 4
 
-    @Option(name: [.customShort("O")], help: "Gap open penalty")
-    var gapOpen: Int32 = 6
+    @Option(name: [.customShort("O")], help: "Gap open penalty [,INT for deletions]")
+    var gapOpen: String = "6"
 
-    @Option(name: [.customShort("E")], help: "Gap extension penalty")
-    var gapExtend: Int32 = 1
+    @Option(name: [.customShort("E")], help: "Gap extension penalty [,INT for deletions]")
+    var gapExtend: String = "1"
+
+    @Option(name: [.customShort("L")], help: "Clipping penalty [,INT for 3' end]")
+    var clipPenalty: String = "5"
+
+    @Option(name: [.customShort("U")], help: "Penalty for unpaired read pair")
+    var unpairedPenalty: Int32 = 17
 
     @Option(name: [.customShort("T")], help: "Minimum alignment score to output")
     var minScore: Int32 = 30
 
+    @Option(name: [.customLong("xa-hits")], help: "XA hit limits [,INT for ALT contigs]")
+    var xaHits: String = "5,200"
+
+    // Input/output options
     @Option(name: [.customShort("R")], help: "Read group header line (@RG\\tID:...)")
     var readGroup: String?
 
+    @Option(name: [.customShort("H")], help: "Insert header lines (string starting with @ or file path)")
+    var headerLines: String?
+
     @Option(name: .shortAndLong, help: "Output file [stdout]")
     var output: String?
+
+    @Flag(name: [.customShort("M")], help: "Mark shorter split hits as secondary")
+    var markSecondary: Bool = false
+
+    @Flag(name: [.customShort("Y")], help: "Use soft clipping for supplementary alignments")
+    var softClipSupp: Bool = false
+
+    @Flag(name: [.customShort("5")], help: "Take split alignment with smallest coordinate as primary")
+    var primary5: Bool = false
+
+    @Flag(name: .short, help: "Don't modify MAPQ of supplementary alignments")
+    var q: Bool = false
+
+    @Flag(name: .short, help: "Treat ALT contigs as part of primary assembly")
+    var j: Bool = false
 
     @Argument(help: "Index prefix (reference genome)")
     var indexPrefix: String
@@ -58,27 +112,70 @@ struct Mem: AsyncParsableCommand {
     var fastqFiles: [String]
 
     func run() async throws {
+        // Parse comma-separated penalty pairs
+        let gapOpenParts = gapOpen.split(separator: ",").compactMap { Int32($0) }
+        let gapExtendParts = gapExtend.split(separator: ",").compactMap { Int32($0) }
+        let clipParts = clipPenalty.split(separator: ",").compactMap { Int32($0) }
+        let xaParts = xaHits.split(separator: ",").compactMap { Int32($0) }
+
         // Build scoring parameters
         var scoring = ScoringParameters()
+        scoring.matchScore = matchScore
         scoring.minSeedLength = k
         scoring.bandWidth = w
         scoring.zDrop = d
-        scoring.mismatchPenalty = mismatch
-        scoring.gapOpenPenalty = gapOpen
-        scoring.gapExtendPenalty = gapExtend
-        scoring.gapOpenPenaltyDeletion = gapOpen
-        scoring.gapExtendPenaltyDeletion = gapExtend
-        scoring.minOutputScore = minScore
+        scoring.seedSplitRatio = r
+        scoring.maxOccurrences = c
+        scoring.chainDropRatio = chainDrop
+        scoring.minChainWeight = minChainWeight
+        scoring.maxMatesw = m
+        scoring.unpairedPenalty = unpairedPenalty
         scoring.numThreads = threads
+
+        // Scale penalties by match score if -A != 1 and user didn't override
+        let a = matchScore
+        scoring.mismatchPenalty = mismatch * a
+        scoring.gapOpenPenalty = gapOpenParts[0] * a
+        scoring.gapExtendPenalty = gapExtendParts[0] * a
+        scoring.gapOpenPenaltyDeletion = (gapOpenParts.count > 1 ? gapOpenParts[1] : gapOpenParts[0]) * a
+        scoring.gapExtendPenaltyDeletion = (gapExtendParts.count > 1 ? gapExtendParts[1] : gapExtendParts[0]) * a
+        scoring.penClip5 = (clipParts.first ?? 5) * a
+        scoring.penClip3 = (clipParts.count > 1 ? clipParts[1] : clipParts.first ?? 5) * a
+        scoring.minOutputScore = minScore * a
+        scoring.zDrop = d * a
+
+        scoring.maxXAHits = xaParts.first ?? 5
+        scoring.maxXAHitsAlt = xaParts.count > 1 ? xaParts[1] : 200
+
+        // Set behavioral flags
+        var flagBits: Int32 = 0
+        if markSecondary { flagBits |= ScoringParameters.flagNoMulti }
+        if softClipSupp { flagBits |= ScoringParameters.flagSoftClip }
+        if primary5 { flagBits |= ScoringParameters.flagPrimary5 | ScoringParameters.flagKeepSuppMapq }
+        if q { flagBits |= ScoringParameters.flagKeepSuppMapq }
+        if skipRescue { flagBits |= ScoringParameters.flagNoRescue }
+        if skipPairing { flagBits |= ScoringParameters.flagNoPairing }
+        if j { flagBits |= ScoringParameters.flagNoAlt }
+        scoring.flag = flagBits
 
         var options = BWAMemOptions()
         options.scoring = scoring
         options.isPairedEnd = fastqFiles.count >= 2
         options.readGroupLine = readGroup
+        options.ignoreAlt = j
+
+        // Handle -H: string starting with @ or file path
+        if let hArg = headerLines {
+            if hArg.hasPrefix("@") {
+                options.headerLines = hArg
+            } else {
+                options.headerLines = try String(contentsOfFile: hArg, encoding: .utf8)
+            }
+        }
 
         // Load index
         fputs("Loading index from \(indexPrefix)...\n", stderr)
-        let index = try FMIndexLoader.load(from: indexPrefix)
+        let index = try FMIndexLoader.load(from: indexPrefix, skipAlt: options.ignoreAlt)
         fputs("Index loaded: ref_len=\(index.referenceSeqLen), "
               + "genome_len=\(index.genomeLength), "
               + "\(index.metadata.numSequences) sequences\n", stderr)
@@ -89,7 +186,9 @@ struct Mem: AsyncParsableCommand {
 
         let aligner = BWAMemAligner(index: index, options: options)
         let header = try SAMOutputBuilder.buildHeader(
-            metadata: index.metadata, readGroupLine: options.readGroupLine
+            metadata: index.metadata,
+            readGroupLine: options.readGroupLine,
+            headerLines: options.headerLines
         )
         let outFile = try HTSFile(path: outputPath, mode: outputMode)
         try header.write(to: outFile)

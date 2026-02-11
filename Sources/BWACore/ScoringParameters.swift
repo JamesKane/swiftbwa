@@ -34,11 +34,29 @@ public struct ScoringParameters: Sendable {
     public var maxXAHitsAlt: Int32 = 200
     /// XA drop ratio threshold
     public var xaDropRatio: Float = 0.80
+    /// Chain drop ratio (-D): drop chains shorter than this fraction of the longest overlapping chain
+    public var chainDropRatio: Float = 0.50
+    /// Minimum chain weight (-W): discard chains with seeded bases shorter than this
+    public var minChainWeight: Int32 = 0
+
+    // MARK: - Flag constants
 
     /// -M: Mark shorter split hits as secondary instead of supplementary
     public static let flagNoMulti: Int32 = 0x10
     /// -Y: Use soft clipping for supplementary alignments
     public static let flagSoftClip: Int32 = 0x200
+    /// -5: Take split alignment with smallest coordinate as primary
+    public static let flagPrimary5: Int32 = 0x800
+    /// -q/-5: Don't cap supplementary MAPQ at primary MAPQ
+    public static let flagKeepSuppMapq: Int32 = 0x1000
+    /// -S: Skip mate rescue
+    public static let flagNoRescue: Int32 = 0x20
+    /// -P: Skip pairing (treat PE reads as independent SE)
+    public static let flagNoPairing: Int32 = 0x4
+    /// -a: Output all alignments for SE or unpaired PE
+    public static let flagAll: Int32 = 0x8
+    /// -j: Treat ALT contigs as primary (ignore .alt file)
+    public static let flagNoAlt: Int32 = 0x2000
 
     public init() {}
 

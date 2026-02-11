@@ -6,6 +6,12 @@ public struct BWAMemOptions: Sendable {
     public var outputMode: OutputMode
     public var isPairedEnd: Bool
     public var readGroupLine: String?
+    /// Extra header lines to insert (-H)
+    public var headerLines: String?
+    /// Append FASTQ comment to SAM output (-C)
+    public var appendComment: Bool = false
+    /// Skip ALT contig loading (-j)
+    public var ignoreAlt: Bool = false
 
     public enum OutputMode: Sendable {
         case sam

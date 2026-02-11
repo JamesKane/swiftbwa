@@ -289,11 +289,12 @@ public actor BWAMemAligner {
                   + "treating as unpaired for scoring\n", stderr)
         }
 
-        // Phase 2.5: Mate rescue
+        // Phase 2.5: Mate rescue (skip if -S)
         var mutableRegions1 = allRegions1
         var mutableRegions2 = allRegions2
+        let skipRescue = (options.scoring.flag & ScoringParameters.flagNoRescue) != 0
 
-        if !primaryStats.failed {
+        if !primaryStats.failed && !skipRescue {
             let scoring = options.scoring
             for i in 0..<pairCount {
                 // Rescue read2 using read1's alignments as templates
@@ -339,6 +340,7 @@ public actor BWAMemAligner {
         }
 
         // Phase 3: For each pair, resolve and write output
+        let skipPairing = (options.scoring.flag & ScoringParameters.flagNoPairing) != 0
         let rgID = options.readGroupID
         for i in 0..<pairCount {
             let read1 = reads1[i]
@@ -374,8 +376,8 @@ public actor BWAMemAligner {
                 continue
             }
 
-            // Try to resolve best pair
-            let decision = PairedEndResolver.resolve(
+            // Try to resolve best pair (skip if -P)
+            let decision = skipPairing ? nil : PairedEndResolver.resolve(
                 regions1: regions1,
                 regions2: regions2,
                 dist: dist,
@@ -530,8 +532,10 @@ public actor BWAMemAligner {
                 ))
             } else {
                 // Independent region (primary or supplementary)
+                let noMulti = (scoring.flag & ScoringParameters.flagNoMulti) != 0
                 let isPrimary = nonSecondaryCount == 0
-                let isSupplementary = nonSecondaryCount > 0
+                let isSupplementary = nonSecondaryCount > 0 && !noMulti
+                let isSecondary = nonSecondaryCount > 0 && noMulti
 
                 segments.append(AlnSegment(
                     regionIndex: regIdx,
@@ -539,7 +543,7 @@ public actor BWAMemAligner {
                     mapq: mapq,
                     isPrimary: isPrimary,
                     isSupplementary: isSupplementary,
-                    isSecondary: false,
+                    isSecondary: isSecondary,
                     rname: rname,
                     localPos: localPos,
                     rid: rid
@@ -556,11 +560,40 @@ public actor BWAMemAligner {
             return
         }
 
+        // -5: Reorder so smallest-coordinate segment becomes primary
+        if (scoring.flag & ScoringParameters.flagPrimary5) != 0 && segments.count > 1 {
+            var minIdx = 0
+            for i in 1..<segments.count {
+                if segments[i].localPos < segments[minIdx].localPos {
+                    minIdx = i
+                }
+            }
+            if minIdx != 0 {
+                segments.swapAt(0, minIdx)
+                for i in 0..<segments.count {
+                    segments[i] = AlnSegment(
+                        regionIndex: segments[i].regionIndex,
+                        cigarInfo: segments[i].cigarInfo,
+                        mapq: segments[i].mapq,
+                        isPrimary: i == 0,
+                        isSupplementary: i > 0,
+                        isSecondary: segments[i].isSecondary,
+                        rname: segments[i].rname,
+                        localPos: segments[i].localPos,
+                        rid: segments[i].rid
+                    )
+                }
+            }
+        }
+
         // Cap supplementary MAPQ at primary's MAPQ, except for ALT hits
-        let primaryMapq = segments[0].mapq
-        for i in 1..<segments.count {
-            if !regions[segments[i].regionIndex].isAlt {
-                segments[i].mapq = min(segments[i].mapq, primaryMapq)
+        // Skip if -q or -5 (flagKeepSuppMapq)
+        if (scoring.flag & ScoringParameters.flagKeepSuppMapq) == 0 {
+            let primaryMapq = segments[0].mapq
+            for i in 1..<segments.count {
+                if !regions[segments[i].regionIndex].isAlt {
+                    segments[i].mapq = min(segments[i].mapq, primaryMapq)
+                }
             }
         }
 
