@@ -8,7 +8,7 @@
 ## Important (real-world usability)
 
 - [x] **Paired-end alignment** — `alignPairedBatch()` wired into CLI. `PairedEndResolver` resolves best pair, `InsertSizeEstimator` infers distribution, TLEN set, proper-pair flagged, MC tag written. Mate rescue implemented (`MateRescue.rescue()` via `LocalSWAligner`) as Phase 2.5 in the paired-end pipeline.
-- [~] **CLI parallelization** — `alignBatch()`/`alignPairedBatch()` use TaskGroup; reads DO run concurrently. Remaining gap: `-t` flag is stored in `ScoringParameters.numThreads` but **never limits concurrency** — all reads launch as concurrent tasks regardless of `-t` value.
+- [x] **CLI parallelization** — `alignBatch()`/`alignPairedBatch()` use TaskGroup with sliding-window concurrency capped at `numThreads`. `alignRead()` is `nonisolated` so child tasks run truly in parallel.
 - [x] **Supplementary/chimeric alignments** — Two-pass output classification (primary/supplementary/secondary) in `BWAMemAligner.emitSingleEndAlignments()`. SA and XA tag generation. Hard-clip conversion for supplementary records. MAPQ capping. Paired-end path emits supplementary alignments with proper mate info.
 
 ## Nice-to-have / advanced

@@ -48,7 +48,7 @@ public actor BWAMemAligner {
     }
 
     /// Align a single read against the reference.
-    public func alignRead(_ read: ReadSequence) -> [MemAlnReg] {
+    nonisolated public func alignRead(_ read: ReadSequence) -> [MemAlnReg] {
         let scoring = options.scoring
 
         // Phase 1: Find SMEMs
@@ -196,22 +196,39 @@ public actor BWAMemAligner {
         outputFile: borrowing HTSFile,
         header: SAMHeader
     ) async throws {
-        // Process reads in parallel using TaskGroup
+        // Process reads in parallel using TaskGroup with sliding-window concurrency
+        let maxConcurrency = options.scoring.numThreads
+
         let results = await withTaskGroup(
             of: (Int, [MemAlnReg]).self,
             returning: [(Int, [MemAlnReg])].self
         ) { group in
-            for (idx, read) in reads.enumerated() {
+            var nextIdx = 0
+            var collected: [(Int, [MemAlnReg])] = []
+
+            // Seed initial batch
+            while nextIdx < min(maxConcurrency, reads.count) {
+                let idx = nextIdx
+                let read = reads[idx]
                 group.addTask { [self] in
-                    let regions = await self.alignRead(read)
-                    return (idx, regions)
+                    (idx, self.alignRead(read))
+                }
+                nextIdx += 1
+            }
+
+            // As each completes, launch next
+            for await result in group {
+                collected.append(result)
+                if nextIdx < reads.count {
+                    let idx = nextIdx
+                    let read = reads[idx]
+                    group.addTask { [self] in
+                        (idx, self.alignRead(read))
+                    }
+                    nextIdx += 1
                 }
             }
 
-            var collected: [(Int, [MemAlnReg])] = []
-            for await result in group {
-                collected.append(result)
-            }
             return collected.sorted { $0.0 < $1.0 }
         }
 
@@ -626,20 +643,37 @@ public actor BWAMemAligner {
 
     /// Align all reads in parallel and return regions indexed by read position.
     private func alignAllReads(_ reads: [ReadSequence]) async -> [[MemAlnReg]] {
+        let maxConcurrency = options.scoring.numThreads
         let results = await withTaskGroup(
             of: (Int, [MemAlnReg]).self,
             returning: [(Int, [MemAlnReg])].self
         ) { group in
-            for (idx, read) in reads.enumerated() {
-                group.addTask { [self] in
-                    let regions = await self.alignRead(read)
-                    return (idx, regions)
-                }
-            }
+            var nextIdx = 0
             var collected: [(Int, [MemAlnReg])] = []
+
+            // Seed initial batch
+            while nextIdx < min(maxConcurrency, reads.count) {
+                let idx = nextIdx
+                let read = reads[idx]
+                group.addTask { [self] in
+                    (idx, self.alignRead(read))
+                }
+                nextIdx += 1
+            }
+
+            // As each completes, launch next
             for await result in group {
                 collected.append(result)
+                if nextIdx < reads.count {
+                    let idx = nextIdx
+                    let read = reads[idx]
+                    group.addTask { [self] in
+                        (idx, self.alignRead(read))
+                    }
+                    nextIdx += 1
+                }
             }
+
             return collected.sorted { $0.0 < $1.0 }
         }
         return results.map { $0.1 }
