@@ -71,6 +71,11 @@ public struct ExtensionAligner: Sendable {
             reg.seedCov = seed.len
             reg.seedLen0 = Int32(seeds.count)
 
+            // Accumulated h0 chains through extensions (matches bwa-mem2's sc0 pattern).
+            // Left extension starts from seed.score; right extension starts from left's
+            // local best (or seed.score if left didn't run).
+            var accumulatedH0 = seed.score
+
             // --- Left extension ---
             var leftScore: Int32 = 0
             var leftQLen: Int32 = 0
@@ -96,6 +101,9 @@ public struct ExtensionAligner: Sendable {
                             )
                         }
                     }
+
+                    // Update accumulated h0 to left's local best (bwa-mem2: sc0 = a->score)
+                    accumulatedH0 = result.score
 
                     // Clip-vs-extend decision (bwa-mem2 lines 2499-2505)
                     if result.globalScore <= 0
@@ -132,7 +140,7 @@ public struct ExtensionAligner: Sendable {
                                 target: tBuf,
                                 scoring: scoring,
                                 w: bandWidth,
-                                h0: seed.score
+                                h0: accumulatedH0
                             )
                         }
                     }
@@ -158,13 +166,18 @@ public struct ExtensionAligner: Sendable {
             reg.qe = seedQEnd + rightQLen
             reg.rb = seed.rbeg - Int64(leftTLen)
             reg.re = seedREnd + Int64(rightTLen)
-            // Each extension score includes h0 (= seed.score) as a baseline from the
-            // banded SW initialization (maxScore = h0). Subtract it to avoid counting
-            // the seed contribution twice per extension side.
-            let leftAdj = leftScore > 0 ? seed.score : Int32(0)
-            let rightAdj = rightScore > 0 ? seed.score : Int32(0)
-            reg.score = (leftScore - leftAdj) + Int32(seed.len) * scoring.matchScore + (rightScore - rightAdj)
-            reg.trueScore = reg.score
+            // Score: matches bwa-mem2's truesc accumulation pattern.
+            // truesc starts at seed.score, is replaced by leftChosen (which includes
+            // h0=seed.score), then adds rightChosen - rightH0 (rightH0 = accumulatedH0).
+            var trueScore = Int32(seed.len) * scoring.matchScore
+            if leftScore > 0 {
+                trueScore = leftScore
+            }
+            if rightScore > 0 {
+                trueScore += rightScore - accumulatedH0
+            }
+            reg.score = trueScore
+            reg.trueScore = trueScore
 
             coveredRegions.append((reg.qb, reg.qe, reg.rb, reg.re))
             regions.append(reg)
