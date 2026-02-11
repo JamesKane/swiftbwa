@@ -23,6 +23,10 @@ public struct OrientationStats: Sendable {
     public var stddev: Double = 0
     public var count: Int = 0
     public var failed: Bool = true
+    /// Lower proper-pair bound for rescue: Q25 - 3*IQR, capped at mean - 4*stddev
+    public var properLow: Int64 = 0
+    /// Upper proper-pair bound for rescue: Q75 + 3*IQR, capped at mean + 4*stddev
+    public var properHigh: Int64 = 0
 
     public init() {}
 }
@@ -46,8 +50,13 @@ public struct InsertSizeEstimator: Sendable {
 
     /// Infer pair orientation and unsigned insert size from two alignment regions.
     ///
-    /// Uses the BWT coordinate convention: positions >= genomeLength are on the
-    /// reverse-complement strand.
+    /// Uses bwa-mem2's `mem_infer_dir` algorithm with start-to-start distance metric
+    /// in BWT coordinate space. Positions >= genomeLength are on the reverse strand.
+    ///
+    /// The bwa direction encoding is:
+    /// - bit 0: 0 = same strand, 1 = different strand
+    /// - XOR with 3 if p2 <= b1 (i.e., mate is upstream)
+    /// - Result: FF=0, FR=1, RF=2, RR=3
     ///
     /// - Parameters:
     ///   - r1: Primary alignment region for read 1
@@ -59,50 +68,21 @@ public struct InsertSizeEstimator: Sendable {
     ) -> (orientation: PairOrientation, insertSize: Int64)? {
         guard r1.rid == r2.rid else { return nil }
 
-        let r1Reverse = r1.rb >= genomeLength
-        let r2Reverse = r2.rb >= genomeLength
+        // Mirror r2 onto r1's strand if they're on different strands
+        let sameStrand = (r1.rb >= genomeLength) == (r2.rb >= genomeLength)
+        let p2 = sameStrand ? r2.rb : (2 * genomeLength - 1 - r2.rb)
 
-        // Convert to forward-strand positions
-        let r1Start: Int64
-        let r1End: Int64
-        if r1Reverse {
-            r1Start = 2 * genomeLength - r1.re
-            r1End = 2 * genomeLength - r1.rb
-        } else {
-            r1Start = r1.rb
-            r1End = r1.re
-        }
+        // Start-to-start distance
+        let dist = abs(p2 - r1.rb)
 
-        let r2Start: Int64
-        let r2End: Int64
-        if r2Reverse {
-            r2Start = 2 * genomeLength - r2.re
-            r2End = 2 * genomeLength - r2.rb
-        } else {
-            r2Start = r2.rb
-            r2End = r2.re
-        }
+        // bwa direction encoding: same-strand→0, diff→1, XOR with 3 if p2<=b1
+        let bwaDir = (sameStrand ? 0 : 1) ^ (p2 > r1.rb ? 0 : 3)
 
-        // Insert size = distance between outer coordinates
-        let outerLeft = min(r1Start, r2Start)
-        let outerRight = max(r1End, r2End)
-        let isize = outerRight - outerLeft
+        // Map bwa dir (FF=0, FR=1, RF=2, RR=3) to PairOrientation
+        let orientations: [PairOrientation] = [.ff, .fr, .rf, .rr]
+        let orientation = orientations[bwaDir]
 
-        // Determine orientation based on strand and relative position
-        let orientation: PairOrientation
-        if !r1Reverse && r2Reverse {
-            // Read1 forward, read2 reverse
-            orientation = r1Start <= r2Start ? .fr : .rf
-        } else if r1Reverse && !r2Reverse {
-            // Read1 reverse, read2 forward
-            orientation = r2Start <= r1Start ? .fr : .rf
-        } else if !r1Reverse && !r2Reverse {
-            orientation = .ff
-        } else {
-            orientation = .rr
-        }
-
-        return (orientation, isize)
+        return (orientation, dist)
     }
 
     /// Estimate insert size distribution from a set of high-quality pairs.
@@ -194,6 +174,12 @@ public struct InsertSizeEstimator: Sendable {
             dist.stats[idx].stddev = stddev
             dist.stats[idx].count = filtered.count
             dist.stats[idx].failed = false
+
+            // Proper-pair bounds for mate rescue (bwa-mem2 MAPPING_BOUND=3, MAX_STDDEV=4)
+            let pLow = q25 - 3 * iqr
+            let pHigh = q75 + 3 * iqr
+            dist.stats[idx].properLow = max(pLow, Int64(mean - 4.0 * stddev + 0.5))
+            dist.stats[idx].properHigh = min(pHigh, Int64(mean + 4.0 * stddev + 0.5))
 
             if filtered.count > maxCount {
                 maxCount = filtered.count

@@ -254,12 +254,61 @@ public actor BWAMemAligner {
                   + "treating as unpaired for scoring\n", stderr)
         }
 
+        // Phase 2.5: Mate rescue
+        var mutableRegions1 = allRegions1
+        var mutableRegions2 = allRegions2
+
+        if !primaryStats.failed {
+            let scoring = options.scoring
+            for i in 0..<pairCount {
+                // Rescue read2 using read1's alignments as templates
+                let templates1 = selectRescueCandidates(mutableRegions1[i], scoring: scoring)
+                let rescued2 = MateRescue.rescue(
+                    templateRegions: templates1,
+                    mateRead: reads2[i],
+                    mateRegions: mutableRegions2[i],
+                    dist: dist,
+                    genomeLength: genomeLen,
+                    packedRef: index.packedRef,
+                    metadata: index.metadata,
+                    scoring: scoring
+                )
+                mutableRegions2[i].append(contentsOf: rescued2)
+
+                // Rescue read1 using read2's alignments (symmetric)
+                let templates2 = selectRescueCandidates(mutableRegions2[i], scoring: scoring)
+                let rescued1 = MateRescue.rescue(
+                    templateRegions: templates2,
+                    mateRead: reads1[i],
+                    mateRegions: mutableRegions1[i],
+                    dist: dist,
+                    genomeLength: genomeLen,
+                    packedRef: index.packedRef,
+                    metadata: index.metadata,
+                    scoring: scoring
+                )
+                mutableRegions1[i].append(contentsOf: rescued1)
+
+                // Re-mark secondaries after adding rescued regions
+                if mutableRegions1[i].count > 1 {
+                    ChainFilter.markSecondary(
+                        regions: &mutableRegions1[i], maskLevel: scoring.maskLevel
+                    )
+                }
+                if mutableRegions2[i].count > 1 {
+                    ChainFilter.markSecondary(
+                        regions: &mutableRegions2[i], maskLevel: scoring.maskLevel
+                    )
+                }
+            }
+        }
+
         // Phase 3: For each pair, resolve and write output
         for i in 0..<pairCount {
             let read1 = reads1[i]
             let read2 = reads2[i]
-            let regions1 = allRegions1[i]
-            let regions2 = allRegions2[i]
+            let regions1 = mutableRegions1[i]
+            let regions2 = mutableRegions2[i]
 
             let r1Empty = regions1.isEmpty
             let r2Empty = regions2.isEmpty
@@ -398,6 +447,24 @@ public actor BWAMemAligner {
     }
 
     // MARK: - Private Helpers
+
+    /// Select rescue candidate regions: primary regions with score >= bestScore - unpairedPenalty,
+    /// capped at maxMatesw. Matches bwa-mem2 lines 382-385.
+    private func selectRescueCandidates(
+        _ regions: [MemAlnReg], scoring: ScoringParameters
+    ) -> [MemAlnReg] {
+        guard let bestScore = regions.first(where: { $0.secondary < 0 })?.score else {
+            return []
+        }
+        let threshold = bestScore - scoring.unpairedPenalty
+        var candidates: [MemAlnReg] = []
+        for r in regions {
+            guard r.secondary < 0 && r.score >= threshold else { continue }
+            candidates.append(r)
+            if candidates.count >= Int(scoring.maxMatesw) { break }
+        }
+        return candidates
+    }
 
     /// Align all reads in parallel and return regions indexed by read position.
     private func alignAllReads(_ reads: [ReadSequence]) async -> [[MemAlnReg]] {

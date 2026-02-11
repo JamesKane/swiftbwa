@@ -62,6 +62,6 @@ let package = Package(
         .testTarget(name: "BWACoreTests", dependencies: ["BWACore"]),
         .testTarget(name: "FMIndexTests", dependencies: ["FMIndex"]),
         .testTarget(name: "AlignmentTests", dependencies: ["Alignment"]),
-        .testTarget(name: "BWAMemTests", dependencies: ["BWAMem"]),
+        .testTarget(name: "BWAMemTests", dependencies: ["BWAMem", "FMIndex", "Alignment"]),
     ]
 )

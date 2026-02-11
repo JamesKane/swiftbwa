@@ -1,6 +1,8 @@
 import Testing
 @testable import BWAMem
 @testable import BWACore
+@testable import FMIndex
+@testable import Alignment
 
 @Suite("BWAMem Tests")
 struct BWAMemTests {
@@ -59,36 +61,33 @@ struct InsertSizeEstimatorTests {
     @Test("Infer FR orientation: read1 forward, read2 reverse, r1 left of r2")
     func testInferOrientationFR() {
         let genomeLen: Int64 = 10000
-        // Read1: forward strand, pos 100-200
+        // Read1: forward strand, rb=100
         let r1 = MemAlnReg(rb: 100, re: 200, qb: 0, qe: 100, rid: 0, score: 100)
-        // Read2: reverse strand, pos 300-400 (in BWT coords: genomeLen + something)
-        // Reverse strand coords: rb >= genomeLen
-        // Forward-strand pos = 2*genomeLen - re ... 2*genomeLen - rb
-        // Want fwd pos 300-400: 2*10000 - re = 300 → re = 19700; 2*10000 - rb = 400 → rb = 19600
+        // Read2: reverse strand, rb=19600 (BWT coords)
+        // Mirror onto r1's strand: p2 = 2*10000 - 1 - 19600 = 399
+        // dist = |399 - 100| = 299, bwaDir = 1^0 = 1 (FR)
         let r2 = MemAlnReg(rb: 19600, re: 19700, qb: 0, qe: 100, rid: 0, score: 100)
 
         let result = InsertSizeEstimator.inferOrientation(r1: r1, r2: r2, genomeLength: genomeLen)
         #expect(result != nil)
         #expect(result!.orientation == .fr)
-        // Insert size: outer coords = min(100,300)=100, max(200,400)=400, span=300
-        #expect(result!.insertSize == 300)
+        // Start-to-start distance: 299
+        #expect(result!.insertSize == 299)
     }
 
-    @Test("Infer RF orientation: read1 reverse before read2 forward")
+    @Test("Infer RF orientation: read2 forward, upstream of read1 reverse")
     func testInferOrientationRF() {
         let genomeLen: Int64 = 10000
-        // Read1: reverse strand, fwd pos 300-400
-        // 2*10000 - re = 300 → re=19700; 2*10000 - rb = 400 → rb=19600
-        let r1 = MemAlnReg(rb: 19600, re: 19700, qb: 0, qe: 100, rid: 0, score: 100)
-        // Read2: forward strand, pos 100-200
-        let r2 = MemAlnReg(rb: 100, re: 200, qb: 0, qe: 100, rid: 0, score: 100)
+        // r1 is forward, r2 is reverse, with r2 mirrored position < r1 → RF
+        // r1 forward at rb=500, r2 reverse at rb=19800
+        // p2 = 2*10000 - 1 - 19800 = 199 (mirrored, < r1.rb=500)
+        // bwaDir = 1 ^ 3 = 2 → RF
+        let r1 = MemAlnReg(rb: 500, re: 600, qb: 0, qe: 100, rid: 0, score: 100)
+        let r2 = MemAlnReg(rb: 19800, re: 19900, qb: 0, qe: 100, rid: 0, score: 100)
 
         let result = InsertSizeEstimator.inferOrientation(r1: r1, r2: r2, genomeLength: genomeLen)
         #expect(result != nil)
-        // r1 is reverse, r2 is forward: r2Start(100) <= r1Start(300) → FR
-        // Actually: r1Reverse=true, r2Reverse=false → "r1Reverse && !r2Reverse" case
-        // r2Start(100) <= r1Start(300) → .fr
-        #expect(result!.orientation == .fr)
+        #expect(result!.orientation == .rf)
     }
 
     @Test("Infer FF orientation: both forward")
@@ -102,11 +101,13 @@ struct InsertSizeEstimatorTests {
         #expect(result!.orientation == .ff)
     }
 
-    @Test("Infer RR orientation: both reverse")
+    @Test("Infer RR orientation: both reverse, b1 > b2")
     func testInferOrientationRR() {
         let genomeLen: Int64 = 10000
-        let r1 = MemAlnReg(rb: 19600, re: 19700, qb: 0, qe: 100, rid: 0, score: 100)
-        let r2 = MemAlnReg(rb: 19800, re: 19900, qb: 0, qe: 100, rid: 0, score: 100)
+        // Under bwa encoding, two same-strand reads where p2 <= b1 → dir = 0^3 = 3 (RR)
+        // r1 at higher BWT position than r2
+        let r1 = MemAlnReg(rb: 19800, re: 19900, qb: 0, qe: 100, rid: 0, score: 100)
+        let r2 = MemAlnReg(rb: 19600, re: 19700, qb: 0, qe: 100, rid: 0, score: 100)
 
         let result = InsertSizeEstimator.inferOrientation(r1: r1, r2: r2, genomeLength: genomeLen)
         #expect(result != nil)
@@ -126,25 +127,25 @@ struct InsertSizeEstimatorTests {
     @Test("Estimate distribution with known FR insert sizes")
     func testEstimateDistribution() {
         let genomeLen: Int64 = 100000
-        // Create 100 simulated FR pairs with insert sizes around 300 (±20)
+        // Create 100 simulated FR pairs with start-to-start distances around 300 (±20)
+        // Using bwa-mem2's start-to-start metric:
+        //   p2 = 2*genomeLen - 1 - r2.rb, dist = |p2 - r1.rb|
         var regions1: [[MemAlnReg]] = []
         var regions2: [[MemAlnReg]] = []
 
         for i in 0..<100 {
-            let insertSize = 280 + Int64(i % 41)  // 280..320
+            let targetDist = 280 + Int64(i % 41)  // 280..320
             let r1Pos: Int64 = 1000 + Int64(i) * 500
             let r1 = MemAlnReg(
                 rb: r1Pos, re: r1Pos + 100,
                 qb: 0, qe: 100, rid: 0,
                 score: 100, trueScore: 100, sub: 0
             )
-            // r2 on reverse strand, fwd position = r1Pos + insertSize - 100
-            let r2FwdStart = r1Pos + insertSize - 100
-            let r2FwdEnd = r1Pos + insertSize
-            // Reverse BWT coords: rb = 2*genomeLen - fwdEnd, re = 2*genomeLen - fwdStart
+            // We want p2 = r1Pos + targetDist, where p2 = 2*genomeLen - 1 - r2.rb
+            // So r2.rb = 2*genomeLen - 1 - (r1Pos + targetDist)
+            let r2Rb = 2 * genomeLen - 1 - (r1Pos + targetDist)
             let r2 = MemAlnReg(
-                rb: 2 * genomeLen - r2FwdEnd,
-                re: 2 * genomeLen - r2FwdStart,
+                rb: r2Rb, re: r2Rb + 100,
                 qb: 0, qe: 100, rid: 0,
                 score: 100, trueScore: 100, sub: 0
             )
@@ -171,7 +172,7 @@ struct InsertSizeEstimatorTests {
         var regions1: [[MemAlnReg]] = []
         var regions2: [[MemAlnReg]] = []
 
-        // 40 normal pairs with insert ~300
+        // 40 normal pairs with start-to-start dist ~300
         for i in 0..<40 {
             let r1Pos: Int64 = 1000 + Int64(i) * 500
             let r1 = MemAlnReg(
@@ -179,11 +180,10 @@ struct InsertSizeEstimatorTests {
                 qb: 0, qe: 100, rid: 0,
                 score: 100, trueScore: 100, sub: 0
             )
-            let r2FwdStart = r1Pos + 200
-            let r2FwdEnd = r1Pos + 300
+            // p2 = r1Pos + 300, so r2.rb = 2*genomeLen - 1 - (r1Pos + 300)
+            let r2Rb = 2 * genomeLen - 1 - (r1Pos + 300)
             let r2 = MemAlnReg(
-                rb: 2 * genomeLen - r2FwdEnd,
-                re: 2 * genomeLen - r2FwdStart,
+                rb: r2Rb, re: r2Rb + 100,
                 qb: 0, qe: 100, rid: 0,
                 score: 100, trueScore: 100, sub: 0
             )
@@ -191,7 +191,7 @@ struct InsertSizeEstimatorTests {
             regions2.append([r2])
         }
 
-        // 5 outlier pairs with insert ~5000 (should be filtered)
+        // 5 outlier pairs with dist ~5000 (should be filtered)
         for i in 0..<5 {
             let r1Pos: Int64 = 50000 + Int64(i) * 500
             let r1 = MemAlnReg(
@@ -199,11 +199,9 @@ struct InsertSizeEstimatorTests {
                 qb: 0, qe: 100, rid: 0,
                 score: 100, trueScore: 100, sub: 0
             )
-            let r2FwdStart = r1Pos + 4900
-            let r2FwdEnd = r1Pos + 5000
+            let r2Rb = 2 * genomeLen - 1 - (r1Pos + 5000)
             let r2 = MemAlnReg(
-                rb: 2 * genomeLen - r2FwdEnd,
-                re: 2 * genomeLen - r2FwdStart,
+                rb: r2Rb, re: r2Rb + 100,
                 qb: 0, qe: 100, rid: 0,
                 score: 100, trueScore: 100, sub: 0
             )
@@ -426,5 +424,159 @@ struct SAMOutputBuilderPETests {
         #expect(flag.contains(.read2))
         #expect(!flag.contains(.read1))
         #expect(!flag.contains(.mateUnmapped))
+    }
+}
+
+// MARK: - MateRescue Tests
+
+@Suite("MateRescue Tests")
+struct MateRescueTests {
+
+    /// Build a small packed reference and metadata for testing.
+    /// Creates a 1000bp reference of repeating ACGT on chromosome "chr1".
+    static func makeTestReference() -> (PackedReference, ReferenceMetadata) {
+        let refLen = 1000
+        let byteCount = (refLen + 3) / 4
+        let ptr = UnsafeMutablePointer<UInt8>.allocate(capacity: byteCount)
+
+        // Fill with repeating pattern: A(0) C(1) G(2) T(3)
+        for i in 0..<byteCount {
+            // Each byte: bits 7-6=base0, 5-4=base1, 3-2=base2, 1-0=base3
+            // Pattern ACGT = 0b_00_01_10_11 = 0x1B
+            ptr[i] = 0x1B
+        }
+
+        let bufPtr = UnsafeBufferPointer(start: UnsafePointer(ptr), count: byteCount)
+        let packedRef = PackedReference(data: bufPtr, length: Int64(refLen), ownedBase: ptr)
+
+        let metadata = ReferenceMetadata(
+            totalLength: Int64(refLen),
+            numSequences: 1,
+            annotations: [ReferenceAnnotation(offset: 0, length: Int32(refLen), name: "chr1")]
+        )
+        return (packedRef, metadata)
+    }
+
+    @Test("Rescue finds mate in FR orientation")
+    func testRescueFR() {
+        let (packedRef, metadata) = MateRescueTests.makeTestReference()
+        let genomeLen: Int64 = 1000
+
+        // Template: read1 mapped at forward position 100-120
+        let template = MemAlnReg(
+            rb: 100, re: 120, qb: 0, qe: 20, rid: 0,
+            score: 20, trueScore: 20, sub: 0
+        )
+
+        // Create mate read that matches at position ~380 on reverse strand
+        // For FR orientation (bwaDir=1): mate is on opposite strand, downstream
+        // Extract what the reference looks like at position 380-400, reversed & complemented
+        let refSlice = packedRef.subsequence(from: 380, length: 20)
+        let mateSeq = refSlice.reversed().map { UInt8(3 - $0) }  // reverse complement
+        // This is what the mate read looks like (original orientation)
+        // When rescue does reverseComplement, it should match position 380-400
+
+        let mateRead = ReadSequence(name: "mate", bases: mateSeq, qualities: [UInt8](repeating: 30, count: 20))
+
+        // Insert size distribution centered at 300 for FR
+        var dist = InsertSizeDistribution()
+        dist.stats[PairOrientation.fr.rawValue].mean = 300
+        dist.stats[PairOrientation.fr.rawValue].stddev = 50
+        dist.stats[PairOrientation.fr.rawValue].properLow = 150
+        dist.stats[PairOrientation.fr.rawValue].properHigh = 450
+        dist.stats[PairOrientation.fr.rawValue].count = 100
+        dist.stats[PairOrientation.fr.rawValue].failed = false
+        dist.primaryOrientation = .fr
+
+        let scoring = ScoringParameters()
+        let rescued = MateRescue.rescue(
+            templateRegions: [template],
+            mateRead: mateRead,
+            mateRegions: [],
+            dist: dist,
+            genomeLength: genomeLen,
+            packedRef: packedRef,
+            metadata: metadata,
+            scoring: scoring
+        )
+
+        // Should find at least one rescued region
+        #expect(!rescued.isEmpty)
+        if let reg = rescued.first {
+            #expect(reg.score >= scoring.minSeedLength * scoring.matchScore)
+            #expect(reg.rid == 0)
+        }
+    }
+
+    @Test("Rescue skips when mate already has hit")
+    func testRescueSkipsExisting() {
+        let (packedRef, metadata) = MateRescueTests.makeTestReference()
+        let genomeLen: Int64 = 1000
+
+        let template = MemAlnReg(
+            rb: 100, re: 120, qb: 0, qe: 20, rid: 0,
+            score: 20, trueScore: 20, sub: 0
+        )
+
+        let mateRead = ReadSequence(
+            name: "mate",
+            bases: [UInt8](repeating: 0, count: 20),
+            qualities: [UInt8](repeating: 30, count: 20)
+        )
+
+        // Existing mate region that satisfies FR at proper distance
+        // FR direction: p2 = 2*genomeLen - 1 - mateReg.rb should give dist ~300 from template.rb=100
+        // p2 = 100 + 300 = 400, so mateReg.rb = 2*1000 - 1 - 400 = 1599
+        let existingMate = MemAlnReg(
+            rb: 1599, re: 1619, qb: 0, qe: 20, rid: 0,
+            score: 20, trueScore: 20, sub: 0
+        )
+
+        var dist = InsertSizeDistribution()
+        dist.stats[PairOrientation.fr.rawValue].mean = 300
+        dist.stats[PairOrientation.fr.rawValue].stddev = 50
+        dist.stats[PairOrientation.fr.rawValue].properLow = 150
+        dist.stats[PairOrientation.fr.rawValue].properHigh = 450
+        dist.stats[PairOrientation.fr.rawValue].count = 100
+        dist.stats[PairOrientation.fr.rawValue].failed = false
+        dist.primaryOrientation = .fr
+
+        let scoring = ScoringParameters()
+        let rescued = MateRescue.rescue(
+            templateRegions: [template],
+            mateRead: mateRead,
+            mateRegions: [existingMate],
+            dist: dist,
+            genomeLength: genomeLen,
+            packedRef: packedRef,
+            metadata: metadata,
+            scoring: scoring
+        )
+
+        // Should skip FR direction since existing mate satisfies it
+        // May still try other directions but they have no stats
+        #expect(rescued.isEmpty)
+    }
+
+    @Test("Rescue with empty templates returns empty")
+    func testRescueEmptyTemplates() {
+        let (packedRef, metadata) = MateRescueTests.makeTestReference()
+        let mateRead = ReadSequence(
+            name: "mate", bases: [0, 1, 2, 3], qualities: [30, 30, 30, 30]
+        )
+        let dist = InsertSizeDistribution()
+        let scoring = ScoringParameters()
+
+        let rescued = MateRescue.rescue(
+            templateRegions: [],
+            mateRead: mateRead,
+            mateRegions: [],
+            dist: dist,
+            genomeLength: 1000,
+            packedRef: packedRef,
+            metadata: metadata,
+            scoring: scoring
+        )
+        #expect(rescued.isEmpty)
     }
 }

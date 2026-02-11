@@ -560,4 +560,72 @@ struct AlignmentTests {
 
         #expect(!chains.isEmpty)
     }
+
+    // MARK: - LocalSWAligner Tests
+
+    @Test("LocalSWAligner perfect match")
+    func testLocalSWPerfectMatch() {
+        let scoring = ScoringParameters()
+        let query: [UInt8] = [0, 1, 2, 3, 0, 1]  // ACGTAC
+        let target: [UInt8] = [0, 1, 2, 3, 0, 1]  // ACGTAC
+
+        let result = LocalSWAligner.align(query: query, target: target, scoring: scoring)
+        #expect(result != nil)
+        #expect(result!.score == 6)
+        #expect(result!.queryBegin == 0)
+        #expect(result!.queryEnd == 5)
+        #expect(result!.targetBegin == 0)
+        #expect(result!.targetEnd == 5)
+    }
+
+    @Test("LocalSWAligner query embedded in target")
+    func testLocalSWEmbedded() {
+        let scoring = ScoringParameters()
+        // Query matches in the middle of target
+        let query: [UInt8] = [0, 1, 2, 3]  // ACGT
+        let target: [UInt8] = [3, 3, 0, 1, 2, 3, 3, 3]  // TTACGTTT
+
+        let result = LocalSWAligner.align(query: query, target: target, scoring: scoring)
+        #expect(result != nil)
+        #expect(result!.score == 4)
+        #expect(result!.queryBegin == 0)
+        #expect(result!.queryEnd == 3)
+        #expect(result!.targetBegin == 2)
+        #expect(result!.targetEnd == 5)
+    }
+
+    @Test("LocalSWAligner with mismatch finds best local alignment")
+    func testLocalSWMismatch() {
+        let scoring = ScoringParameters()
+        // 4 matches then 1 mismatch then 3 matches
+        let query: [UInt8]  = [0, 1, 2, 3, 0, 1, 2, 3]  // ACGTACGT
+        let target: [UInt8] = [0, 1, 2, 3, 3, 1, 2, 3]  // ACGTTCGT
+
+        let result = LocalSWAligner.align(query: query, target: target, scoring: scoring)
+        #expect(result != nil)
+        // Best score: either 4 (first half) or the whole thing (8-4=4)
+        // Actually: 7 matches - 1 * 4 mismatch penalty = 3; but local can skip mismatch
+        // Best contiguous: 4 matches = score 4
+        #expect(result!.score >= 4)
+    }
+
+    @Test("LocalSWAligner returns nil for all-mismatch")
+    func testLocalSWAllMismatch() {
+        var scoring = ScoringParameters()
+        scoring.matchScore = 1
+        scoring.mismatchPenalty = 4
+        // Query all A, target all T — every position is a mismatch
+        let query: [UInt8] = [0, 0, 0, 0]
+        let target: [UInt8] = [3, 3, 3, 3]
+
+        let result = LocalSWAligner.align(query: query, target: target, scoring: scoring)
+        #expect(result == nil)
+    }
+
+    @Test("LocalSWAligner empty input returns nil")
+    func testLocalSWEmpty() {
+        let scoring = ScoringParameters()
+        let result = LocalSWAligner.align(query: [], target: [0, 1, 2], scoring: scoring)
+        #expect(result == nil)
+    }
 }
