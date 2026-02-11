@@ -216,11 +216,11 @@ public struct FMIndexLoader: Sendable {
             guard lineIdx + 1 < annLines.count else { break }
 
             var ann = ReferenceAnnotation()
-            let parts1 = annLines[lineIdx].split(separator: " ", maxSplits: 3)
-            if parts1.count >= 3 {
+            let parts1 = annLines[lineIdx].split(separator: " ", maxSplits: 2)
+            if parts1.count >= 2 {
                 ann.gi = UInt32(parts1[0]) ?? 0
                 ann.name = String(parts1[1])
-                ann.anno = parts1.count > 3 ? String(parts1[3]) : ""
+                ann.anno = parts1.count > 2 ? String(parts1[2]) : ""
             }
             lineIdx += 1
 

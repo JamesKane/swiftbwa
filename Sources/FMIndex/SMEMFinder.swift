@@ -55,6 +55,16 @@ public struct SMEMFinder: Sendable {
         return allSMEMs
     }
 
+    /// Bidirectional SMEM interval used internally during search.
+    /// Tracks both forward (k) and reverse (l) SA intervals plus query span.
+    private struct BidiInterval {
+        var k: Int64    // Forward SA interval start
+        var l: Int64    // Reverse SA interval position
+        var s: Int64    // Interval size (same in both directions)
+        var m: Int32    // Query begin (inclusive)
+        var n: Int32    // Query end (inclusive, i.e., last matched position)
+    }
+
     /// Find SMEMs starting from a specific query position.
     ///
     /// Reimplements `getSMEMsOnePosOneThread()` (FMI_search.cpp:496-670).
@@ -89,17 +99,21 @@ public struct SMEMFinder: Sendable {
             return (smems, nextPos)
         }
 
-        // Initialize SA interval for the first character
-        // Forward search uses reverse complement: count[a] for k, count[3-a] for l
-        var curK = bwt.count(for: Int(a))
-        var curL = bwt.count(for: Int(3 - a))
-        var curS = bwt.count(forNext: Int(a)) - bwt.count(for: Int(a))
+        // Initialize bidirectional SA interval for the first character
+        // Forward: k = count[a], Reverse: l = count[3-a], s = count[a+1] - count[a]
+        var smem = BidiInterval(
+            k: bwt.count(for: Int(a)),
+            l: bwt.count(for: Int(3 - a)),
+            s: bwt.count(forNext: Int(a)) - bwt.count(for: Int(a)),
+            m: Int32(startPos),
+            n: Int32(startPos)
+        )
 
         // Track previous intervals (candidates for backward extension)
-        var prevArray: [(k: Int64, l: Int64, s: Int64, m: Int32, n: Int32)] = []
+        var prevArray: [BidiInterval] = []
         var numPrev = 0
 
-        // === Forward phase: extend rightward ===
+        // === Forward phase: extend rightward (lines 537-575) ===
         var j = startPos + 1
         while j < readLength {
             let base = query[j]
@@ -107,47 +121,43 @@ public struct SMEMFinder: Sendable {
 
             guard base < 4 else { break }
 
-            // Forward extension is backward extension on reverse complement BWT
-            // Swap k <-> l, use complement base (3-a)
-            let swapped = (k: curL, l: curK, s: curS)
-            let ext = BackwardSearch.backwardExt(bwt: bwt, interval: swapped, base: Int(3 - base))
-            // Swap back
-            let newK = ext.l
-            let newL = ext.k
-            let newS = ext.s
+            // Forward extension = backward extension with swapped k/l and complement base
+            let swapped = BidiInterval(k: smem.l, l: smem.k, s: smem.s, m: smem.m, n: smem.n)
+            let ext = BackwardSearch.backwardExt(
+                bwt: bwt,
+                interval: (swapped.k, swapped.l, swapped.s),
+                base: Int(3 - base)
+            )
+            // Swap result back
+            let newSmem = BidiInterval(k: ext.l, l: ext.k, s: ext.s, m: smem.m, n: Int32(j))
 
             // If interval size changed, record previous as candidate
-            if newS != curS {
-                prevArray.append((curK, curL, curS, Int32(startPos), Int32(j - 1)))
+            // (using bitmask trick from C++: prevArray[numPrev] = smem; numPrev += (newS != oldS))
+            if newSmem.s != smem.s {
+                prevArray.append(smem)
                 numPrev += 1
             }
 
             // If new interval is too small, stop forward extension
-            if newS < minIntv {
+            if newSmem.s < minIntv {
                 nextPos = j
                 break
             }
 
-            curK = newK
-            curL = newL
-            curS = newS
+            smem = newSmem
             j += 1
         }
 
         // Record the final forward interval if it meets threshold
-        if curS >= minIntv {
-            prevArray.append((curK, curL, curS, Int32(startPos), Int32(j - 1)))
+        if smem.s >= minIntv {
+            prevArray.append(smem)
             numPrev += 1
         }
 
-        // Reverse prevArray so longest match is first (for backward extension priority)
+        // Reverse prevArray so longest match is first (lines 587-592)
         prevArray.reverse()
 
-        // === Backward phase: extend leftward from each candidate ===
-        var prev = prevArray
-        var currentJ = readLength  // nolint: used for tracking backward extension position
-        _ = currentJ
-
+        // === Backward phase: extend leftward from each candidate (lines 596-655) ===
         for bj in stride(from: startPos - 1, through: 0, by: -1) {
             let base = query[bj]
             guard base < 4 else { break }
@@ -155,64 +165,84 @@ public struct SMEMFinder: Sendable {
             var numCurr = 0
             var currS: Int64 = -1
 
-            for p in 0..<prev.count {
-                let interval = prev[p]
+            // First loop: p = 0..<numPrev (lines 607-629)
+            var p = 0
+            while p < numPrev {
+                let interval = prevArray[p]
                 let ext = BackwardSearch.backwardExt(
                     bwt: bwt,
-                    interval: (interval.k, interval.k + interval.s - 1, interval.s),
+                    interval: (interval.k, interval.l, interval.s),
                     base: Int(base)
                 )
-                let newS = ext.s
+                let newInterval = BidiInterval(k: ext.k, l: ext.l, s: ext.s, m: Int32(bj), n: interval.n)
 
-                if newS < minIntv && (interval.n - Int32(bj) + 1) >= minSeedLen {
-                    // This interval can't extend further; emit SMEM
-                    currentJ = bj
-                    let smem = SMEM(
+                // CONDITION 1: Can't extend further AND meets min length
+                if newInterval.s < minIntv && (interval.n - interval.m + 1) >= minSeedLen {
+                    // Emit the PREVIOUS interval (not the new one)
+                    let emitSmem = SMEM(
                         k: interval.k,
                         l: interval.k + interval.s - 1,
-                        queryBegin: Int32(bj + 1),
+                        queryBegin: interval.m,
                         queryEnd: interval.n + 1
                     )
-                    smems.append(smem)
+                    smems.append(emitSmem)
                     break
                 }
 
-                if newS >= minIntv && newS != currS {
-                    currS = newS
-                    if numCurr < prev.count {
-                        prev[numCurr] = (ext.k, ext.l, ext.s, Int32(bj), interval.n)
+                // CONDITION 2: Can extend AND hasn't seen this size yet
+                if newInterval.s >= minIntv && newInterval.s != currS {
+                    currS = newInterval.s
+                    if numCurr < prevArray.count {
+                        prevArray[numCurr] = newInterval
+                    } else {
+                        prevArray.append(newInterval)
                     }
                     numCurr += 1
-
-                    if p == 0 { break }  // First (longest) interval extended successfully
+                    break  // Break first loop (line 628)
                 }
-
-                // Continue checking shorter intervals
-                if p > 0 && newS >= minIntv && newS != currS {
-                    currS = newS
-                    if numCurr < prev.count {
-                        prev[numCurr] = (ext.k, ext.l, ext.s, Int32(bj), interval.n)
-                    }
-                    numCurr += 1
-                }
+                p += 1
             }
 
-            if numCurr == 0 { break }
-            prev = Array(prev[0..<numCurr])
+            // Second loop: p+1..<numPrev (lines 631-649)
+            p += 1
+            while p < numPrev {
+                let interval = prevArray[p]
+                let ext = BackwardSearch.backwardExt(
+                    bwt: bwt,
+                    interval: (interval.k, interval.l, interval.s),
+                    base: Int(base)
+                )
+                let newInterval = BidiInterval(k: ext.k, l: ext.l, s: ext.s, m: Int32(bj), n: interval.n)
+
+                if newInterval.s >= minIntv && newInterval.s != currS {
+                    currS = newInterval.s
+                    if numCurr < prevArray.count {
+                        prevArray[numCurr] = newInterval
+                    } else {
+                        prevArray.append(newInterval)
+                    }
+                    numCurr += 1
+                }
+                p += 1
+            }
+
+            numPrev = numCurr
+            if numCurr == 0 {
+                break
+            }
         }
 
-        // Emit any remaining intervals that weren't emitted during backward extension
-        if !prev.isEmpty {
-            let interval = prev[0]
-            let smemLen = interval.n - interval.m + 1
-            if smemLen >= minSeedLen {
-                let smem = SMEM(
+        // Emit any remaining intervals (lines 656-664)
+        if numPrev != 0 {
+            let interval = prevArray[0]
+            if (interval.n - interval.m + 1) >= minSeedLen {
+                let emitSmem = SMEM(
                     k: interval.k,
                     l: interval.k + interval.s - 1,
                     queryBegin: interval.m,
                     queryEnd: interval.n + 1
                 )
-                smems.append(smem)
+                smems.append(emitSmem)
             }
         }
 
