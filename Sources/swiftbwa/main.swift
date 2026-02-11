@@ -79,26 +79,44 @@ struct Mem: AsyncParsableCommand {
               + "genome_len=\(index.genomeLength), "
               + "\(index.metadata.numSequences) sequences\n", stderr)
 
-        // Parse FASTQ and align
-        let reads = try parseFASTQ(path: fastqFiles[0])
-        fputs("Loaded \(reads.count) reads from \(fastqFiles[0])\n", stderr)
-
         // Output
         let outputMode = output != nil ? "wb" : "w"
         let outputPath = output ?? "-"
-
-        fputs("Aligning...\n", stderr)
 
         let aligner = BWAMemAligner(index: index, options: options)
         let header = try SAMOutputBuilder.buildHeader(metadata: index.metadata)
         let outFile = try HTSFile(path: outputPath, mode: outputMode)
         try header.write(to: outFile)
 
-        try await aligner.alignBatch(
-            reads: reads,
-            outputFile: outFile,
-            header: header
-        )
+        if options.isPairedEnd {
+            // Paired-end mode
+            let reads1 = try parseFASTQ(path: fastqFiles[0])
+            let reads2 = try parseFASTQ(path: fastqFiles[1])
+            guard reads1.count == reads2.count else {
+                throw BWAError.fileIOError(
+                    "R1 and R2 have different read counts: "
+                    + "\(reads1.count) vs \(reads2.count)"
+                )
+            }
+            fputs("Loaded \(reads1.count) paired reads\n", stderr)
+            fputs("Aligning paired-end...\n", stderr)
+
+            try await aligner.alignPairedBatch(
+                reads1: reads1, reads2: reads2,
+                outputFile: outFile, header: header
+            )
+        } else {
+            // Single-end mode
+            let reads = try parseFASTQ(path: fastqFiles[0])
+            fputs("Loaded \(reads.count) reads from \(fastqFiles[0])\n", stderr)
+            fputs("Aligning...\n", stderr)
+
+            try await aligner.alignBatch(
+                reads: reads,
+                outputFile: outFile,
+                header: header
+            )
+        }
 
         fputs("Done.\n", stderr)
     }

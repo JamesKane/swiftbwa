@@ -1,6 +1,34 @@
 import BWACore
 import Htslib
 
+/// Paired-end information for building SAM records.
+public struct PairedEndInfo: Sendable {
+    public var isRead1: Bool
+    public var isProperPair: Bool
+    public var mateTid: Int32
+    public var matePos: Int64
+    public var mateIsReverse: Bool
+    public var mateIsUnmapped: Bool
+    public var tlen: Int64
+    public var mateCigarString: String?
+
+    public init(
+        isRead1: Bool, isProperPair: Bool,
+        mateTid: Int32, matePos: Int64,
+        mateIsReverse: Bool, mateIsUnmapped: Bool,
+        tlen: Int64, mateCigarString: String? = nil
+    ) {
+        self.isRead1 = isRead1
+        self.isProperPair = isProperPair
+        self.mateTid = mateTid
+        self.matePos = matePos
+        self.mateIsReverse = mateIsReverse
+        self.mateIsUnmapped = mateIsUnmapped
+        self.tlen = tlen
+        self.mateCigarString = mateCigarString
+    }
+}
+
 /// Converts alignment regions to BAM records using swift-htslib.
 public struct SAMOutputBuilder: Sendable {
 
@@ -44,7 +72,7 @@ public struct SAMOutputBuilder: Sendable {
         md: String? = nil,
         isPrimary: Bool,
         adjustedPos: Int64? = nil,
-        mateRecord: (tid: Int32, pos: Int64, isReverse: Bool)? = nil
+        pairedEnd: PairedEndInfo? = nil
     ) throws -> BAMRecord {
         let mapq = MappingQuality.compute(
             region: region,
@@ -55,11 +83,27 @@ public struct SAMOutputBuilder: Sendable {
 
         // Build flags
         var flag: AlignmentFlag = []
-        if mateRecord != nil {
+
+        // Paired-end flags
+        if let pe = pairedEnd {
             flag.insert(.paired)
+            if pe.isRead1 {
+                flag.insert(.read1)
+            } else {
+                flag.insert(.read2)
+            }
+            if pe.isProperPair {
+                flag.insert(.properPair)
+            }
+            if pe.mateIsReverse {
+                flag.insert(.mateReverse)
+            }
+            if pe.mateIsUnmapped {
+                flag.insert(.mateUnmapped)
+            }
         }
+
         if region.rb < metadata.totalLength && region.re > 0 {
-            // Check if reverse strand: position >= genome length means reverse
             let genomeLen = metadata.totalLength
             if region.rb >= genomeLen {
                 flag.insert(.reverse)
@@ -68,14 +112,8 @@ public struct SAMOutputBuilder: Sendable {
         if !isPrimary {
             flag.insert(.secondary)
         }
-        if let mate = mateRecord {
-            if mate.isReverse {
-                flag.insert(.mateReverse)
-            }
-        }
 
         // Compute position in reference coordinates
-        // Use adjustedPos if provided (accounts for leading deletion squeeze)
         let refPos = adjustedPos ?? region.rb
         let (rid, localPos) = metadata.decodePosition(refPos)
 
@@ -93,9 +131,19 @@ public struct SAMOutputBuilder: Sendable {
         // Convert qualities to ASCII string (Phred+33)
         let qualStr = String(read.qualities.map { Character(UnicodeScalar($0 + 33)) })
 
-        let mtid: Int32 = mateRecord?.tid ?? -1
-        let mpos: Int64 = mateRecord?.pos ?? -1
-        let isize: Int64 = 0
+        let mtid: Int32
+        let mpos: Int64
+        let isize: Int64
+
+        if let pe = pairedEnd {
+            mtid = pe.mateIsUnmapped ? -1 : pe.mateTid
+            mpos = pe.mateIsUnmapped ? -1 : pe.matePos
+            isize = pe.tlen
+        } else {
+            mtid = -1
+            mpos = -1
+            isize = 0
+        }
 
         var record = try BAMRecord()
         try record.set(
@@ -120,6 +168,9 @@ public struct SAMOutputBuilder: Sendable {
         if let md = md {
             try aux.updateString(tag: "MD", value: md)
         }
+        if let pe = pairedEnd, let mc = pe.mateCigarString {
+            try aux.updateString(tag: "MC", value: mc)
+        }
 
         return record
     }
@@ -128,7 +179,10 @@ public struct SAMOutputBuilder: Sendable {
     ///
     /// The returned `BAMRecord` is move-only (`~Copyable`). Callers must consume it
     /// (e.g., by writing it to a file) rather than copying.
-    public static func buildUnmappedRecord(read: ReadSequence) throws -> BAMRecord {
+    public static func buildUnmappedRecord(
+        read: ReadSequence,
+        pairedEnd: PairedEndInfo? = nil
+    ) throws -> BAMRecord {
         let seqStr = String(read.bases.map { b -> Character in
             switch b {
             case 0: return "A"
@@ -140,17 +194,42 @@ public struct SAMOutputBuilder: Sendable {
         })
         let qualStr = String(read.qualities.map { Character(UnicodeScalar($0 + 33)) })
 
+        var flag: AlignmentFlag = [.unmapped]
+        let mtid: Int32
+        let mpos: Int64
+        let isize: Int64 = 0
+
+        if let pe = pairedEnd {
+            flag.insert(.paired)
+            if pe.isRead1 {
+                flag.insert(.read1)
+            } else {
+                flag.insert(.read2)
+            }
+            if pe.mateIsReverse {
+                flag.insert(.mateReverse)
+            }
+            if pe.mateIsUnmapped {
+                flag.insert(.mateUnmapped)
+            }
+            mtid = pe.mateIsUnmapped ? -1 : pe.mateTid
+            mpos = pe.mateIsUnmapped ? -1 : pe.matePos
+        } else {
+            mtid = -1
+            mpos = -1
+        }
+
         var record = try BAMRecord()
         try record.set(
             qname: read.name,
-            flag: AlignmentFlag.unmapped.rawValue,
+            flag: flag.rawValue,
             tid: -1,
             pos: -1,
             mapq: 0,
             cigar: [],
-            mtid: -1,
-            mpos: -1,
-            isize: 0,
+            mtid: mtid,
+            mpos: mpos,
+            isize: isize,
             seq: seqStr,
             qual: qualStr
         )
