@@ -67,7 +67,7 @@ public struct ExtensionAligner: Sendable {
 
                     let result = queryLeft.withUnsafeBufferPointer { qBuf in
                         targetLeftArr.withUnsafeBufferPointer { tBuf in
-                            BandedSWScalar.align(
+                            bandedSWExtend(
                                 query: qBuf,
                                 target: tBuf,
                                 scoring: scoring,
@@ -107,7 +107,7 @@ public struct ExtensionAligner: Sendable {
 
                     let result = queryRight.withUnsafeBufferPointer { qBuf in
                         targetRight.withUnsafeBufferPointer { tBuf in
-                            BandedSWScalar.align(
+                            bandedSWExtend(
                                 query: qBuf,
                                 target: tBuf,
                                 scoring: scoring,
@@ -147,5 +147,24 @@ public struct ExtensionAligner: Sendable {
         }
 
         return regions
+    }
+
+    /// Tiered SIMD Smith-Waterman extension: try 8-bit SIMD first, fall back to 16-bit.
+    /// Matches bwa-mem2's ksw_extend2() dispatch: 8-bit → 16-bit SIMD.
+    private static func bandedSWExtend(
+        query: UnsafeBufferPointer<UInt8>,
+        target: UnsafeBufferPointer<UInt8>,
+        scoring: ScoringParameters,
+        w: Int32,
+        h0: Int32
+    ) -> SWResult {
+        if let result = BandedSW8.align(
+            query: query, target: target, scoring: scoring, w: w, h0: h0
+        ) {
+            return result
+        }
+        return BandedSW16.align(
+            query: query, target: target, scoring: scoring, w: w, h0: h0
+        )
     }
 }

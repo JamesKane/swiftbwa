@@ -1,7 +1,8 @@
 import BWACore
 
 /// 16-bit SIMD banded Smith-Waterman using SIMD8<Int16> (128-bit NEON).
-/// Used when scores don't fit in 8-bit range.
+/// Implements Farrar's striped algorithm with z-dropoff and lazy-F correction.
+/// Matches bwa-mem2's ksw_extl() behavior.
 public struct BandedSW16: Sendable {
 
     public static func align(
@@ -23,8 +24,17 @@ public struct BandedSW16: Sendable {
 
         guard stripeCount > 0 else { return SWResult() }
 
+        let oIns = scoring.gapOpenPenalty
+        let eIns = scoring.gapExtendPenalty
+        let oDel = scoring.gapOpenPenaltyDeletion
+        let eDel = scoring.gapExtendPenaltyDeletion
+        let zDrop = scoring.zDrop
+
         // Build striped query profile
-        var profile = [[SIMD8<Int16>]](repeating: [SIMD8<Int16>](repeating: .zero, count: stripeCount), count: m)
+        var profile = [[SIMD8<Int16>]](
+            repeating: [SIMD8<Int16>](repeating: .zero, count: stripeCount),
+            count: m
+        )
 
         for k in 0..<m {
             for s in 0..<stripeCount {
@@ -39,66 +49,151 @@ public struct BandedSW16: Sendable {
             }
         }
 
+        // Initialize H: H[position p] = max(0, h0 - oIns - eIns*(p+1)) for p+1 <= w
+        // These serve as diagonals for the first target row and as H_prev for E.
         var H = [SIMD8<Int16>](repeating: .zero, count: stripeCount)
         var E = [SIMD8<Int16>](repeating: .zero, count: stripeCount)
 
-        let gapO = SIMD8<Int16>(repeating: Int16(scoring.gapOpenPenalty))
-        let gapE = SIMD8<Int16>(repeating: Int16(scoring.gapExtendPenalty))
+        for s in 0..<stripeCount {
+            var vec = SIMD8<Int16>(repeating: 0)
+            for lane in 0..<lanes {
+                let j = s + lane * stripeCount
+                if j < qlen && j + 1 <= Int(w) {
+                    let val = Int(h0) - Int(oIns) - Int(eIns) * (j + 1)
+                    if val > 0 { vec[lane] = Int16(clamping: val) }
+                }
+            }
+            H[s] = vec
+        }
+
+        let oInsVec = SIMD8<Int16>(repeating: Int16(oIns))
+        let eInsVec = SIMD8<Int16>(repeating: Int16(eIns))
+        let oDelVec = SIMD8<Int16>(repeating: Int16(oDel))
+        let eDelVec = SIMD8<Int16>(repeating: Int16(eDel))
         let zero = SIMD8<Int16>(repeating: 0)
 
-        var maxScore: Int16 = Int16(clamping: Int(h0))
+        var maxScore: Int32 = h0
         var maxI: Int32 = -1
         var maxJ: Int32 = -1
+        var maxIE: Int32 = -1
+        var gScore: Int32 = -1
+        var gTle: Int32 = -1
+        var maxOff: Int32 = 0
 
         for i in 0..<tlen {
             let targetBase = Int(target[i])
             let prof = profile[targetBase]
 
+            // Diagonal: shifted H from previous row's last stripe
+            var vH = shiftLanesRight(H[stripeCount - 1])
+            if i == 0 {
+                // Inject h0 as the diagonal for position 0 on the first target row
+                vH[0] = Int16(clamping: max(0, Int(h0)))
+            }
+
             var f = SIMD8<Int16>(repeating: 0)
 
             for s in 0..<stripeCount {
-                var hNew = H[s] &+ prof[s]
+                // Diagonal contribution
+                var hNew = vH &+ prof[s]
                 hNew = hNew.replacing(with: zero, where: hNew .< zero)
 
-                // E
-                let hMinusGap = H[s] &- gapO
-                E[s] = pointwiseMax(hMinusGap, E[s]) &- gapE
+                // Save H_prev[s] and set vH for next stripe's diagonal
+                let hPrev = H[s]
+                vH = hPrev
+
+                // E: insertion from previous row
+                let hMinusGapIns = hPrev &- oInsVec
+                E[s] = pointwiseMax(hMinusGapIns, E[s]) &- eInsVec
                 E[s] = E[s].replacing(with: zero, where: E[s] .< zero)
 
-                // F
-                let hForF = hNew &- gapO
-                f = pointwiseMax(hForF, f) &- gapE
-                f = f.replacing(with: zero, where: f .< zero)
+                // Combine diagonal with E
+                hNew = pointwiseMax(hNew, E[s])
 
-                hNew = pointwiseMax(hNew, pointwiseMax(E[s], f))
+                // Combine with F (deletion, carried from previous stripe)
+                hNew = pointwiseMax(hNew, f)
+
+                // Write new H
                 H[s] = hNew
 
-                let localMax = hNew.max()
-                if localMax > maxScore {
-                    maxScore = localMax
+                // Compute F for next stripe using final H
+                let hForF = H[s] &- oDelVec
+                f = pointwiseMax(hForF, f) &- eDelVec
+                f = f.replacing(with: zero, where: f .< zero)
+            }
+
+            // Lazy-F correction: handle F propagation across lane group boundaries
+            var corrF = shiftLanesRight(f)
+            for s in 0..<stripeCount {
+                let newH = pointwiseMax(H[s], corrF)
+                if newH == H[s] { break }
+                H[s] = newH
+                let hForF = H[s] &- oDelVec
+                corrF = pointwiseMax(hForF, corrF) &- eDelVec
+                corrF = corrF.replacing(with: zero, where: corrF .< zero)
+            }
+
+            // Tracking pass: row max, overall max, global score, max offset
+            var rowMax: Int32 = 0
+            for s in 0..<stripeCount {
+                let localMax = H[s].max()
+                let localMax32 = Int32(localMax)
+                if localMax32 > rowMax { rowMax = localMax32 }
+                if localMax32 > maxScore {
+                    maxScore = localMax32
                     maxI = Int32(i)
+                    maxIE = Int32(i)
                     for lane in 0..<lanes {
-                        if hNew[lane] == localMax {
-                            maxJ = Int32(s + lane * stripeCount)
-                            break
+                        if H[s][lane] == localMax {
+                            let j = s + lane * stripeCount
+                            if j < qlen {
+                                maxJ = Int32(j)
+                                break
+                            }
                         }
                     }
+                    let off = abs(maxI - maxJ)
+                    if off > maxOff { maxOff = off }
                 }
+            }
+
+            // Track global score (alignment consuming entire query)
+            let lastJ = qlen - 1
+            let lastStripe = lastJ % stripeCount
+            let lastLane = lastJ / stripeCount
+            let hAtEnd = Int32(H[lastStripe][lastLane])
+            if hAtEnd > gScore {
+                gScore = hAtEnd
+                gTle = Int32(i)
+            }
+
+            // Z-dropoff: terminate if score has dropped too far past the peak
+            if maxScore - rowMax > zDrop && Int32(i) - maxIE > w {
+                break
             }
         }
 
         return SWResult(
-            score: Int32(maxScore),
+            score: maxScore,
             queryEnd: maxJ + 1,
             targetEnd: maxI + 1,
-            globalTargetEnd: -1,
-            globalScore: -1,
-            maxOff: 0
+            globalTargetEnd: gTle + 1,
+            globalScore: gScore,
+            maxOff: maxOff
         )
     }
 
     @inline(__always)
     private static func pointwiseMax(_ a: SIMD8<Int16>, _ b: SIMD8<Int16>) -> SIMD8<Int16> {
         a.replacing(with: b, where: b .> a)
+    }
+
+    /// Shift SIMD lanes right by one: result[0] = 0, result[i] = source[i-1]
+    @inline(__always)
+    private static func shiftLanesRight(_ v: SIMD8<Int16>) -> SIMD8<Int16> {
+        var r = SIMD8<Int16>(repeating: 0)
+        r[1] = v[0]; r[2] = v[1]; r[3] = v[2]; r[4] = v[3]
+        r[5] = v[4]; r[6] = v[5]; r[7] = v[6]
+        return r
     }
 }

@@ -111,7 +111,7 @@ struct AlignmentTests {
         #expect(result == nil)
     }
 
-    @Test("SIMD16 produces positive score on perfect match")
+    @Test("SIMD16 score agrees with scalar on perfect match")
     func testSIMD16PositiveScore() {
         let scoring = ScoringParameters()
         let query: [UInt8] = [0, 1, 2, 3, 0, 1, 2, 3]  // ACGTACGT
@@ -129,10 +129,179 @@ struct AlignmentTests {
             }
         }
 
-        // Scalar produces the reference score
         #expect(scalarResult.score == 8)
-        // SIMD should produce a positive score (striped layout may differ in exact value)
-        #expect(simdResult.score > 0)
+        #expect(simdResult.score == scalarResult.score)
+    }
+
+    // MARK: - SIMD Completeness and Z-Dropoff Tests
+
+    @Test("BandedSW16 returns correct globalScore and globalTargetEnd")
+    func testSIMD16GlobalScore() {
+        let scoring = ScoringParameters()
+        let query: [UInt8] = [0, 1, 2, 3, 0, 1]  // ACGTAC
+        let target: [UInt8] = [0, 1, 2, 3, 0, 1]  // ACGTAC
+
+        let scalar = query.withUnsafeBufferPointer { qBuf in
+            target.withUnsafeBufferPointer { tBuf in
+                BandedSWScalar.align(query: qBuf, target: tBuf, scoring: scoring, w: 10, h0: 0)
+            }
+        }
+
+        let simd16 = query.withUnsafeBufferPointer { qBuf in
+            target.withUnsafeBufferPointer { tBuf in
+                BandedSW16.align(query: qBuf, target: tBuf, scoring: scoring, w: 10, h0: 0)
+            }
+        }
+
+        // Both should report globalScore (when entire query is consumed)
+        #expect(scalar.globalScore > 0)
+        #expect(simd16.globalScore == scalar.globalScore)
+        #expect(simd16.globalTargetEnd == scalar.globalTargetEnd)
+    }
+
+    @Test("BandedSW16 with h0 > 0 matches scalar")
+    func testSIMD16WithH0() {
+        let scoring = ScoringParameters()
+        let query: [UInt8] = [0, 1, 2]  // ACG
+        let target: [UInt8] = [0, 1, 2]  // ACG
+
+        let scalar = query.withUnsafeBufferPointer { qBuf in
+            target.withUnsafeBufferPointer { tBuf in
+                BandedSWScalar.align(query: qBuf, target: tBuf, scoring: scoring, w: 10, h0: 5)
+            }
+        }
+
+        let simd16 = query.withUnsafeBufferPointer { qBuf in
+            target.withUnsafeBufferPointer { tBuf in
+                BandedSW16.align(query: qBuf, target: tBuf, scoring: scoring, w: 10, h0: 5)
+            }
+        }
+
+        #expect(scalar.score >= 8)
+        #expect(simd16.score == scalar.score)
+    }
+
+    @Test("BandedSW8 score agrees with scalar on short perfect match")
+    func testSW8ScoreAgreement() {
+        let scoring = ScoringParameters()
+        let query: [UInt8] = [0, 1, 2, 3, 0, 1]  // ACGTAC
+        let target: [UInt8] = [0, 1, 2, 3, 0, 1]
+
+        let scalar = query.withUnsafeBufferPointer { qBuf in
+            target.withUnsafeBufferPointer { tBuf in
+                BandedSWScalar.align(query: qBuf, target: tBuf, scoring: scoring, w: 10, h0: 0)
+            }
+        }
+
+        let simd8 = query.withUnsafeBufferPointer { qBuf in
+            target.withUnsafeBufferPointer { tBuf in
+                BandedSW8.align(query: qBuf, target: tBuf, scoring: scoring, w: 10, h0: 0)
+            }
+        }
+
+        #expect(simd8 != nil)
+        #expect(simd8!.score == scalar.score)
+    }
+
+    @Test("All three SW implementations agree on mismatch input")
+    func testAllThreeAgreeOnMismatch() {
+        let scoring = ScoringParameters()
+        // 10bp with a mismatch in the middle
+        let query: [UInt8]  = [0, 1, 2, 3, 0, 1, 2, 3, 0, 1]  // ACGTACGTAC
+        let target: [UInt8] = [0, 1, 2, 3, 3, 1, 2, 3, 0, 1]  // ACGTTCGTAC
+
+        let scalar = query.withUnsafeBufferPointer { qBuf in
+            target.withUnsafeBufferPointer { tBuf in
+                BandedSWScalar.align(query: qBuf, target: tBuf, scoring: scoring, w: 10, h0: 0)
+            }
+        }
+
+        let simd16 = query.withUnsafeBufferPointer { qBuf in
+            target.withUnsafeBufferPointer { tBuf in
+                BandedSW16.align(query: qBuf, target: tBuf, scoring: scoring, w: 10, h0: 0)
+            }
+        }
+
+        let simd8 = query.withUnsafeBufferPointer { qBuf in
+            target.withUnsafeBufferPointer { tBuf in
+                BandedSW8.align(query: qBuf, target: tBuf, scoring: scoring, w: 10, h0: 0)
+            }
+        }
+
+        #expect(scalar.score > 0)
+        #expect(simd16.score == scalar.score)
+        #expect(simd8 != nil)
+        #expect(simd8!.score == scalar.score)
+    }
+
+    @Test("Z-dropoff triggers in BandedSW16 with divergent tail")
+    func testSIMD16ZDropoff() {
+        var scoring = ScoringParameters()
+        scoring.zDrop = 10  // Low z-drop to trigger early termination
+
+        // 5 matching bases then 100 all-mismatch bases
+        var query: [UInt8] = [0, 1, 2, 3, 0]
+        query += [UInt8](repeating: 0, count: 100)  // All A's
+        var target: [UInt8] = [0, 1, 2, 3, 0]
+        target += [UInt8](repeating: 3, count: 100)  // All T's (mismatches)
+
+        let result = query.withUnsafeBufferPointer { qBuf in
+            target.withUnsafeBufferPointer { tBuf in
+                BandedSW16.align(query: qBuf, target: tBuf, scoring: scoring, w: 5, h0: 0)
+            }
+        }
+
+        // Score should be from the matching prefix (5 matches = 5)
+        #expect(result.score == 5)
+        // Z-dropoff should have stopped extension early, so targetEnd should be
+        // well short of the full 105
+        #expect(result.targetEnd < 50)
+    }
+
+    @Test("Z-dropoff triggers in BandedSW8 with divergent tail")
+    func testSW8ZDropoff() {
+        var scoring = ScoringParameters()
+        scoring.zDrop = 10
+
+        var query: [UInt8] = [0, 1, 2, 3, 0]
+        query += [UInt8](repeating: 0, count: 100)
+        var target: [UInt8] = [0, 1, 2, 3, 0]
+        target += [UInt8](repeating: 3, count: 100)
+
+        let result = query.withUnsafeBufferPointer { qBuf in
+            target.withUnsafeBufferPointer { tBuf in
+                BandedSW8.align(query: qBuf, target: tBuf, scoring: scoring, w: 5, h0: 0)
+            }
+        }
+
+        #expect(result != nil)
+        #expect(result!.score == 5)
+        #expect(result!.targetEnd < 50)
+    }
+
+    @Test("BandedSW16 maxOff tracks diagonal offset")
+    func testSIMD16MaxOff() {
+        let scoring = ScoringParameters()
+        // Query embedded in a longer target — best alignment is off-diagonal
+        let query: [UInt8] = [0, 1, 2, 3]  // ACGT
+        let target: [UInt8] = [3, 3, 3, 0, 1, 2, 3, 3, 3]  // TTTACGTTTT
+
+        let scalar = query.withUnsafeBufferPointer { qBuf in
+            target.withUnsafeBufferPointer { tBuf in
+                BandedSWScalar.align(query: qBuf, target: tBuf, scoring: scoring, w: 10, h0: 0)
+            }
+        }
+
+        let simd16 = query.withUnsafeBufferPointer { qBuf in
+            target.withUnsafeBufferPointer { tBuf in
+                BandedSW16.align(query: qBuf, target: tBuf, scoring: scoring, w: 10, h0: 0)
+            }
+        }
+
+        #expect(scalar.score == 4)
+        #expect(simd16.score == scalar.score)
+        // maxOff should be > 0 since the best alignment is off the main diagonal
+        #expect(simd16.maxOff > 0)
     }
 
     @Test("ChainFilter removes low-weight chains")
