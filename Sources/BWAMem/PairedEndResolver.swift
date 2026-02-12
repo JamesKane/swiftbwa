@@ -38,9 +38,6 @@ public struct PairDecision: Sendable {
 /// Reimplements `mem_pair()` from bwa-mem2's `bwamem_pair.cpp`.
 public struct PairedEndResolver: Sendable {
 
-    /// Maximum number of regions per end to consider for pairing.
-    private static let maxPairings = 4
-
     /// Z-score threshold for proper pairing.
     private static let zThreshold: Double = 4.0
 
@@ -67,9 +64,9 @@ public struct PairedEndResolver: Sendable {
     ) -> PairDecision? {
         guard !regions1.isEmpty && !regions2.isEmpty else { return nil }
 
-        // Take top maxPairings non-secondary regions per end
-        let candidates1 = topCandidates(from: regions1)
-        let candidates2 = topCandidates(from: regions2)
+        // Select pairing candidates (primaries + secondaries within score threshold)
+        let candidates1 = topCandidates(from: regions1, scoring: scoring)
+        let candidates2 = topCandidates(from: regions2, scoring: scoring)
 
         var bestDecision: PairDecision?
         var bestScore = Int.min
@@ -102,8 +99,8 @@ public struct PairedEndResolver: Sendable {
                         isProper = (result.orientation == dist.primaryOrientation)
                     }
                 } else {
-                    // Stats not available: no bonus/penalty
-                    pairScore = baseScore
+                    // Stats not available (unobserved orientation): treat as improper
+                    pairScore = baseScore - Int(scoring.unpairedPenalty)
                 }
 
                 if pairScore > bestScore {
@@ -187,16 +184,23 @@ public struct PairedEndResolver: Sendable {
 
     // MARK: - Private Helpers
 
-    /// Select top candidates (non-secondary, up to maxPairings) from regions.
+    /// Select pairing candidates: all primary regions, plus secondaries within
+    /// score threshold. For multi-mappers (MAPQ=0), all positions have the same
+    /// score but most are secondary; including them allows proper-pair discovery.
     /// Returns (index_in_input_array, original_index) pairs.
     private static func topCandidates(
-        from regions: [MemAlnReg]
+        from regions: [MemAlnReg],
+        scoring: ScoringParameters
     ) -> [(Int, Int)] {
+        guard let bestScore = regions.first(where: { $0.secondary < 0 })?.score else {
+            // No primary — use all regions
+            return regions.indices.map { ($0, $0) }
+        }
+        let threshold = bestScore - scoring.unpairedPenalty
         var result: [(Int, Int)] = []
         for (i, region) in regions.enumerated() {
-            guard region.secondary < 0 else { continue }
+            guard region.score >= threshold else { continue }
             result.append((i, i))
-            if result.count >= maxPairings { break }
         }
         return result
     }

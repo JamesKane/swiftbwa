@@ -59,12 +59,21 @@ public struct ChainFilter: Sendable {
     /// Mark secondary alignment regions based on overlap with primary regions.
     public static func markSecondary(
         regions: inout [MemAlnReg],
-        maskLevel: Float
+        maskLevel: Float,
+        readId: UInt64 = 0
     ) {
         guard regions.count > 1 else { return }
 
-        // Sort by score descending
-        regions.sort { $0.score > $1.score }
+        // Assign hashes for deterministic tiebreaking (matches bwa-mem2's mem_mark_primary_se)
+        for i in 0..<regions.count {
+            regions[i].hash = hash64(readId &+ UInt64(i))
+        }
+
+        // Sort by score descending, then hash for deterministic tiebreaking
+        regions.sort { a, b in
+            if a.score != b.score { return a.score > b.score }
+            return a.hash < b.hash
+        }
 
         for i in 0..<regions.count {
             if regions[i].secondary >= 0 { continue }
@@ -97,17 +106,19 @@ public struct ChainFilter: Sendable {
     public static func markSecondaryALT(
         regions: inout [MemAlnReg],
         maskLevel: Float,
-        scoring: ScoringParameters
+        scoring: ScoringParameters,
+        readId: UInt64 = 0
     ) {
         guard regions.count > 1 else { return }
         let n = regions.count
 
-        // Initialize
+        // Initialize (matches bwa-mem2's mem_mark_primary_se initialization)
         for i in 0..<n {
             regions[i].sub = 0
             regions[i].altSc = 0
             regions[i].secondary = -1
             regions[i].secondaryAll = -1
+            regions[i].hash = hash64(readId &+ UInt64(i))
         }
 
         let nPri = regions.filter { !$0.isAlt }.count

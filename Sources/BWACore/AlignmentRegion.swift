@@ -1,3 +1,18 @@
+/// Hash function for deterministic tiebreaking among equal-score regions.
+/// Matches bwa-mem2's `hash_64()` from utils.h.
+public func hash64(_ key: UInt64) -> UInt64 {
+    var k = key
+    k &+= ~(k &<< 32)
+    k ^= (k >> 22)
+    k &+= ~(k &<< 13)
+    k ^= (k >> 8)
+    k &+= (k &<< 3)
+    k ^= (k >> 15)
+    k &+= ~(k &<< 27)
+    k ^= (k >> 31)
+    return k
+}
+
 /// An alignment region produced by Smith-Waterman extension of a chain.
 ///
 /// Corresponds to `mem_alnreg_t` in bwa-mem2's `bwamem.h`.

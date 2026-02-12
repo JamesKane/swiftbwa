@@ -48,7 +48,10 @@ public actor BWAMemAligner {
     }
 
     /// Align a single read against the reference.
-    nonisolated public func alignRead(_ read: ReadSequence) -> [MemAlnReg] {
+    /// - Parameters:
+    ///   - read: The read to align
+    ///   - readId: Unique identifier for deterministic hash-based tiebreaking (matches bwa-mem2's id parameter)
+    nonisolated public func alignRead(_ read: ReadSequence, readId: UInt64 = 0) -> [MemAlnReg] {
         let scoring = options.scoring
 
         // Phase 1: Find SMEMs
@@ -118,9 +121,7 @@ public actor BWAMemAligner {
                 chain: chain,
                 read: read,
                 getReference: { [index] pos, length in
-                    let safeLen = min(length, Int(index.packedRef.length - pos))
-                    guard safeLen > 0 && pos >= 0 else { return [] }
-                    return index.packedRef.subsequence(from: pos, length: safeLen)
+                    index.getReference(at: pos, length: length)
                 },
                 scoring: scoring
             )
@@ -141,9 +142,7 @@ public actor BWAMemAligner {
             regions: &regions,
             query: read.bases,
             getReference: { [index] pos, length in
-                let safeLen = min(length, Int(index.packedRef.length - pos))
-                guard safeLen > 0 && pos >= 0 else { return [] }
-                return index.packedRef.subsequence(from: pos, length: safeLen)
+                index.getReference(at: pos, length: length)
             },
             genomeLength: index.genomeLength,
             scoring: scoring
@@ -153,10 +152,12 @@ public actor BWAMemAligner {
         let hasAlt = regions.contains { $0.isAlt }
         if hasAlt {
             ChainFilter.markSecondaryALT(
-                regions: &regions, maskLevel: scoring.maskLevel, scoring: scoring
+                regions: &regions, maskLevel: scoring.maskLevel, scoring: scoring,
+                readId: readId
             )
         } else {
-            ChainFilter.markSecondary(regions: &regions, maskLevel: scoring.maskLevel)
+            ChainFilter.markSecondary(regions: &regions, maskLevel: scoring.maskLevel,
+                                      readId: readId)
         }
 
         return regions
@@ -258,7 +259,7 @@ public actor BWAMemAligner {
                 let idx = nextIdx
                 let read = reads[idx]
                 group.addTask { [self] in
-                    (idx, self.alignRead(read))
+                    (idx, self.alignRead(read, readId: UInt64(idx)))
                 }
                 nextIdx += 1
             }
@@ -270,7 +271,7 @@ public actor BWAMemAligner {
                     let idx = nextIdx
                     let read = reads[idx]
                     group.addTask { [self] in
-                        (idx, self.alignRead(read))
+                        (idx, self.alignRead(read, readId: UInt64(idx)))
                     }
                     nextIdx += 1
                 }
@@ -317,8 +318,9 @@ public actor BWAMemAligner {
         let genomeLen = index.genomeLength
 
         // Phase 1: Align all reads in parallel
-        let allRegions1 = await alignAllReads(reads1)
-        let allRegions2 = await alignAllReads(reads2)
+        // PE read IDs match bwa-mem2: id = pairIndex<<1|mateFlag
+        let allRegions1 = await alignAllReads(reads1, idBase: 0, idShift: true)
+        let allRegions2 = await alignAllReads(reads2, idBase: 1, idShift: true)
 
         // Phase 2: Estimate insert size distribution (or use manual override)
         let dist: InsertSizeDistribution
@@ -354,6 +356,7 @@ public actor BWAMemAligner {
 
         if !primaryStats.failed && !skipRescue {
             let scoring = options.scoring
+            var rescueCount1 = 0, rescueCount2 = 0
             for i in 0..<pairCount {
                 // Rescue read2 using read1's alignments as templates
                 let templates1 = selectRescueCandidates(mutableRegions1[i], scoring: scoring)
@@ -368,6 +371,7 @@ public actor BWAMemAligner {
                     scoring: scoring
                 )
                 mutableRegions2[i].append(contentsOf: rescued2)
+                rescueCount2 += rescued2.count
 
                 // Rescue read1 using read2's alignments (symmetric)
                 let templates2 = selectRescueCandidates(mutableRegions2[i], scoring: scoring)
@@ -382,18 +386,26 @@ public actor BWAMemAligner {
                     scoring: scoring
                 )
                 mutableRegions1[i].append(contentsOf: rescued1)
+                rescueCount1 += rescued1.count
 
                 // Re-mark secondaries after adding rescued regions
+                let peId1 = (UInt64(i) &<< 1) | 0
+                let peId2 = (UInt64(i) &<< 1) | 1
                 if mutableRegions1[i].count > 1 {
                     ChainFilter.markSecondary(
-                        regions: &mutableRegions1[i], maskLevel: scoring.maskLevel
+                        regions: &mutableRegions1[i], maskLevel: scoring.maskLevel,
+                        readId: peId1
                     )
                 }
                 if mutableRegions2[i].count > 1 {
                     ChainFilter.markSecondary(
-                        regions: &mutableRegions2[i], maskLevel: scoring.maskLevel
+                        regions: &mutableRegions2[i], maskLevel: scoring.maskLevel,
+                        readId: peId2
                     )
                 }
+            }
+            if options.verbosity >= 3 {
+                fputs("[PE] Mate rescue: \(rescueCount1) read1 + \(rescueCount2) read2 rescued\n", stderr)
             }
         }
 
@@ -448,8 +460,15 @@ public actor BWAMemAligner {
 
             if let decision = decision {
                 // Both mapped and paired
-                let reg1 = regions1[decision.idx1]
-                let reg2 = regions2[decision.idx2]
+                // Promote paired regions to primary position (matches bwa-mem2's
+                // mem_sam_pe swap logic that puts the paired region at index 0)
+                var pairedRegions1 = regions1
+                var pairedRegions2 = regions2
+                promotePairedRegion(regions: &pairedRegions1, pairedIdx: decision.idx1)
+                promotePairedRegion(regions: &pairedRegions2, pairedIdx: decision.idx2)
+
+                let reg1 = pairedRegions1[0]
+                let reg2 = pairedRegions2[0]
 
                 let cigar1 = generateCIGAR(read: read1, region: reg1)
                 let cigar2 = generateCIGAR(read: read2, region: reg2)
@@ -477,14 +496,14 @@ public actor BWAMemAligner {
 
                 // Emit primary read1 using emitSingleEndAlignments for full supplementary handling
                 try emitSingleEndAlignments(
-                    read: read1, regions: regions1,
+                    read: read1, regions: pairedRegions1,
                     outputFile: outputFile, header: header,
                     pairedEnd: pe1
                 )
 
                 // Emit primary read2 using emitSingleEndAlignments for full supplementary handling
                 try emitSingleEndAlignments(
-                    read: read2, regions: regions2,
+                    read: read2, regions: pairedRegions2,
                     outputFile: outputFile, header: header,
                     pairedEnd: pe2
                 )
@@ -742,6 +761,28 @@ public actor BWAMemAligner {
 
     // MARK: - Private Helpers
 
+    /// Promote the paired region to index 0 for primary output.
+    /// Matches bwa-mem2's mem_sam_pe() swap logic that ensures the paired region
+    /// is emitted as primary. Fixes secondary references accordingly.
+    private func promotePairedRegion(regions: inout [MemAlnReg], pairedIdx: Int) {
+        guard pairedIdx > 0 && pairedIdx < regions.count else { return }
+
+        // Swap the paired region to position 0
+        regions.swapAt(0, pairedIdx)
+
+        // Fix secondary references that point to the swapped indices
+        for i in 0..<regions.count {
+            if regions[i].secondary == Int32(pairedIdx) {
+                regions[i].secondary = 0
+            } else if regions[i].secondary == 0 {
+                regions[i].secondary = Int32(pairedIdx)
+            }
+        }
+
+        // Ensure the promoted region is marked as primary
+        regions[0].secondary = -1
+    }
+
     /// Select rescue candidate regions: primary regions with score >= bestScore - unpairedPenalty,
     /// capped at maxMatesw. Matches bwa-mem2 lines 382-385.
     private func selectRescueCandidates(
@@ -761,7 +802,15 @@ public actor BWAMemAligner {
     }
 
     /// Align all reads in parallel and return regions indexed by read position.
-    private func alignAllReads(_ reads: [ReadSequence]) async -> [[MemAlnReg]] {
+    /// - Parameters:
+    ///   - reads: Array of reads to align
+    ///   - idBase: Base value for read ID (0 for SE/read1, 1 for read2)
+    ///   - idShift: If true, use PE scheme (idx<<1|idBase); if false, use SE scheme (idx)
+    private func alignAllReads(
+        _ reads: [ReadSequence],
+        idBase: UInt64 = 0,
+        idShift: Bool = false
+    ) async -> [[MemAlnReg]] {
         let maxConcurrency = options.scoring.numThreads
         let results = await withTaskGroup(
             of: (Int, [MemAlnReg]).self,
@@ -774,8 +823,9 @@ public actor BWAMemAligner {
             while nextIdx < min(maxConcurrency, reads.count) {
                 let idx = nextIdx
                 let read = reads[idx]
+                let readId = idShift ? (UInt64(idx) &<< 1) | idBase : UInt64(idx)
                 group.addTask { [self] in
-                    (idx, self.alignRead(read))
+                    (idx, self.alignRead(read, readId: readId))
                 }
                 nextIdx += 1
             }
@@ -786,8 +836,9 @@ public actor BWAMemAligner {
                 if nextIdx < reads.count {
                     let idx = nextIdx
                     let read = reads[idx]
+                    let readId = idShift ? (UInt64(idx) &<< 1) | idBase : UInt64(idx)
                     group.addTask { [self] in
-                        (idx, self.alignRead(read))
+                        (idx, self.alignRead(read, readId: readId))
                     }
                     nextIdx += 1
                 }
