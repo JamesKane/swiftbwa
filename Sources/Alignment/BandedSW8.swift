@@ -12,7 +12,8 @@ public struct BandedSW8: Sendable {
         target: UnsafeBufferPointer<UInt8>,
         scoring: ScoringParameters,
         w: Int32,
-        h0: Int32
+        h0: Int32,
+        scoringMatrix: [Int8]? = nil
     ) -> SWResult? {
         let qlen = query.count
         let tlen = target.count
@@ -25,7 +26,7 @@ public struct BandedSW8: Sendable {
             return nil  // Overflow risk, use 16-bit
         }
 
-        let mat = scoring.scoringMatrix()
+        let mat = scoringMatrix ?? scoring.scoringMatrix()
         let m = 5  // alphabet size
         let lanes = 16  // SIMD16<UInt8> width
         let stripeCount = (qlen + lanes - 1) / lanes

@@ -24,6 +24,7 @@ public struct ExtensionAligner: Sendable {
 
         let readLen = Int32(read.length)
         let bandWidth = scoring.bandWidth
+        let mat = scoring.scoringMatrix()
 
         // Process each seed as potential extension anchor
         var coveredRegions: [(qb: Int32, qe: Int32, rb: Int64, re: Int64)] = []
@@ -97,7 +98,8 @@ public struct ExtensionAligner: Sendable {
                                 target: tBuf,
                                 scoring: scoring,
                                 w: bandWidth,
-                                h0: seed.score
+                                h0: seed.score,
+                                scoringMatrix: mat
                             )
                         }
                     }
@@ -140,7 +142,8 @@ public struct ExtensionAligner: Sendable {
                                 target: tBuf,
                                 scoring: scoring,
                                 w: bandWidth,
-                                h0: accumulatedH0
+                                h0: accumulatedH0,
+                                scoringMatrix: mat
                             )
                         }
                     }
@@ -179,6 +182,17 @@ public struct ExtensionAligner: Sendable {
             reg.score = trueScore
             reg.trueScore = trueScore
 
+            // Compute seedCov: total length of seeds fully contained in alignment region
+            // Matches bwa-mem2's seedcov computation in mem_chain2aln_across_reads_V2
+            var seedCov: Int32 = 0
+            for s in seeds {
+                if s.qbeg >= reg.qb && s.qbeg + s.len <= reg.qe
+                    && s.rbeg >= reg.rb && s.rbeg + Int64(s.len) <= reg.re {
+                    seedCov += s.len
+                }
+            }
+            reg.seedCov = seedCov
+
             coveredRegions.append((reg.qb, reg.qe, reg.rb, reg.re))
             regions.append(reg)
         }
@@ -201,15 +215,18 @@ public struct ExtensionAligner: Sendable {
         target: UnsafeBufferPointer<UInt8>,
         scoring: ScoringParameters,
         w: Int32,
-        h0: Int32
+        h0: Int32,
+        scoringMatrix: [Int8]
     ) -> SWResult {
         if let result = BandedSW8.align(
-            query: query, target: target, scoring: scoring, w: w, h0: h0
+            query: query, target: target, scoring: scoring, w: w, h0: h0,
+            scoringMatrix: scoringMatrix
         ) {
             return result
         }
         return BandedSW16.align(
-            query: query, target: target, scoring: scoring, w: w, h0: h0
+            query: query, target: target, scoring: scoring, w: w, h0: h0,
+            scoringMatrix: scoringMatrix
         )
     }
 }

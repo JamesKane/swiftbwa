@@ -163,8 +163,37 @@ public actor BWAMemAligner {
         return regions
     }
 
+    /// Dummy CIGARInfo for regions filtered before CIGAR generation.
+    /// Matching bwa-mem2's approach of only running ksw_global2 for output regions.
+    private static let dummyCigar = CIGARInfo(
+        cigar: [], nm: 0, md: "", pos: 0,
+        isReverse: false, refConsumed: 0, cigarString: "*"
+    )
+
+    /// Generate CIGARs for regions, skipping those that won't be output.
+    /// Regions with score < minOutputScore or secondary regions below drop ratio
+    /// are replaced with a lightweight dummy, avoiding expensive GlobalAligner calls.
+    nonisolated func generateFilteredCIGARs(
+        read: ReadSequence,
+        regions: [MemAlnReg],
+        scoringMatrix: [Int8]
+    ) -> [CIGARInfo] {
+        let minScore = options.scoring.minOutputScore
+        return regions.enumerated().map { (idx, reg) -> CIGARInfo in
+            // Always generate CIGAR for primary (idx 0) — it's always emitted
+            if idx > 0 && reg.score < minScore { return Self.dummyCigar }
+            if reg.secondary >= 0 {
+                let pi = Int(reg.secondary)
+                if pi < regions.count && reg.score < regions[pi].score / 2 {
+                    return Self.dummyCigar
+                }
+            }
+            return generateCIGAR(read: read, region: reg, scoringMatrix: scoringMatrix)
+        }
+    }
+
     /// Generate CIGAR for a single alignment region.
-    func generateCIGAR(read: ReadSequence, region: MemAlnReg) -> CIGARInfo {
+    nonisolated func generateCIGAR(read: ReadSequence, region: MemAlnReg, scoringMatrix: [Int8]? = nil) -> CIGARInfo {
         let genomeLen = index.genomeLength
         let isReverse = region.rb >= genomeLen
 
@@ -208,7 +237,8 @@ public actor BWAMemAligner {
             trueScore: region.trueScore,
             initialW: region.w,
             scoring: options.scoring,
-            refPos: rb
+            refPos: rb,
+            scoringMatrix: scoringMatrix
         )
 
         // Compute reference consumed and CIGAR string
@@ -244,22 +274,27 @@ public actor BWAMemAligner {
         outputFile: borrowing HTSFile,
         header: SAMHeader
     ) async throws {
-        // Process reads in parallel using TaskGroup with sliding-window concurrency
+        // Process reads in parallel: alignment + CIGAR generation in one task
+        // (CIGAR generation via GlobalAligner is the SE bottleneck, so it must be parallel)
         let maxConcurrency = options.scoring.numThreads
 
         let results = await withTaskGroup(
-            of: (Int, [MemAlnReg]).self,
-            returning: [(Int, [MemAlnReg])].self
+            of: (Int, [MemAlnReg], [CIGARInfo]).self,
+            returning: [(Int, [MemAlnReg], [CIGARInfo])].self
         ) { group in
             var nextIdx = 0
-            var collected: [(Int, [MemAlnReg])] = []
+            var collected: [(Int, [MemAlnReg], [CIGARInfo])] = []
+            collected.reserveCapacity(reads.count)
 
             // Seed initial batch
             while nextIdx < min(maxConcurrency, reads.count) {
                 let idx = nextIdx
                 let read = reads[idx]
                 group.addTask { [self] in
-                    (idx, self.alignRead(read, readId: UInt64(idx)))
+                    let regions = self.alignRead(read, readId: UInt64(idx))
+                    let mat = self.options.scoring.scoringMatrix()
+                    let cigars = self.generateFilteredCIGARs(read: read, regions: regions, scoringMatrix: mat)
+                    return (idx, regions, cigars)
                 }
                 nextIdx += 1
             }
@@ -271,20 +306,33 @@ public actor BWAMemAligner {
                     let idx = nextIdx
                     let read = reads[idx]
                     group.addTask { [self] in
-                        (idx, self.alignRead(read, readId: UInt64(idx)))
+                        let regions = self.alignRead(read, readId: UInt64(idx))
+                        let mat = self.options.scoring.scoringMatrix()
+                        let cigars = self.generateFilteredCIGARs(read: read, regions: regions, scoringMatrix: mat)
+                        return (idx, regions, cigars)
                     }
                     nextIdx += 1
                 }
             }
 
-            return collected.sorted { $0.0 < $1.0 }
+            return collected  // No sort needed: output loop uses idx-based lookup
         }
 
-        // Write output sequentially (ordered by input)
+        // Place results by idx for ordered output
+        var regionsByIdx = Array(repeating: [MemAlnReg](), count: reads.count)
+        var cigarsByIdx = Array(repeating: [CIGARInfo](), count: reads.count)
+        for (idx, regions, cigars) in results {
+            regionsByIdx[idx] = regions
+            cigarsByIdx[idx] = cigars
+        }
+
+        // Write output sequentially (ordered by input) — CIGARs already computed
         let rgID = options.readGroupID
         let comment = options.appendComment
-        for (idx, regions) in results {
+        for idx in 0..<reads.count {
             let read = reads[idx]
+            let regions = regionsByIdx[idx]
+            let cigars = cigarsByIdx[idx]
 
             if regions.isEmpty {
                 let record = try SAMOutputBuilder.buildUnmappedRecord(
@@ -297,7 +345,8 @@ public actor BWAMemAligner {
                     read: read,
                     regions: regions,
                     outputFile: outputFile,
-                    header: header
+                    header: header,
+                    cigarCache: cigars
                 )
             }
         }
@@ -317,10 +366,12 @@ public actor BWAMemAligner {
         let pairCount = min(reads1.count, reads2.count)
         let genomeLen = index.genomeLength
 
-        // Phase 1: Align all reads in parallel
+        // Phase 1: Align both mates concurrently
         // PE read IDs match bwa-mem2: id = pairIndex<<1|mateFlag
-        let allRegions1 = await alignAllReads(reads1, idBase: 0, idShift: true)
-        let allRegions2 = await alignAllReads(reads2, idBase: 1, idShift: true)
+        async let r1Task = alignAllReads(reads1, idBase: 0, idShift: true)
+        async let r2Task = alignAllReads(reads2, idBase: 1, idShift: true)
+        let allRegions1 = await r1Task
+        let allRegions2 = await r2Task
 
         // Phase 2: Estimate insert size distribution (or use manual override)
         let dist: InsertSizeDistribution
@@ -349,67 +400,99 @@ public actor BWAMemAligner {
             }
         }
 
-        // Phase 2.5: Mate rescue (skip if -S)
+        // Phase 2.5+3: Merged rescue + CIGAR pre-computation in one parallel pass.
+        // Eliminates the synchronization barrier between separate rescue and CIGAR phases.
         var mutableRegions1 = allRegions1
         var mutableRegions2 = allRegions2
         let skipRescue = (options.scoring.flag & ScoringParameters.flagNoRescue) != 0
+        let doRescue = !primaryStats.failed && !skipRescue
 
-        if !primaryStats.failed && !skipRescue {
+        // Batch rescue + CIGAR tasks: process multiple pairs per task to reduce
+        // scheduling overhead (500k individual tasks → ~4k batched tasks).
+        let maxConcurrencyOut = options.scoring.numThreads
+        let batchSize = 128
+        let batchCount = (pairCount + batchSize - 1) / batchSize
+
+        typealias PairResult = (Int, [MemAlnReg], [MemAlnReg], [CIGARInfo], [CIGARInfo], Int, Int)
+        let mergedResults = await withTaskGroup(
+            of: [PairResult].self,
+            returning: [[PairResult]].self
+        ) { group in
             let scoring = options.scoring
-            var rescueCount1 = 0, rescueCount2 = 0
-            for i in 0..<pairCount {
-                // Rescue read2 using read1's alignments as templates
-                let templates1 = selectRescueCandidates(mutableRegions1[i], scoring: scoring)
-                let rescued2 = MateRescue.rescue(
-                    templateRegions: templates1,
-                    mateRead: reads2[i],
-                    mateRegions: mutableRegions2[i],
-                    dist: dist,
-                    genomeLength: genomeLen,
-                    packedRef: index.packedRef,
-                    metadata: index.metadata,
-                    scoring: scoring
-                )
-                mutableRegions2[i].append(contentsOf: rescued2)
-                rescueCount2 += rescued2.count
+            // Capture arrays for task access (CoW reference counted)
+            let capturedReads1 = reads1
+            let capturedReads2 = reads2
+            let capturedRegs1 = mutableRegions1
+            let capturedRegs2 = mutableRegions2
 
-                // Rescue read1 using read2's alignments (symmetric)
-                let templates2 = selectRescueCandidates(mutableRegions2[i], scoring: scoring)
-                let rescued1 = MateRescue.rescue(
-                    templateRegions: templates2,
-                    mateRead: reads1[i],
-                    mateRegions: mutableRegions1[i],
-                    dist: dist,
-                    genomeLength: genomeLen,
-                    packedRef: index.packedRef,
-                    metadata: index.metadata,
-                    scoring: scoring
-                )
-                mutableRegions1[i].append(contentsOf: rescued1)
-                rescueCount1 += rescued1.count
+            var nextBatch = 0
+            var collected: [[PairResult]] = []
+            collected.reserveCapacity(batchCount)
 
-                // Re-mark secondaries after adding rescued regions
-                let peId1 = (UInt64(i) &<< 1) | 0
-                let peId2 = (UInt64(i) &<< 1) | 1
-                if mutableRegions1[i].count > 1 {
-                    ChainFilter.markSecondary(
-                        regions: &mutableRegions1[i], maskLevel: scoring.maskLevel,
-                        readId: peId1
-                    )
-                }
-                if mutableRegions2[i].count > 1 {
-                    ChainFilter.markSecondary(
-                        regions: &mutableRegions2[i], maskLevel: scoring.maskLevel,
-                        readId: peId2
-                    )
+            func addBatchTask(
+                _ group: inout TaskGroup<[PairResult]>,
+                batchStart: Int
+            ) {
+                let batchEnd = min(batchStart + batchSize, pairCount)
+                group.addTask { [self] in
+                    let mat = scoring.scoringMatrix()
+                    var results: [PairResult] = []
+                    results.reserveCapacity(batchEnd - batchStart)
+                    for idx in batchStart..<batchEnd {
+                        let r1 = capturedReads1[idx]
+                        let r2 = capturedReads2[idx]
+                        var finalRegs1 = capturedRegs1[idx]
+                        var finalRegs2 = capturedRegs2[idx]
+                        var rc1 = 0, rc2 = 0
+                        if doRescue {
+                            let (_, rr1, rr2, c1, c2) = self.rescuePair(
+                                idx: idx, regions1: finalRegs1, regions2: finalRegs2,
+                                read1: r1, read2: r2, dist: dist, scoring: scoring
+                            )
+                            finalRegs1 = rr1; finalRegs2 = rr2; rc1 = c1; rc2 = c2
+                        }
+                        let cig1 = self.generateFilteredCIGARs(read: r1, regions: finalRegs1, scoringMatrix: mat)
+                        let cig2 = self.generateFilteredCIGARs(read: r2, regions: finalRegs2, scoringMatrix: mat)
+                        results.append((idx, finalRegs1, finalRegs2, cig1, cig2, rc1, rc2))
+                    }
+                    return results
                 }
             }
-            if options.verbosity >= 3 {
-                fputs("[PE] Mate rescue: \(rescueCount1) read1 + \(rescueCount2) read2 rescued\n", stderr)
+
+            // Seed initial batches
+            while nextBatch < min(maxConcurrencyOut, batchCount) {
+                addBatchTask(&group, batchStart: nextBatch * batchSize)
+                nextBatch += 1
+            }
+
+            for await batchResult in group {
+                collected.append(batchResult)
+                if nextBatch < batchCount {
+                    addBatchTask(&group, batchStart: nextBatch * batchSize)
+                    nextBatch += 1
+                }
+            }
+
+            return collected  // No sort needed: unpacking uses idx-based placement
+        }
+
+        // Unpack merged results (batched)
+        var allCigars = Array(repeating: ([CIGARInfo](), [CIGARInfo]()), count: pairCount)
+        var rescueCount1 = 0, rescueCount2 = 0
+        for batch in mergedResults {
+            for (idx, regs1, regs2, cig1, cig2, rc1, rc2) in batch {
+                mutableRegions1[idx] = regs1
+                mutableRegions2[idx] = regs2
+                allCigars[idx] = (cig1, cig2)
+                rescueCount1 += rc1
+                rescueCount2 += rc2
             }
         }
 
-        // Phase 3: For each pair, resolve and write output
+        if doRescue && options.verbosity >= 3 {
+            fputs("[PE] Mate rescue: \(rescueCount1) read1 + \(rescueCount2) read2 rescued\n", stderr)
+        }
+
         let skipPairing = (options.scoring.flag & ScoringParameters.flagNoPairing) != 0
         let rgID = options.readGroupID
         let comment = options.appendComment
@@ -418,6 +501,7 @@ public actor BWAMemAligner {
             let read2 = reads2[i]
             let regions1 = mutableRegions1[i]
             let regions2 = mutableRegions2[i]
+            let (cigars1, cigars2) = allCigars[i]
 
             let r1Empty = regions1.isEmpty
             let r2Empty = regions2.isEmpty
@@ -464,14 +548,19 @@ public actor BWAMemAligner {
                 // mem_sam_pe swap logic that puts the paired region at index 0)
                 var pairedRegions1 = regions1
                 var pairedRegions2 = regions2
+                var pairedCigars1 = cigars1
+                var pairedCigars2 = cigars2
                 promotePairedRegion(regions: &pairedRegions1, pairedIdx: decision.idx1)
                 promotePairedRegion(regions: &pairedRegions2, pairedIdx: decision.idx2)
+                if decision.idx1 > 0 && decision.idx1 < pairedCigars1.count {
+                    pairedCigars1.swapAt(0, decision.idx1)
+                }
+                if decision.idx2 > 0 && decision.idx2 < pairedCigars2.count {
+                    pairedCigars2.swapAt(0, decision.idx2)
+                }
 
-                let reg1 = pairedRegions1[0]
-                let reg2 = pairedRegions2[0]
-
-                let cigar1 = generateCIGAR(read: read1, region: reg1)
-                let cigar2 = generateCIGAR(read: read2, region: reg2)
+                let cigar1 = pairedCigars1[0]
+                let cigar2 = pairedCigars2[0]
 
                 let (rid1, localPos1) = index.metadata.decodePosition(cigar1.pos)
                 let (rid2, localPos2) = index.metadata.decodePosition(cigar2.pos)
@@ -498,14 +587,14 @@ public actor BWAMemAligner {
                 try emitSingleEndAlignments(
                     read: read1, regions: pairedRegions1,
                     outputFile: outputFile, header: header,
-                    pairedEnd: pe1
+                    pairedEnd: pe1, cigarCache: pairedCigars1
                 )
 
                 // Emit primary read2 using emitSingleEndAlignments for full supplementary handling
                 try emitSingleEndAlignments(
                     read: read2, regions: pairedRegions2,
                     outputFile: outputFile, header: header,
-                    pairedEnd: pe2
+                    pairedEnd: pe2, cigarCache: pairedCigars2
                 )
             } else if !r1Empty && r2Empty {
                 // Read 1 mapped, read 2 unmapped
@@ -513,7 +602,8 @@ public actor BWAMemAligner {
                     mappedRead: read1, mappedRegions: regions1,
                     unmappedRead: read2,
                     mappedIsRead1: true,
-                    outputFile: outputFile, header: header
+                    outputFile: outputFile, header: header,
+                    cigarCache: cigars1
                 )
             } else if r1Empty && !r2Empty {
                 // Read 1 unmapped, read 2 mapped
@@ -521,15 +611,14 @@ public actor BWAMemAligner {
                     mappedRead: read2, mappedRegions: regions2,
                     unmappedRead: read1,
                     mappedIsRead1: false,
-                    outputFile: outputFile, header: header
+                    outputFile: outputFile, header: header,
+                    cigarCache: cigars2
                 )
             } else {
                 // Both have regions but no valid pairing (e.g., different chromosomes)
                 // Use best region for mate info, then emit with full supplementary handling
-                let bestReg1 = regions1[0]
-                let bestReg2 = regions2[0]
-                let cigar1 = generateCIGAR(read: read1, region: bestReg1)
-                let cigar2 = generateCIGAR(read: read2, region: bestReg2)
+                let cigar1 = cigars1[0]
+                let cigar2 = cigars2[0]
 
                 let (rid1, localPos1) = index.metadata.decodePosition(cigar1.pos)
                 let (rid2, localPos2) = index.metadata.decodePosition(cigar2.pos)
@@ -550,12 +639,12 @@ public actor BWAMemAligner {
                 try emitSingleEndAlignments(
                     read: read1, regions: regions1,
                     outputFile: outputFile, header: header,
-                    pairedEnd: pe1
+                    pairedEnd: pe1, cigarCache: cigars1
                 )
                 try emitSingleEndAlignments(
                     read: read2, regions: regions2,
                     outputFile: outputFile, header: header,
-                    pairedEnd: pe2
+                    pairedEnd: pe2, cigarCache: cigars2
                 )
             }
         }
@@ -570,13 +659,15 @@ public actor BWAMemAligner {
         regions: [MemAlnReg],
         outputFile: borrowing HTSFile,
         header: SAMHeader,
-        pairedEnd: PairedEndInfo? = nil
+        pairedEnd: PairedEndInfo? = nil,
+        cigarCache: [CIGARInfo]? = nil
     ) throws {
         let scoring = options.scoring
         let rgID = options.readGroupID
         let refHeader = options.outputRefHeader
         let comment = options.appendComment
         let outputAll = (scoring.flag & ScoringParameters.flagAll) != 0
+        let scoringMat = scoring.scoringMatrix()
 
         // Pass 1: Classify regions into segments
         var segments: [AlnSegment] = []
@@ -587,7 +678,12 @@ public actor BWAMemAligner {
         for (regIdx, region) in regions.enumerated() {
             guard region.score >= scoring.minOutputScore else { continue }
 
-            let cigarInfo = generateCIGAR(read: read, region: region)
+            let cigarInfo: CIGARInfo
+            if let cache = cigarCache, regIdx < cache.count {
+                cigarInfo = cache[regIdx]
+            } else {
+                cigarInfo = generateCIGAR(read: read, region: region, scoringMatrix: scoringMat)
+            }
             let (rid, localPos) = index.metadata.decodePosition(cigarInfo.pos)
             let rname = rid >= 0 && rid < index.metadata.annotations.count
                 ? index.metadata.annotations[Int(rid)].name : "*"
@@ -783,9 +879,72 @@ public actor BWAMemAligner {
         regions[0].secondary = -1
     }
 
+    /// Rescue a single pair: rescue read2 from read1's templates, then read1 from
+    /// (read2 + rescued). Re-marks secondaries. Called in parallel across pairs.
+    nonisolated private func rescuePair(
+        idx: Int,
+        regions1: [MemAlnReg],
+        regions2: [MemAlnReg],
+        read1: ReadSequence,
+        read2: ReadSequence,
+        dist: InsertSizeDistribution,
+        scoring: ScoringParameters
+    ) -> (Int, [MemAlnReg], [MemAlnReg], Int, Int) {
+        let genomeLen = index.genomeLength
+        let mat = scoring.scoringMatrix()
+        var regs1 = regions1
+        var regs2 = regions2
+
+        // Rescue read2 using read1's alignments as templates
+        let templates1 = Self.selectRescueCandidates(regs1, scoring: scoring)
+        let rescued2 = MateRescue.rescue(
+            templateRegions: templates1,
+            mateRead: read2,
+            mateRegions: regs2,
+            dist: dist,
+            genomeLength: genomeLen,
+            packedRef: index.packedRef,
+            metadata: index.metadata,
+            scoring: scoring,
+            scoringMatrix: mat
+        )
+        regs2.append(contentsOf: rescued2)
+
+        // Rescue read1 using read2's alignments (symmetric)
+        let templates2 = Self.selectRescueCandidates(regs2, scoring: scoring)
+        let rescued1 = MateRescue.rescue(
+            templateRegions: templates2,
+            mateRead: read1,
+            mateRegions: regs1,
+            dist: dist,
+            genomeLength: genomeLen,
+            packedRef: index.packedRef,
+            metadata: index.metadata,
+            scoring: scoring,
+            scoringMatrix: mat
+        )
+        regs1.append(contentsOf: rescued1)
+
+        // Re-mark secondaries after adding rescued regions
+        let peId1 = (UInt64(idx) &<< 1) | 0
+        let peId2 = (UInt64(idx) &<< 1) | 1
+        if regs1.count > 1 {
+            ChainFilter.markSecondary(
+                regions: &regs1, maskLevel: scoring.maskLevel, readId: peId1
+            )
+        }
+        if regs2.count > 1 {
+            ChainFilter.markSecondary(
+                regions: &regs2, maskLevel: scoring.maskLevel, readId: peId2
+            )
+        }
+
+        return (idx, regs1, regs2, rescued1.count, rescued2.count)
+    }
+
     /// Select rescue candidate regions: primary regions with score >= bestScore - unpairedPenalty,
     /// capped at maxMatesw. Matches bwa-mem2 lines 382-385.
-    private func selectRescueCandidates(
+    private static func selectRescueCandidates(
         _ regions: [MemAlnReg], scoring: ScoringParameters
     ) -> [MemAlnReg] {
         guard let bestScore = regions.first(where: { $0.secondary < 0 })?.score else {
@@ -806,7 +965,7 @@ public actor BWAMemAligner {
     ///   - reads: Array of reads to align
     ///   - idBase: Base value for read ID (0 for SE/read1, 1 for read2)
     ///   - idShift: If true, use PE scheme (idx<<1|idBase); if false, use SE scheme (idx)
-    private func alignAllReads(
+    nonisolated private func alignAllReads(
         _ reads: [ReadSequence],
         idBase: UInt64 = 0,
         idShift: Bool = false
@@ -818,6 +977,7 @@ public actor BWAMemAligner {
         ) { group in
             var nextIdx = 0
             var collected: [(Int, [MemAlnReg])] = []
+            collected.reserveCapacity(reads.count)
 
             // Seed initial batch
             while nextIdx < min(maxConcurrency, reads.count) {
@@ -844,9 +1004,14 @@ public actor BWAMemAligner {
                 }
             }
 
-            return collected.sorted { $0.0 < $1.0 }
+            return collected  // No sort needed: idx-based placement below
         }
-        return results.map { $0.1 }
+        // Place results by idx for ordered output
+        var ordered = Array(repeating: [MemAlnReg](), count: reads.count)
+        for (idx, regions) in results {
+            ordered[idx] = regions
+        }
+        return ordered
     }
 
     /// Write a pair where one read is mapped and the other is unmapped.
@@ -856,10 +1021,11 @@ public actor BWAMemAligner {
         unmappedRead: ReadSequence,
         mappedIsRead1: Bool,
         outputFile: borrowing HTSFile,
-        header: SAMHeader
+        header: SAMHeader,
+        cigarCache: [CIGARInfo]? = nil
     ) {
         let region = mappedRegions[0]
-        let cigar = generateCIGAR(read: mappedRead, region: region)
+        let cigar = cigarCache?.first ?? generateCIGAR(read: mappedRead, region: region)
         let (rid, localPos) = index.metadata.decodePosition(cigar.pos)
         let rgID = options.readGroupID
         let refHeader = options.outputRefHeader

@@ -46,7 +46,13 @@ public struct InsertSizeDistribution: Sendable {
 public struct InsertSizeEstimator: Sendable {
 
     /// Minimum number of samples per orientation to compute stats.
-    public static let minSamples = 25
+    /// bwa-mem2: MIN_DIR_CNT = 10
+    public static let minSamples = 10
+
+    /// Minimum ratio of an orientation's count to the max orientation's count.
+    /// Orientations below this ratio are marked as failed.
+    /// bwa-mem2: MIN_DIR_RATIO = 0.05
+    public static let minDirRatio = 0.05
 
     /// Build an insert size distribution from manual override values (-I flag).
     ///
@@ -208,6 +214,18 @@ public struct InsertSizeEstimator: Sendable {
         }
 
         dist.primaryOrientation = PairOrientation(rawValue: primaryIdx) ?? .fr
+
+        // Post-filter: suppress orientations with less than MIN_DIR_RATIO of the
+        // max orientation's count. Matches bwa-mem2 mem_pestat() lines 141-147.
+        if maxCount > 0 {
+            for d in 0..<4 {
+                if !dist.stats[d].failed
+                    && Double(dist.stats[d].count) < Double(maxCount) * Self.minDirRatio {
+                    dist.stats[d].failed = true
+                }
+            }
+        }
+
         return dist
     }
 }

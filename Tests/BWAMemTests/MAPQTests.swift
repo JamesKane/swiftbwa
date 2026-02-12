@@ -15,14 +15,14 @@ struct MAPQTests {
         let scoring = ScoringParameters()
         let readLength: Int32 = 150
 
-        // Region with sub=0 (current behavior for unique mappers)
+        // Region with sub=0 (unique mapper: defaults to minSeedLen * matchScore = 19)
         let regionNoSub = MemAlnReg(
-            rb: 0, re: 100, qb: 0, qe: 100, score: 100, sub: 0
+            rb: 0, re: 100, qb: 0, qe: 100, score: 100, sub: 0, seedCov: 100
         )
 
         // Same region but with sub=80 (what it should be if a secondary existed)
         let regionWithSub = MemAlnReg(
-            rb: 0, re: 100, qb: 0, qe: 100, score: 100, sub: 80
+            rb: 0, re: 100, qb: 0, qe: 100, score: 100, sub: 80, seedCov: 100
         )
 
         let mapqNoSub = MappingQuality.compute(

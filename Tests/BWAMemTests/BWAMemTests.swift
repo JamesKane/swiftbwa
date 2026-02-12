@@ -18,7 +18,7 @@ struct BWAMemTests {
 
     @Test("MappingQuality for unique perfect hit")
     func testMAPQPerfect() {
-        let region = MemAlnReg(rb: 0, re: 100, qb: 0, qe: 100, score: 100, trueScore: 100, sub: 0)
+        let region = MemAlnReg(rb: 0, re: 100, qb: 0, qe: 100, score: 100, trueScore: 100, sub: 0, seedCov: 100)
         let mapq = MappingQuality.compute(
             region: region,
             allRegions: [region],
@@ -42,8 +42,8 @@ struct BWAMemTests {
 
     @Test("MappingQuality decreases with sub-optimal hits")
     func testMAPQWithSub() {
-        let region1 = MemAlnReg(rb: 0, re: 100, qb: 0, qe: 100, score: 80, trueScore: 80, sub: 70)
-        let region2 = MemAlnReg(rb: 0, re: 100, qb: 0, qe: 100, score: 80, trueScore: 80, sub: 10)
+        let region1 = MemAlnReg(rb: 0, re: 100, qb: 0, qe: 100, score: 80, trueScore: 80, sub: 70, seedCov: 80)
+        let region2 = MemAlnReg(rb: 0, re: 100, qb: 0, qe: 100, score: 80, trueScore: 80, sub: 10, seedCov: 80)
 
         let scoring = ScoringParameters()
         let mapq1 = MappingQuality.compute(region: region1, allRegions: [region1], scoring: scoring, readLength: 100)
@@ -351,7 +351,7 @@ struct InsertSizeEstimatorTests {
             let r1 = MemAlnReg(
                 rb: r1Pos, re: r1Pos + 100,
                 qb: 0, qe: 100, rid: 0,
-                score: 100, trueScore: 100, sub: 0
+                score: 100, trueScore: 100, sub: 0, seedCov: 100
             )
             // We want p2 = r1Pos + targetDist, where p2 = 2*genomeLen - 1 - r2.rb
             // So r2.rb = 2*genomeLen - 1 - (r1Pos + targetDist)
@@ -359,7 +359,7 @@ struct InsertSizeEstimatorTests {
             let r2 = MemAlnReg(
                 rb: r2Rb, re: r2Rb + 100,
                 qb: 0, qe: 100, rid: 0,
-                score: 100, trueScore: 100, sub: 0
+                score: 100, trueScore: 100, sub: 0, seedCov: 100
             )
             regions1.append([r1])
             regions2.append([r2])
@@ -390,14 +390,14 @@ struct InsertSizeEstimatorTests {
             let r1 = MemAlnReg(
                 rb: r1Pos, re: r1Pos + 100,
                 qb: 0, qe: 100, rid: 0,
-                score: 100, trueScore: 100, sub: 0
+                score: 100, trueScore: 100, sub: 0, seedCov: 100
             )
             // p2 = r1Pos + 300, so r2.rb = 2*genomeLen - 1 - (r1Pos + 300)
             let r2Rb = 2 * genomeLen - 1 - (r1Pos + 300)
             let r2 = MemAlnReg(
                 rb: r2Rb, re: r2Rb + 100,
                 qb: 0, qe: 100, rid: 0,
-                score: 100, trueScore: 100, sub: 0
+                score: 100, trueScore: 100, sub: 0, seedCov: 100
             )
             regions1.append([r1])
             regions2.append([r2])
@@ -409,13 +409,13 @@ struct InsertSizeEstimatorTests {
             let r1 = MemAlnReg(
                 rb: r1Pos, re: r1Pos + 100,
                 qb: 0, qe: 100, rid: 0,
-                score: 100, trueScore: 100, sub: 0
+                score: 100, trueScore: 100, sub: 0, seedCov: 100
             )
             let r2Rb = 2 * genomeLen - 1 - (r1Pos + 5000)
             let r2 = MemAlnReg(
                 rb: r2Rb, re: r2Rb + 100,
                 qb: 0, qe: 100, rid: 0,
-                score: 100, trueScore: 100, sub: 0
+                score: 100, trueScore: 100, sub: 0, seedCov: 100
             )
             regions1.append([r1])
             regions2.append([r2])

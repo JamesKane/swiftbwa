@@ -209,6 +209,10 @@ public struct PairedEndResolver: Sendable {
     /// `floor(0.721 * ln(2 * erfc(z / sqrt(2))) * matchScore / ln(10) + 0.499)`
     private static func computeZPenalty(z: Double, matchScore: Int32) -> Int {
         let erfcVal = erfc(z / sqrt(2.0))
+        guard erfcVal > 0 else {
+            // z is so large that erfc underflows to 0; treat as maximum penalty
+            return Int(matchScore) * 10
+        }
         let logVal = log(2.0 * erfcVal)
         let penalty = 0.721 * logVal * Double(matchScore) / log(10.0) + 0.499
         // Penalty should be non-positive (it reduces score); floor to int

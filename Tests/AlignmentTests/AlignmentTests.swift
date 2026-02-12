@@ -344,11 +344,10 @@ struct AlignmentTests {
             }
         }
 
-        // Perfect match: 10M, score = 10, NM = 0
+        // Perfect match: 10M, score = 10
         #expect(result.cigar.count == 1)
         #expect(result.cigar[0] == (10 << 4 | CIGAROp.match.rawValue))
         #expect(result.score == 10)
-        #expect(result.nm == 0)
     }
 
     @Test("GlobalAligner single mismatch produces 10M with NM=1")
@@ -366,7 +365,12 @@ struct AlignmentTests {
         // Same lengths, 1 mismatch: should be 10M with NM=1
         #expect(result.cigar.count == 1)
         #expect(result.cigar[0] == (10 << 4 | CIGAROp.match.rawValue))
-        #expect(result.nm == 1)
+        let nm = query.withUnsafeBufferPointer { qBuf in
+            target.withUnsafeBufferPointer { tBuf in
+                GlobalAligner.computeNM(cigar: result.cigar, query: qBuf, target: tBuf)
+            }
+        }
+        #expect(nm == 1)
         // Score: 9 matches - 4 mismatch = 5
         #expect(result.score == 5)
     }
@@ -404,7 +408,6 @@ struct AlignmentTests {
         #expect(hasInsertion)
         #expect(totalQueryBases == 7)
         #expect(totalTargetBases == 6)
-        #expect(result.nm >= 1)
     }
 
     @Test("GlobalAligner single deletion")
@@ -440,7 +443,6 @@ struct AlignmentTests {
         #expect(hasDeletion)
         #expect(totalQueryBases == 6)
         #expect(totalTargetBases == 7)
-        #expect(result.nm >= 1)
     }
 
     @Test("GlobalAligner narrow vs wide band produce same result on short sequences")

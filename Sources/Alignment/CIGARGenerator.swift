@@ -37,7 +37,8 @@ public struct CIGARGenerator: Sendable {
         trueScore: Int32,
         initialW: Int32,
         scoring: ScoringParameters,
-        refPos: Int64
+        refPos: Int64,
+        scoringMatrix: [Int8]? = nil
     ) -> CIGARResult {
         // Infer initial band width from score and lengths
         var w = inferBandWidth(
@@ -53,9 +54,53 @@ public struct CIGARGenerator: Sendable {
         var retries = 0
         let maxRetries = 3
 
+        let mat = scoringMatrix ?? scoring.scoringMatrix()
+
+        // Fast path: when query and ref are the same length and the score deficit
+        // is too small for any indel pair (open+extend for both ins and del), the
+        // alignment must be pure matches/mismatches — CIGAR is just "{len}M".
+        // This skips the entire GlobalAligner DP for ~90% of Illumina reads.
+        let queryLen = querySegment.count
+        let refLen = refSegment.count
+        let minIndelCost = scoring.gapOpenPenalty + scoring.gapExtendPenalty
+            + scoring.gapOpenPenaltyDeletion + scoring.gapExtendPenaltyDeletion
+        let deficit = Int32(queryLen) * scoring.matchScore - trueScore
+
+        if queryLen == refLen && queryLen > 0 && deficit < minIndelCost {
+            let cigarOp = UInt32(queryLen) << 4 | CIGAROp.match.rawValue
+            var cigar = [cigarOp]
+            let nm = computeNMFromCigar(cigar: cigar, query: querySegment,
+                                         target: refSegment)
+            let md = generateMD(cigar: cigar, query: querySegment,
+                                target: refSegment)
+
+            // Add soft-clips
+            let intQb = Int(qb)
+            let intQe = Int(qe)
+            if isReverse {
+                let clip5 = readLength - intQe
+                let clip3 = intQb
+                if clip5 > 0 {
+                    cigar.insert(UInt32(clip5) << 4 | CIGAROp.softClip.rawValue, at: 0)
+                }
+                if clip3 > 0 {
+                    cigar.append(UInt32(clip3) << 4 | CIGAROp.softClip.rawValue)
+                }
+            } else {
+                if intQb > 0 {
+                    cigar.insert(UInt32(intQb) << 4 | CIGAROp.softClip.rawValue, at: 0)
+                }
+                if intQe < readLength {
+                    cigar.append(UInt32(readLength - intQe) << 4 | CIGAROp.softClip.rawValue)
+                }
+            }
+
+            return CIGARResult(cigar: cigar, nm: nm, md: md, score: trueScore, pos: refPos)
+        }
+
         result = querySegment.withUnsafeBufferPointer { qBuf in
             refSegment.withUnsafeBufferPointer { tBuf in
-                GlobalAligner.align(query: qBuf, target: tBuf, scoring: scoring, w: w)
+                GlobalAligner.align(query: qBuf, target: tBuf, scoring: scoring, w: w, scoringMatrix: mat)
             }
         }
 
@@ -64,7 +109,7 @@ public struct CIGARGenerator: Sendable {
             retries += 1
             result = querySegment.withUnsafeBufferPointer { qBuf in
                 refSegment.withUnsafeBufferPointer { tBuf in
-                    GlobalAligner.align(query: qBuf, target: tBuf, scoring: scoring, w: w)
+                    GlobalAligner.align(query: qBuf, target: tBuf, scoring: scoring, w: w, scoringMatrix: mat)
                 }
             }
         }

@@ -38,11 +38,11 @@ private let chm13IndexAvailable = FileManager.default.fileExists(
     atPath: chm13IndexPrefix + ".bwt.2bit.64"
 )
 
-private let seFastqPath = testDataDir + "/hg002_chm13_se_100.fq"
-private let peR1Path = testDataDir + "/hg002_chm13_pe_100_R1.fq"
-private let peR2Path = testDataDir + "/hg002_chm13_pe_100_R2.fq"
-private let seGoldPath = testDataDir + "/hg002_chm13_se_100.sam"
-private let peGoldPath = testDataDir + "/hg002_chm13_pe_100.sam"
+private let seFastqPath = testDataDir + "/hg002_chm13_se_1000.fq"
+private let peR1Path = testDataDir + "/hg002_chm13_pe_1000_R1.fq"
+private let peR2Path = testDataDir + "/hg002_chm13_pe_1000_R2.fq"
+private let seGoldPath = testDataDir + "/hg002_chm13_se_1000.sam"
+private let peGoldPath = testDataDir + "/hg002_chm13_pe_1000.sam"
 
 private let goldFilesExist =
     FileManager.default.fileExists(atPath: seFastqPath)

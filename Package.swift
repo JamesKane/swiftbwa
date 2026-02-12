@@ -30,10 +30,15 @@ let package = Package(
         ),
 
         // Alignment: Smith-Waterman, chaining, filtering
+        // -Ounchecked removes all remaining safety checks (bounds, overflow, force-unwrap)
+        // in the hot DP inner loops, matching C compiler behavior.
         .target(
             name: "Alignment",
             dependencies: ["BWACore"],
-            swiftSettings: [.enableExperimentalFeature("StrictConcurrency")]
+            swiftSettings: [
+                .enableExperimentalFeature("StrictConcurrency"),
+                .unsafeFlags(["-Ounchecked"], .when(configuration: .release)),
+            ]
         ),
 
         // BWAMem: pipeline orchestration + SAM output

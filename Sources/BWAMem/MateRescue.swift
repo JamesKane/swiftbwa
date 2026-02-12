@@ -31,7 +31,8 @@ public struct MateRescue: Sendable {
         genomeLength: Int64,
         packedRef: PackedReference,
         metadata: ReferenceMetadata,
-        scoring: ScoringParameters
+        scoring: ScoringParameters,
+        scoringMatrix: [Int8]? = nil
     ) -> [MemAlnReg] {
         guard !templateRegions.isEmpty else { return [] }
 
@@ -48,6 +49,9 @@ public struct MateRescue: Sendable {
 
             for r in 0..<4 {
                 let oriStats = dist.stats[r]
+                // Skip orientations with insufficient or unreliable data.
+                // Non-primary orientations with few observations cause
+                // excessive SW calls (O(N) per pair) with negligible benefit.
                 guard !oriStats.failed else { continue }
 
                 // Check if mate already has a hit for this direction
@@ -116,7 +120,8 @@ public struct MateRescue: Sendable {
 
                 // Run local SW
                 guard let swResult = LocalSWAligner.align(
-                    query: mateSeq, target: refBases, scoring: scoring
+                    query: mateSeq, target: refBases, scoring: scoring,
+                    scoringMatrix: scoringMatrix
                 ) else { continue }
 
                 // Filter by minimum score
