@@ -11,6 +11,7 @@ let package = Package(
         .library(name: "FMIndex", targets: ["FMIndex"]),
         .library(name: "BWACore", targets: ["BWACore"]),
         .library(name: "MetalSW", targets: ["MetalSW"]),
+        .library(name: "FMIndexBuilder", targets: ["FMIndexBuilder"]),
     ],
     dependencies: [
         .package(path: "../swift-htslib"),
@@ -50,6 +51,19 @@ let package = Package(
             swiftSettings: [.enableExperimentalFeature("StrictConcurrency")]
         ),
 
+        // C helpers for zlib and POSIX functions unavailable in Swift
+        .target(
+            name: "CHelpers",
+            linkerSettings: [.linkedLibrary("z")]
+        ),
+
+        // FM-Index building (FASTA → .bwt.2bit.64 + .pac + .ann + .amb)
+        .target(
+            name: "FMIndexBuilder",
+            dependencies: ["BWACore", "FMIndex", "CHelpers"],
+            swiftSettings: [.enableExperimentalFeature("StrictConcurrency")]
+        ),
+
         // BWAMem: pipeline orchestration + SAM output
         .target(
             name: "BWAMem",
@@ -69,6 +83,7 @@ let package = Package(
             dependencies: [
                 "BWAMem",
                 "MetalSW",
+                "FMIndexBuilder",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
             swiftSettings: [.enableExperimentalFeature("StrictConcurrency")]

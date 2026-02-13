@@ -1,6 +1,7 @@
 import ArgumentParser
 import BWAMem
 import FMIndex
+import FMIndexBuilder
 import BWACore
 import Foundation
 import Htslib
@@ -14,9 +15,33 @@ struct SwiftBWA: AsyncParsableCommand {
         commandName: "swiftbwa",
         abstract: "BWA-MEM sequence aligner reimplemented in Swift",
         version: "0.1.0",
-        subcommands: [Mem.self],
+        subcommands: [Mem.self, Index.self],
         defaultSubcommand: Mem.self
     )
+}
+
+struct Index: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Build BWA-MEM2 compatible index from FASTA"
+    )
+
+    @Option(name: .shortAndLong, help: "Output prefix [same as FASTA path]")
+    var prefix: String?
+
+    @Option(name: .short, help: "Verbosity level: 1=error, 2=warning, 3=info")
+    var v: Int = 3
+
+    @Argument(help: "Reference FASTA file (plain or gzipped)")
+    var fasta: String
+
+    func run() throws {
+        let outputPrefix = prefix ?? fasta
+        if v >= 3 {
+            fputs("[M::index] Building index for \(fasta)\n", stderr)
+            fputs("[M::index] Output prefix: \(outputPrefix)\n", stderr)
+        }
+        try IndexBuilder.build(fasta: fasta, prefix: outputPrefix, verbosity: v)
+    }
 }
 
 struct Mem: AsyncParsableCommand {
