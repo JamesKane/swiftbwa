@@ -7,10 +7,13 @@ import MetalSW
 #endif
 #if canImport(Darwin)
 import Darwin
+import Dispatch
 #elseif canImport(Glibc)
 import Glibc
+import Dispatch
 #elseif canImport(Musl)
 import Musl
+import Dispatch
 #endif
 
 /// Result of CIGAR generation for a single alignment.
@@ -50,11 +53,31 @@ public actor BWAMemAligner {
         self.options = options
     }
 
-    /// Align a single read against the reference.
-    /// - Parameters:
-    ///   - read: The read to align
-    ///   - readId: Unique identifier for deterministic hash-based tiebreaking (matches bwa-mem2's id parameter)
+    /// Align a single read against the reference (CPU path).
+    /// Calls phase1to3, CPU extension, then phase4to5.
     nonisolated public func alignRead(_ read: ReadSequence, readId: UInt64 = 0) -> [MemAlnReg] {
+        let chains = alignReadPhase1to3(read)
+        guard !chains.isEmpty else { return [] }
+
+        let scoring = options.scoring
+        var regions: [MemAlnReg] = []
+        for chain in chains {
+            let chainRegions = ExtensionAligner.extend(
+                chain: chain,
+                read: read,
+                getReference: { [index] pos, length in
+                    index.getReference(at: pos, length: length)
+                },
+                scoring: scoring
+            )
+            regions.append(contentsOf: chainRegions)
+        }
+
+        return alignReadPhase4to5(read, readId: readId, regions: regions)
+    }
+
+    /// Phase 1-3: SMEM finding → chaining → filtering. Returns filtered chains.
+    nonisolated func alignReadPhase1to3(_ read: ReadSequence) -> [MemChain] {
         let scoring = options.scoring
 
         // Phase 1: Find SMEMs
@@ -66,9 +89,7 @@ public actor BWAMemAligner {
 
         guard !smems.isEmpty else { return [] }
 
-        // Phase 1.5: Re-seeding (-y) — for long reads with high-occurrence seeds,
-        // re-run SMEM finding with relaxed occurrence threshold to find additional
-        // shorter, more specific seeds. Matches bwa-mem2's mem_collect_intv behavior.
+        // Phase 1.5: Re-seeding (-y)
         if scoring.reseedLength > 0 {
             let maxOcc = Int64(scoring.maxOccurrences)
             let hasHighOcc = smems.contains { $0.count > maxOcc }
@@ -79,10 +100,8 @@ public actor BWAMemAligner {
                     minSeedLen: scoring.reseedLength,
                     minIntv: maxOcc
                 )
-                // Merge and deduplicate: keep unique seeds by (queryBegin, queryEnd, k)
                 var seen = Set<Int64>()
                 for s in smems {
-                    // Simple hash combining position and SA interval
                     seen.insert(Int64(s.queryBegin) << 32 | Int64(s.queryEnd) << 16 | (s.k & 0xFFFF))
                 }
                 for s in reseeded {
@@ -92,7 +111,6 @@ public actor BWAMemAligner {
                         seen.insert(key)
                     }
                 }
-                // Re-sort
                 smems.sort {
                     if $0.queryBegin != $1.queryBegin { return $0.queryBegin < $1.queryBegin }
                     return $0.length > $1.length
@@ -114,24 +132,71 @@ public actor BWAMemAligner {
         // Phase 3: Filter chains
         ChainFilter.filter(chains: &chains, scoring: scoring)
 
-        guard !chains.isEmpty else { return [] }
+        return chains
+    }
 
-        // Phase 4: Extend chains with Smith-Waterman
-        var regions: [MemAlnReg] = []
+    /// Phase 1.5-3: Re-seeding (if needed) + chaining + filtering from pre-computed SMEMs.
+    /// Used by GPU seeding path where phase 1 (SMEM finding) was done on GPU.
+    nonisolated func alignReadPhase1_5to3(_ read: ReadSequence, gpuSMEMs: [SMEM]) -> [MemChain] {
+        let scoring = options.scoring
+        var smems = gpuSMEMs
+        guard !smems.isEmpty else { return [] }
 
-        for chain in chains {
-            let chainRegions = ExtensionAligner.extend(
-                chain: chain,
-                read: read,
-                getReference: { [index] pos, length in
-                    index.getReference(at: pos, length: length)
-                },
-                scoring: scoring
-            )
-            regions.append(contentsOf: chainRegions)
+        // Phase 1.5: Re-seeding (-y) — runs on CPU for high-occ seeds
+        if scoring.reseedLength > 0 {
+            let maxOcc = Int64(scoring.maxOccurrences)
+            let hasHighOcc = smems.contains { $0.count > maxOcc }
+            if hasHighOcc {
+                let reseeded = SMEMFinder.findAllSMEMs(
+                    query: read.bases,
+                    bwt: index.bwt,
+                    minSeedLen: scoring.reseedLength,
+                    minIntv: maxOcc
+                )
+                var seen = Set<Int64>()
+                for s in smems {
+                    seen.insert(Int64(s.queryBegin) << 32 | Int64(s.queryEnd) << 16 | (s.k & 0xFFFF))
+                }
+                for s in reseeded {
+                    let key = Int64(s.queryBegin) << 32 | Int64(s.queryEnd) << 16 | (s.k & 0xFFFF)
+                    if !seen.contains(key) {
+                        smems.append(s)
+                        seen.insert(key)
+                    }
+                }
+                smems.sort {
+                    if $0.queryBegin != $1.queryBegin { return $0.queryBegin < $1.queryBegin }
+                    return $0.length > $1.length
+                }
+            }
         }
 
-        // Safety net: ensure isAlt is set from metadata (matches bwa-mem2 line 1166-1167)
+        // Phase 2: Chain seeds
+        var chains = SeedChainer.chain(
+            smems: smems,
+            getSAEntry: { [index] pos in
+                index.suffixArray.resolve(at: pos, bwt: index.bwt)
+            },
+            metadata: index.metadata,
+            scoring: scoring,
+            readLength: Int32(read.length)
+        )
+
+        // Phase 3: Filter chains
+        ChainFilter.filter(chains: &chains, scoring: scoring)
+
+        return chains
+    }
+
+    /// Phase 4.5-5: isAlt safety net, dedup, markSecondary. Takes extension results, returns final regions.
+    nonisolated func alignReadPhase4to5(
+        _ read: ReadSequence, readId: UInt64, regions: [MemAlnReg]
+    ) -> [MemAlnReg] {
+        var regions = regions
+        guard !regions.isEmpty else { return [] }
+        let scoring = options.scoring
+
+        // Safety net: ensure isAlt is set from metadata
         for i in 0..<regions.count {
             if regions[i].rid >= 0
                 && regions[i].rid < index.metadata.numSequences
@@ -281,45 +346,31 @@ public actor BWAMemAligner {
         // (CIGAR generation via GlobalAligner is the SE bottleneck, so it must be parallel)
         let maxConcurrency = options.scoring.numThreads
 
-        let results = await withTaskGroup(
-            of: (Int, [MemAlnReg], [CIGARInfo]).self,
-            returning: [(Int, [MemAlnReg], [CIGARInfo])].self
-        ) { group in
-            var nextIdx = 0
-            var collected: [(Int, [MemAlnReg], [CIGARInfo])] = []
-            collected.reserveCapacity(reads.count)
-
-            // Seed initial batch
-            while nextIdx < min(maxConcurrency, reads.count) {
-                let idx = nextIdx
-                let read = reads[idx]
-                group.addTask { [self] in
-                    let regions = self.alignRead(read, readId: UInt64(idx))
-                    let mat = self.options.scoring.scoringMatrix()
-                    let cigars = self.generateFilteredCIGARs(read: read, regions: regions, scoringMatrix: mat)
-                    return (idx, regions, cigars)
-                }
-                nextIdx += 1
-            }
-
-            // As each completes, launch next
-            for await result in group {
-                collected.append(result)
-                if nextIdx < reads.count {
-                    let idx = nextIdx
-                    let read = reads[idx]
-                    group.addTask { [self] in
-                        let regions = self.alignRead(read, readId: UInt64(idx))
-                        let mat = self.options.scoring.scoringMatrix()
-                        let cigars = self.generateFilteredCIGARs(read: read, regions: regions, scoringMatrix: mat)
-                        return (idx, regions, cigars)
-                    }
-                    nextIdx += 1
-                }
-            }
-
-            return collected  // No sort needed: output loop uses idx-based lookup
+        #if canImport(Metal)
+        // GPU seeding: batch SMEM finding on GPU, then per-read CPU pipeline
+        let gpuSeedingEngine: MetalSWEngine?
+        if let engine = options.useGPU ? MetalSWEngine.shared : nil,
+           engine.smemForwardPipeline != nil {
+            setupBWTForGPU(engine: engine)
+            gpuSeedingEngine = engine
+        } else {
+            gpuSeedingEngine = nil
         }
+        #endif
+
+        let results: [(Int, [MemAlnReg], [CIGARInfo])]
+
+        #if canImport(Metal)
+        if let engine = gpuSeedingEngine {
+            results = await alignBatchGPUSeeded(
+                reads: reads, engine: engine, maxConcurrency: maxConcurrency
+            )
+        } else {
+            results = await alignBatchCPU(reads: reads, maxConcurrency: maxConcurrency)
+        }
+        #else
+        results = await alignBatchCPU(reads: reads, maxConcurrency: maxConcurrency)
+        #endif
 
         // Place results by idx for ordered output
         var regionsByIdx = Array(repeating: [MemAlnReg](), count: reads.count)
@@ -355,6 +406,149 @@ public actor BWAMemAligner {
         }
     }
 
+    /// SE CPU path: per-read parallel align + CIGAR.
+    private func alignBatchCPU(
+        reads: [ReadSequence],
+        maxConcurrency: Int
+    ) async -> [(Int, [MemAlnReg], [CIGARInfo])] {
+        await withTaskGroup(
+            of: (Int, [MemAlnReg], [CIGARInfo]).self,
+            returning: [(Int, [MemAlnReg], [CIGARInfo])].self
+        ) { group in
+            var nextIdx = 0
+            var collected: [(Int, [MemAlnReg], [CIGARInfo])] = []
+            collected.reserveCapacity(reads.count)
+
+            while nextIdx < min(maxConcurrency, reads.count) {
+                let idx = nextIdx
+                let read = reads[idx]
+                group.addTask { [self] in
+                    let regions = self.alignRead(read, readId: UInt64(idx))
+                    let mat = self.options.scoring.scoringMatrix()
+                    let cigars = self.generateFilteredCIGARs(read: read, regions: regions, scoringMatrix: mat)
+                    return (idx, regions, cigars)
+                }
+                nextIdx += 1
+            }
+
+            for await result in group {
+                collected.append(result)
+                if nextIdx < reads.count {
+                    let idx = nextIdx
+                    let read = reads[idx]
+                    group.addTask { [self] in
+                        let regions = self.alignRead(read, readId: UInt64(idx))
+                        let mat = self.options.scoring.scoringMatrix()
+                        let cigars = self.generateFilteredCIGARs(read: read, regions: regions, scoringMatrix: mat)
+                        return (idx, regions, cigars)
+                    }
+                    nextIdx += 1
+                }
+            }
+
+            return collected
+        }
+    }
+
+    #if canImport(Metal)
+    /// SE GPU-seeded path: batch SMEM finding on GPU, then per-read CPU pipeline + CIGAR.
+    private func alignBatchGPUSeeded(
+        reads: [ReadSequence],
+        engine: MetalSWEngine,
+        maxConcurrency: Int
+    ) async -> [(Int, [MemAlnReg], [CIGARInfo])] {
+        let scoring = options.scoring
+        let gpuBatchSize = 4096
+        let readCount = reads.count
+        var allCollected: [(Int, [MemAlnReg], [CIGARInfo])] = []
+        allCollected.reserveCapacity(readCount)
+
+        var batchStart = 0
+        while batchStart < readCount {
+            let batchEnd = min(batchStart + gpuBatchSize, readCount)
+            let batchReads = Array(reads[batchStart..<batchEnd])
+            let batchCount = batchEnd - batchStart
+
+            // GPU Phase 1: Forward extension for all reads in batch
+            let queries = batchReads.map { $0.bases }
+            let fwdResults = SMEMDispatcher.dispatchBatch(
+                queries: queries,
+                engine: engine
+            )
+            let gpuSMEMs = SMEMDispatcher.extractSMEMs(
+                from: fwdResults,
+                queries: queries,
+                minSeedLen: scoring.minSeedLength
+            )
+
+            // Phases 1.5-5 + CIGAR: parallel per-read on CPU
+            let batchResults = await withTaskGroup(
+                of: (Int, [MemAlnReg], [CIGARInfo]).self,
+                returning: [(Int, [MemAlnReg], [CIGARInfo])].self
+            ) { group in
+                var nextIdx = 0
+                var collected: [(Int, [MemAlnReg], [CIGARInfo])] = []
+                collected.reserveCapacity(batchCount)
+
+                let capturedBatchStart = batchStart
+                func addTask(_ group: inout TaskGroup<(Int, [MemAlnReg], [CIGARInfo])>, idx: Int) {
+                    let read = batchReads[idx]
+                    let smems = gpuSMEMs[idx]
+                    let gi = capturedBatchStart + idx
+                    group.addTask { [self] in
+                        let chains = self.alignReadPhase1_5to3(read, gpuSMEMs: smems)
+                        guard !chains.isEmpty else {
+                            return (gi, [], [])
+                        }
+
+                        var regions: [MemAlnReg] = []
+                        for chain in chains {
+                            let chainRegions = ExtensionAligner.extend(
+                                chain: chain,
+                                read: read,
+                                getReference: { [index] pos, length in
+                                    index.getReference(at: pos, length: length)
+                                },
+                                scoring: scoring
+                            )
+                            regions.append(contentsOf: chainRegions)
+                        }
+
+                        let finalRegions = self.alignReadPhase4to5(
+                            read, readId: UInt64(gi), regions: regions
+                        )
+                        let mat = scoring.scoringMatrix()
+                        let cigars = self.generateFilteredCIGARs(
+                            read: read, regions: finalRegions, scoringMatrix: mat
+                        )
+                        return (gi, finalRegions, cigars)
+                    }
+                }
+
+                while nextIdx < min(maxConcurrency, batchCount) {
+                    addTask(&group, idx: nextIdx)
+                    nextIdx += 1
+                }
+
+                for await result in group {
+                    collected.append(result)
+                    if nextIdx < batchCount {
+                        addTask(&group, idx: nextIdx)
+                        nextIdx += 1
+                    }
+                }
+
+                return collected
+            }
+
+            allCollected.append(contentsOf: batchResults)
+            batchStart = batchEnd
+        }
+
+        return allCollected
+    }
+    #endif
+
     /// Align paired-end reads and write SAM/BAM output.
     ///
     /// Both ends are aligned in parallel, insert size is estimated from the first
@@ -371,10 +565,30 @@ public actor BWAMemAligner {
 
         // Phase 1: Align both mates concurrently
         // PE read IDs match bwa-mem2: id = pairIndex<<1|mateFlag
-        async let r1Task = alignAllReads(reads1, idBase: 0, idShift: true)
-        async let r2Task = alignAllReads(reads2, idBase: 1, idShift: true)
-        let allRegions1 = await r1Task
-        let allRegions2 = await r2Task
+        let allRegions1: [[MemAlnReg]]
+        let allRegions2: [[MemAlnReg]]
+        #if canImport(Metal)
+        if let engine = options.useGPU ? MetalSWEngine.shared : nil,
+           engine.smemForwardPipeline != nil {
+            setupBWTForGPU(engine: engine)
+            async let r1Task = alignAllReadsGPUSeeded(reads1, idBase: 0, idShift: true, engine: engine)
+            async let r2Task = alignAllReadsGPUSeeded(reads2, idBase: 1, idShift: true, engine: engine)
+            allRegions1 = await r1Task
+            allRegions2 = await r2Task
+        } else {
+            async let r1Task = alignAllReads(reads1, idBase: 0, idShift: true)
+            async let r2Task = alignAllReads(reads2, idBase: 1, idShift: true)
+            allRegions1 = await r1Task
+            allRegions2 = await r2Task
+        }
+        #else
+        do {
+            async let r1Task = alignAllReads(reads1, idBase: 0, idShift: true)
+            async let r2Task = alignAllReads(reads2, idBase: 1, idShift: true)
+            allRegions1 = await r1Task
+            allRegions2 = await r2Task
+        }
+        #endif
 
         // Phase 2: Estimate insert size distribution (or use manual override)
         let dist: InsertSizeDistribution
@@ -1145,11 +1359,246 @@ public actor BWAMemAligner {
         return candidates
     }
 
+    #if canImport(Metal)
+    /// Ensure BWT + K-mer hash buffers are set up on the GPU engine. Called once lazily.
+    nonisolated private func setupBWTForGPU(engine: MetalSWEngine) {
+        guard engine.bwtCheckpointBuffer == nil else { return }
+        let bwt = index.bwt
+        guard let baseAddr = bwt.checkpoints.baseAddress else { return }
+        let byteCount = bwt.checkpoints.count * MemoryLayout<CheckpointOCC>.stride
+        engine.setupBWT(
+            checkpointPointer: UnsafeRawPointer(baseAddr),
+            checkpointByteCount: byteCount,
+            counts: bwt.count,
+            sentinelIndex: bwt.sentinelIndex
+        )
+
+        // Build 12-mer hash table: pre-computed BWT intervals for all 4^12 = 16M 12-mers.
+        // BFS tree expansion: level 0 has 4 entries (single bases), each level extends
+        // by all 4 bases, expanding 4× until level 11 fills the full 16M entries.
+        // In-place expansion processes parents in reverse order so children don't
+        // overwrite unprocessed parents.
+        if options.verbosity >= 3 {
+            fputs("[GPU] Building 12-mer hash table...\n", stderr)
+        }
+        let kmerK = 12
+        let tableCount = 1 << (2 * kmerK)  // 4^12 = 16,777,216
+        // Each entry: (k: Int64, l: Int64, s: Int64) = 24 bytes
+        let entrySize = 3 * MemoryLayout<Int64>.size  // 24
+        let tableByteCount = tableCount * entrySize    // 384 MB
+
+        let tablePtr = UnsafeMutableRawPointer.allocate(
+            byteCount: tableByteCount, alignment: MemoryLayout<Int64>.alignment
+        )
+        let table = tablePtr.bindMemory(to: Int64.self, capacity: tableCount * 3)
+
+        // Level 0: initialize 4 entries for single bases A, C, G, T
+        for base in 0..<4 {
+            let k = bwt.count(for: base)
+            let l = bwt.count(for: 3 - base)
+            let s = bwt.count(forNext: base) - bwt.count(for: base)
+            table[base * 3]     = k
+            table[base * 3 + 1] = l
+            table[base * 3 + 2] = s
+        }
+
+        // Levels 1 through kmerK-1: extend each parent by all 4 bases
+        for level in 1..<kmerK {
+            let parentCount = 1 << (2 * level)  // 4^level entries at current level
+
+            // Parallelize the last few levels (level 5+ have 1024+ parents)
+            if parentCount >= 1024 {
+                // Copy parents to temp buffer to avoid in-place race conditions:
+                // children of one chunk can overlap with parent indices of another chunk
+                let parentBytes = parentCount * 3 * MemoryLayout<Int64>.size
+                let tempParents = UnsafeMutablePointer<Int64>.allocate(capacity: parentCount * 3)
+                memcpy(tempParents, table, parentBytes)
+
+                let numThreads = min(parentCount, options.scoring.numThreads)
+                let chunkSize = (parentCount + numThreads - 1) / numThreads
+
+                DispatchQueue.concurrentPerform(iterations: numThreads) { threadIdx in
+                    let start = threadIdx * chunkSize
+                    let end = min(start + chunkSize, parentCount)
+                    for parentIdx in start..<end {
+                        let pk = tempParents[parentIdx * 3]
+                        let pl = tempParents[parentIdx * 3 + 1]
+                        let ps = tempParents[parentIdx * 3 + 2]
+
+                        for base in 0..<4 {
+                            let childIdx = parentIdx * 4 + base
+                            if ps <= 0 {
+                                table[childIdx * 3]     = 0
+                                table[childIdx * 3 + 1] = 0
+                                table[childIdx * 3 + 2] = 0
+                            } else {
+                                let ext = BackwardSearch.backwardExt(
+                                    bwt: bwt,
+                                    interval: (k: pl, l: pk, s: ps),
+                                    base: 3 - base
+                                )
+                                table[childIdx * 3]     = ext.l
+                                table[childIdx * 3 + 1] = ext.k
+                                table[childIdx * 3 + 2] = ext.s
+                            }
+                        }
+                    }
+                }
+                tempParents.deallocate()
+            } else {
+                // Sequential for small levels
+                for parentIdx in stride(from: parentCount - 1, through: 0, by: -1) {
+                    let pk = table[parentIdx * 3]
+                    let pl = table[parentIdx * 3 + 1]
+                    let ps = table[parentIdx * 3 + 2]
+
+                    for base in 0..<4 {
+                        let childIdx = parentIdx * 4 + base
+                        if ps <= 0 {
+                            table[childIdx * 3]     = 0
+                            table[childIdx * 3 + 1] = 0
+                            table[childIdx * 3 + 2] = 0
+                        } else {
+                            let ext = BackwardSearch.backwardExt(
+                                bwt: bwt,
+                                interval: (k: pl, l: pk, s: ps),
+                                base: 3 - base
+                            )
+                            table[childIdx * 3]     = ext.l
+                            table[childIdx * 3 + 1] = ext.k
+                            table[childIdx * 3 + 2] = ext.s
+                        }
+                    }
+                }
+            }
+        }
+
+        engine.setupKmerHash(pointer: UnsafeRawPointer(tablePtr), byteCount: tableByteCount)
+        tablePtr.deallocate()
+
+        if options.verbosity >= 3 {
+            fputs("[GPU] 12-mer hash table ready (\(tableByteCount / 1_048_576) MB)\n", stderr)
+        }
+    }
+
+    /// GPU-seeded alignment: batch SMEM finding on GPU, then per-read CPU pipeline.
+    nonisolated private func alignAllReadsGPUSeeded(
+        _ reads: [ReadSequence],
+        idBase: UInt64, idShift: Bool,
+        engine: MetalSWEngine
+    ) async -> [[MemAlnReg]] {
+        let scoring = options.scoring
+        let maxConcurrency = scoring.numThreads
+        let gpuBatchSize = 4096
+        let readCount = reads.count
+        var allResults = Array(repeating: [MemAlnReg](), count: readCount)
+
+        var batchStart = 0
+        while batchStart < readCount {
+            let batchEnd = min(batchStart + gpuBatchSize, readCount)
+            let batchReads = Array(reads[batchStart..<batchEnd])
+            let batchCount = batchEnd - batchStart
+
+            // GPU Phase 1: Forward extension for all reads in batch
+            let queries = batchReads.map { $0.bases }
+            let fwdResults = SMEMDispatcher.dispatchBatch(
+                queries: queries,
+                engine: engine
+            )
+            let gpuSMEMs = SMEMDispatcher.extractSMEMs(
+                from: fwdResults,
+                queries: queries,
+                minSeedLen: scoring.minSeedLength
+            )
+
+            // Phases 1.5-5: parallel per-read on CPU
+            let capturedBatchStart = batchStart
+            let batchResults = await withTaskGroup(
+                of: (Int, [MemAlnReg]).self,
+                returning: [(Int, [MemAlnReg])].self
+            ) { group in
+                var nextIdx = 0
+                var collected: [(Int, [MemAlnReg])] = []
+                collected.reserveCapacity(batchCount)
+
+                while nextIdx < min(maxConcurrency, batchCount) {
+                    let idx = nextIdx
+                    let read = batchReads[idx]
+                    let smems = gpuSMEMs[idx]
+                    let gi = capturedBatchStart + idx
+                    let readId = idShift ? (UInt64(gi) &<< 1) | idBase : UInt64(gi)
+                    group.addTask { [self] in
+                        let chains = self.alignReadPhase1_5to3(read, gpuSMEMs: smems)
+                        guard !chains.isEmpty else { return (idx, []) }
+
+                        var regions: [MemAlnReg] = []
+                        for chain in chains {
+                            let chainRegions = ExtensionAligner.extend(
+                                chain: chain,
+                                read: read,
+                                getReference: { [index] pos, length in
+                                    index.getReference(at: pos, length: length)
+                                },
+                                scoring: scoring
+                            )
+                            regions.append(contentsOf: chainRegions)
+                        }
+
+                        return (idx, self.alignReadPhase4to5(read, readId: readId, regions: regions))
+                    }
+                    nextIdx += 1
+                }
+
+                for await result in group {
+                    collected.append(result)
+                    if nextIdx < batchCount {
+                        let idx = nextIdx
+                        let read = batchReads[idx]
+                        let smems = gpuSMEMs[idx]
+                        let gi = capturedBatchStart + idx
+                        let readId = idShift ? (UInt64(gi) &<< 1) | idBase : UInt64(gi)
+                        group.addTask { [self] in
+                            let chains = self.alignReadPhase1_5to3(read, gpuSMEMs: smems)
+                            guard !chains.isEmpty else { return (idx, []) }
+
+                            var regions: [MemAlnReg] = []
+                            for chain in chains {
+                                let chainRegions = ExtensionAligner.extend(
+                                    chain: chain,
+                                    read: read,
+                                    getReference: { [index] pos, length in
+                                        index.getReference(at: pos, length: length)
+                                    },
+                                    scoring: scoring
+                                )
+                                regions.append(contentsOf: chainRegions)
+                            }
+
+                            return (idx, self.alignReadPhase4to5(read, readId: readId, regions: regions))
+                        }
+                        nextIdx += 1
+                    }
+                }
+
+                return collected
+            }
+
+            for (idx, regions) in batchResults {
+                allResults[capturedBatchStart + idx] = regions
+            }
+
+            batchStart = batchEnd
+        }
+
+        return allResults
+    }
+    #endif
+
     /// Align all reads in parallel and return regions indexed by read position.
-    /// - Parameters:
-    ///   - reads: Array of reads to align
-    ///   - idBase: Base value for read ID (0 for SE/read1, 1 for read2)
-    ///   - idShift: If true, use PE scheme (idx<<1|idBase); if false, use SE scheme (idx)
+    /// Uses CPU per-read parallel alignment. GPU extension is not used here because
+    /// the batching overhead (sequential plan collection, synchronization barriers)
+    /// exceeds the per-seed GPU computation savings — extension takes <2s fully
+    /// parallelized on CPU vs ~12s with GPU batching.
     nonisolated private func alignAllReads(
         _ reads: [ReadSequence],
         idBase: UInt64 = 0,
@@ -1198,6 +1647,287 @@ public actor BWAMemAligner {
         }
         return ordered
     }
+
+    #if canImport(Metal)
+    /// GPU-accelerated extension: process reads in batches of 4096.
+    /// Phase 1-3 run parallel per-read, then extension is batched to GPU,
+    /// then phase 4.5-5 run per-read.
+    nonisolated private func alignAllReadsGPU(
+        _ reads: [ReadSequence],
+        idBase: UInt64, idShift: Bool,
+        engine: MetalSWEngine
+    ) async -> [[MemAlnReg]] {
+        let scoring = options.scoring
+        let maxConcurrency = scoring.numThreads
+        let gpuBatchSize = 4096
+        let readCount = reads.count
+        var allResults = Array(repeating: [MemAlnReg](), count: readCount)
+
+        // Process in batches of gpuBatchSize reads
+        var batchStart = 0
+        while batchStart < readCount {
+            let batchEnd = min(batchStart + gpuBatchSize, readCount)
+            let batchReads = Array(reads[batchStart..<batchEnd])
+            let batchCount = batchEnd - batchStart
+
+            // Phase 1-3: parallel SMEM → chain → filter
+            let chainResults = await withTaskGroup(
+                of: (Int, [MemChain]).self,
+                returning: [(Int, [MemChain])].self
+            ) { group in
+                var nextIdx = 0
+                var collected: [(Int, [MemChain])] = []
+                collected.reserveCapacity(batchCount)
+
+                while nextIdx < min(maxConcurrency, batchCount) {
+                    let idx = nextIdx
+                    let read = batchReads[idx]
+                    group.addTask { [self] in
+                        (idx, self.alignReadPhase1to3(read))
+                    }
+                    nextIdx += 1
+                }
+                for await result in group {
+                    collected.append(result)
+                    if nextIdx < batchCount {
+                        let idx = nextIdx
+                        let read = batchReads[idx]
+                        group.addTask { [self] in
+                            (idx, self.alignReadPhase1to3(read))
+                        }
+                        nextIdx += 1
+                    }
+                }
+                return collected
+            }
+
+            // Place by idx
+            var batchChains = Array(repeating: [MemChain](), count: batchCount)
+            for (idx, chains) in chainResults {
+                batchChains[idx] = chains
+            }
+
+            // Collect extension plans across all reads in this batch
+            var allPlans: [SeedExtensionPlan] = []
+            var planRanges = [(start: Int, count: Int)](repeating: (0, 0), count: batchCount)
+
+            for i in 0..<batchCount {
+                let chains = batchChains[i]
+                guard !chains.isEmpty else { continue }
+                let plans = ExtensionAligner.collectExtensionPlans(
+                    chains: chains,
+                    read: batchReads[i],
+                    getReference: { [index] pos, length in
+                        index.getReference(at: pos, length: length)
+                    },
+                    scoring: scoring
+                )
+                if !plans.isEmpty {
+                    planRanges[i] = (start: allPlans.count, count: plans.count)
+                    allPlans.append(contentsOf: plans)
+                }
+            }
+
+            let totalPlans = allPlans.count
+            if totalPlans == 0 {
+                for i in 0..<batchCount {
+                    let gi = batchStart + i
+                    let readId = idShift ? (UInt64(gi) &<< 1) | idBase : UInt64(gi)
+                    allResults[gi] = alignReadPhase4to5(
+                        batchReads[i], readId: readId, regions: []
+                    )
+                }
+                batchStart = batchEnd
+                continue
+            }
+
+            // --- GPU dispatch: LEFT extensions ---
+            var leftTasks: [BandedSWTask] = []
+            leftTasks.reserveCapacity(totalPlans)
+            for plan in allPlans {
+                if !plan.leftQuery.isEmpty && !plan.leftTarget.isEmpty {
+                    leftTasks.append(BandedSWTask(
+                        query: plan.leftQuery, target: plan.leftTarget,
+                        h0: plan.seed.score, w: scoring.bandWidth, scoring: scoring
+                    ))
+                } else {
+                    leftTasks.append(BandedSWTask(
+                        query: [], target: [], h0: 0, w: scoring.bandWidth, scoring: scoring
+                    ))
+                }
+            }
+
+            var leftResults: [SWResult] = dispatchBandedSWBatch(
+                tasks: leftTasks, engine: engine, scoring: scoring
+            )
+            for i in 0..<totalPlans {
+                if allPlans[i].leftQuery.isEmpty || allPlans[i].leftTarget.isEmpty {
+                    leftResults[i] = SWResult()
+                }
+            }
+
+            // Compute right h0 for each plan from left results
+            var rightH0s: [Int32] = []
+            rightH0s.reserveCapacity(totalPlans)
+            for i in 0..<totalPlans {
+                let plan = allPlans[i]
+                if !plan.leftQuery.isEmpty && !plan.leftTarget.isEmpty {
+                    rightH0s.append(leftResults[i].score)
+                } else {
+                    rightH0s.append(plan.seed.score)
+                }
+            }
+
+            // --- GPU dispatch: RIGHT extensions ---
+            var rightTasks: [BandedSWTask] = []
+            rightTasks.reserveCapacity(totalPlans)
+            for i in 0..<totalPlans {
+                let plan = allPlans[i]
+                if !plan.rightQuery.isEmpty && !plan.rightTarget.isEmpty {
+                    rightTasks.append(BandedSWTask(
+                        query: plan.rightQuery, target: plan.rightTarget,
+                        h0: rightH0s[i], w: scoring.bandWidth, scoring: scoring
+                    ))
+                } else {
+                    rightTasks.append(BandedSWTask(
+                        query: [], target: [], h0: 0, w: scoring.bandWidth, scoring: scoring
+                    ))
+                }
+            }
+
+            var rightResults: [SWResult] = dispatchBandedSWBatch(
+                tasks: rightTasks, engine: engine, scoring: scoring
+            )
+            for i in 0..<totalPlans {
+                if allPlans[i].rightQuery.isEmpty || allPlans[i].rightTarget.isEmpty {
+                    rightResults[i] = SWResult()
+                }
+            }
+
+            // Per-read: assembleRegions → phase4to5
+            for i in 0..<batchCount {
+                let gi = batchStart + i
+                let readId = idShift ? (UInt64(gi) &<< 1) | idBase : UInt64(gi)
+                let range = planRanges[i]
+
+                if range.count == 0 {
+                    allResults[gi] = alignReadPhase4to5(
+                        batchReads[i], readId: readId, regions: []
+                    )
+                    continue
+                }
+
+                let readPlans = Array(allPlans[range.start..<(range.start + range.count)])
+                let readLeftResults = Array(leftResults[range.start..<(range.start + range.count)])
+                let readRightResults = Array(rightResults[range.start..<(range.start + range.count)])
+
+                let regions = ExtensionAligner.assembleRegions(
+                    plans: readPlans,
+                    leftResults: readLeftResults,
+                    rightResults: readRightResults,
+                    scoring: scoring
+                )
+
+                allResults[gi] = alignReadPhase4to5(
+                    batchReads[i], readId: readId, regions: regions
+                )
+            }
+
+            batchStart = batchEnd
+        }
+
+        return allResults
+    }
+
+    /// Dispatch a batch of banded SW tasks to GPU with 8→16 overflow handling.
+    /// Returns one SWResult per task. Handles empty-task passthrough.
+    nonisolated private func dispatchBandedSWBatch(
+        tasks: [BandedSWTask],
+        engine: MetalSWEngine,
+        scoring: ScoringParameters
+    ) -> [SWResult] {
+        guard !tasks.isEmpty else { return [] }
+
+        // Filter out empty tasks for GPU dispatch (they'd produce garbage)
+        var realIndices: [Int] = []
+        var realTasks: [BandedSWTask] = []
+        for (i, task) in tasks.enumerated() {
+            if !task.query.isEmpty && !task.target.isEmpty {
+                realIndices.append(i)
+                realTasks.append(task)
+            }
+        }
+
+        // Initialize all results to zero
+        var results = [SWResult](repeating: SWResult(), count: tasks.count)
+
+        guard !realTasks.isEmpty else { return results }
+
+        // Skip GPU for very small batches
+        if realTasks.count < MetalSWEngine.minBatchSize {
+            let mat = scoring.scoringMatrix()
+            for (idx, task) in zip(realIndices, realTasks) {
+                results[idx] = task.query.withUnsafeBufferPointer { qBuf in
+                    task.target.withUnsafeBufferPointer { tBuf in
+                        if let r = BandedSW8.align(
+                            query: qBuf, target: tBuf, scoring: scoring,
+                            w: task.w, h0: task.h0, scoringMatrix: mat
+                        ) {
+                            return r
+                        }
+                        return BandedSW16.align(
+                            query: qBuf, target: tBuf, scoring: scoring,
+                            w: task.w, h0: task.h0, scoringMatrix: mat
+                        )
+                    }
+                }
+            }
+            return results
+        }
+
+        // 8-bit GPU dispatch
+        let gpu8Results = BandedSWDispatcher.dispatchBatch8(tasks: realTasks, engine: engine)
+
+        // Collect overflows for 16-bit fallback
+        var overflowIndices: [Int] = []  // indices into realTasks
+        for (i, r) in gpu8Results.enumerated() {
+            if let r = r {
+                results[realIndices[i]] = r
+            } else {
+                overflowIndices.append(i)
+            }
+        }
+
+        // Handle overflows
+        if !overflowIndices.isEmpty {
+            let overflowTasks = overflowIndices.map { realTasks[$0] }
+            let gpu16Results = BandedSWDispatcher.dispatchBatch16(
+                tasks: overflowTasks, engine: engine
+            )
+            if gpu16Results.count == overflowTasks.count {
+                for (j, oi) in overflowIndices.enumerated() {
+                    results[realIndices[oi]] = gpu16Results[j]
+                }
+            } else {
+                // CPU fallback for 16-bit failures
+                let mat = scoring.scoringMatrix()
+                for oi in overflowIndices {
+                    let task = realTasks[oi]
+                    results[realIndices[oi]] = task.query.withUnsafeBufferPointer { qBuf in
+                        task.target.withUnsafeBufferPointer { tBuf in
+                            BandedSW16.align(
+                                query: qBuf, target: tBuf, scoring: scoring,
+                                w: task.w, h0: task.h0, scoringMatrix: mat
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        return results
+    }
+    #endif
 
     /// Write a pair where one read is mapped and the other is unmapped.
     private func writeMappedUnmappedPair(

@@ -22,7 +22,16 @@ public final class MetalSWEngine: @unchecked Sendable {
     var bandedSW16Pipeline: MTLComputePipelineState?
     var localSWPipeline: MTLComputePipelineState?
     var localSWWavefrontPipeline: MTLComputePipelineState?
+    public private(set) var smemForwardPipeline: MTLComputePipelineState?
     public let bufferPool: MetalBufferPool
+
+    // Cached BWT buffers for GPU seeding (created once via setupBWT, reused)
+    public private(set) var bwtCheckpointBuffer: MTLBuffer?
+    public private(set) var bwtCountsBuffer: MTLBuffer?
+    public private(set) var bwtSentinelBuffer: MTLBuffer?
+
+    /// Pre-computed 12-mer hash table for GPU seeding (384MB, built once).
+    public private(set) var kmerHashBuffer: MTLBuffer?
 
     /// Minimum batch size to justify GPU dispatch overhead.
     public static let minBatchSize = 32
@@ -47,7 +56,7 @@ public final class MetalSWEngine: @unchecked Sendable {
             // Compile from .metal source files bundled via SPM .process("Kernels")
             // SPM flattens the resource directory, so files are at bundle root
             var sources: [String] = []
-            for name in ["banded_sw8", "banded_sw16", "local_sw", "local_sw_wavefront"] {
+            for name in ["banded_sw8", "banded_sw16", "local_sw", "local_sw_wavefront", "smem_forward"] {
                 if let url = Bundle.module.url(forResource: name, withExtension: "metal") {
                     sources.append(try String(contentsOf: url, encoding: .utf8))
                 }
@@ -74,6 +83,77 @@ public final class MetalSWEngine: @unchecked Sendable {
         if let wfFn = library.makeFunction(name: "local_sw_wavefront") {
             self.localSWWavefrontPipeline = try device.makeComputePipelineState(function: wfFn)
         }
+        if let smemFn = library.makeFunction(name: "smem_forward") {
+            self.smemForwardPipeline = try device.makeComputePipelineState(function: smemFn)
+        }
+    }
+
+    /// Set up BWT checkpoint buffer for GPU seeding. Called once at pipeline start.
+    /// Creates Metal buffers wrapping/copying the BWT checkpoint array, counts, and sentinel.
+    ///
+    /// - Parameters:
+    ///   - checkpointPointer: Raw pointer to the CheckpointOCC array
+    ///   - checkpointByteCount: Total size in bytes of the checkpoint array
+    ///   - counts: The 5 cumulative base counts (A, C, G, T, total+1)
+    ///   - sentinelIndex: Position of the '$' sentinel in the BWT
+    public func setupBWT(
+        checkpointPointer: UnsafeRawPointer,
+        checkpointByteCount: Int,
+        counts: (Int64, Int64, Int64, Int64, Int64),
+        sentinelIndex: Int64
+    ) {
+        guard bwtCheckpointBuffer == nil else { return }  // already set up
+
+        // Try zero-copy buffer if pointer is page-aligned
+        let pageSize = Int(getpagesize())
+        let pointerValue = Int(bitPattern: checkpointPointer)
+        if pointerValue % pageSize == 0 {
+            // Page-aligned: try bytesNoCopy for zero-copy GPU access
+            let mutablePtr = UnsafeMutableRawPointer(mutating: checkpointPointer)
+            bwtCheckpointBuffer = device.makeBuffer(
+                bytesNoCopy: mutablePtr,
+                length: checkpointByteCount,
+                options: .storageModeShared,
+                deallocator: nil  // BWT owns the memory
+            )
+        }
+
+        // Fallback: copy the checkpoint data
+        if bwtCheckpointBuffer == nil {
+            bwtCheckpointBuffer = device.makeBuffer(
+                bytes: checkpointPointer,
+                length: checkpointByteCount,
+                options: .storageModeShared
+            )
+        }
+
+        // Counts buffer: 5 × Int64 = 40 bytes
+        var countsArray: [Int64] = [counts.0, counts.1, counts.2, counts.3, counts.4]
+        bwtCountsBuffer = device.makeBuffer(
+            bytes: &countsArray,
+            length: 5 * MemoryLayout<Int64>.size,
+            options: .storageModeShared
+        )
+
+        // Sentinel buffer: 1 × Int64 = 8 bytes
+        var sentinel = sentinelIndex
+        bwtSentinelBuffer = device.makeBuffer(
+            bytes: &sentinel,
+            length: MemoryLayout<Int64>.size,
+            options: .storageModeShared
+        )
+    }
+
+    /// Set up the 12-mer hash table for GPU seeding.
+    /// Takes a raw pointer to 4^12 = 16,777,216 entries of (k, l, s) × Int64 = 24 bytes each.
+    /// Total: 384MB, built once by the caller and cached here.
+    public func setupKmerHash(pointer: UnsafeRawPointer, byteCount: Int) {
+        guard kmerHashBuffer == nil else { return }
+        kmerHashBuffer = device.makeBuffer(
+            bytes: pointer,
+            length: byteCount,
+            options: .storageModeShared
+        )
     }
 }
 
