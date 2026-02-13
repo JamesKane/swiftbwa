@@ -9,14 +9,18 @@ public final class PackedReference: @unchecked Sendable {
     /// Total number of bases (not bytes)
     public let length: Int64
 
-    // Owned allocation for cleanup
+    // Owned allocation for cleanup (nil when mmap'd)
     private let ownedBase: UnsafeMutableRawPointer?
+    // Keeps mmap alive via ARC (nil when heap-allocated)
+    private let mappedFile: MappedFile?
 
     public init(data: UnsafeBufferPointer<UInt8>, length: Int64,
-                ownedBase: UnsafeMutableRawPointer? = nil) {
+                ownedBase: UnsafeMutableRawPointer? = nil,
+                mappedFile: MappedFile? = nil) {
         self.data = data
         self.length = length
         self.ownedBase = ownedBase
+        self.mappedFile = mappedFile
     }
 
     deinit {

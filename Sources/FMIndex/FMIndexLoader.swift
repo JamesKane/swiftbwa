@@ -6,182 +6,109 @@ public struct FMIndexLoader: Sendable {
     /// Load a complete FM-Index from the given prefix path.
     /// Expects files: {prefix}.bwt.2bit.64, {prefix}.ann, {prefix}.amb, {prefix}.pac
     public static func load(from prefix: String, skipAlt: Bool = false) throws -> FMIndex {
-        let bwtResult = try loadBWT(from: prefix)
-        let sa = try loadSA(from: prefix, referenceSeqLen: bwtResult.length)
+        let (bwt, bwtMappedFile, refSeqLen) = try loadBWT(from: prefix)
+        let sa = try loadSA(from: prefix, referenceSeqLen: refSeqLen, mappedFile: bwtMappedFile)
         let pac = try loadPac(from: prefix)
         var metadata = try loadMetadata(from: prefix)
         if !skipAlt {
             loadAlt(from: prefix, metadata: &metadata)
         }
 
-        return FMIndex(bwt: bwtResult, suffixArray: sa, packedRef: pac, metadata: metadata)
+        return FMIndex(bwt: bwt, suffixArray: sa, packedRef: pac, metadata: metadata)
     }
 
     // MARK: - BWT Loading (.bwt.2bit.64)
 
-    /// Load BWT from .bwt.2bit.64 file (matches FMI_search.cpp:384-494)
-    public static func loadBWT(from prefix: String) throws -> BWT {
+    /// Load BWT from .bwt.2bit.64 file via mmap (matches FMI_search.cpp:384-494)
+    /// Returns the BWT, the shared MappedFile (reused by SA), and referenceSeqLen.
+    static func loadBWT(from prefix: String) throws -> (bwt: BWT, mappedFile: MappedFile, referenceSeqLen: Int64) {
         let path = prefix + ".bwt.2bit.64"
+        let mf = try MappedFile(path: path)
+        let base = mf.pointer
 
-        guard let fh = FileHandle(forReadingAtPath: path) else {
-            throw BWAError.indexNotFound(path)
-        }
-        defer { fh.closeFile() }
-
-        // Read reference_seq_len (int64)
-        guard let lenData = try fh.read(upToCount: 8), lenData.count == 8 else {
-            throw BWAError.indexCorrupted("Cannot read reference_seq_len")
-        }
-        let referenceSeqLen = lenData.withUnsafeBytes { $0.load(as: Int64.self) }
+        // offset 0: referenceSeqLen (8 bytes)
+        let referenceSeqLen = base.load(as: Int64.self)
         guard referenceSeqLen > 0 else {
             throw BWAError.indexCorrupted("Invalid reference_seq_len: \(referenceSeqLen)")
         }
 
-        // Read count[5] (5 x int64)
-        guard let countData = try fh.read(upToCount: 40), countData.count == 40 else {
-            throw BWAError.indexCorrupted("Cannot read count array")
-        }
-        var rawCount = (Int64(0), Int64(0), Int64(0), Int64(0), Int64(0))
-        countData.withUnsafeBytes { buf in
-            let ptr = buf.bindMemory(to: Int64.self)
-            rawCount = (ptr[0], ptr[1], ptr[2], ptr[3], ptr[4])
-        }
-        // Add 1 to each count (matching bwa-mem2 load_index lines 432-436)
-        let count = (rawCount.0 + 1, rawCount.1 + 1, rawCount.2 + 1, rawCount.3 + 1, rawCount.4 + 1)
+        // offset 8: count[5] (40 bytes) — add 1 to each (matching bwa-mem2 load_index lines 432-436)
+        let countPtr = (base + 8).assumingMemoryBound(to: Int64.self)
+        let count = (countPtr[0] + 1, countPtr[1] + 1, countPtr[2] + 1, countPtr[3] + 1, countPtr[4] + 1)
 
-        // Read checkpoint OCC array
+        // offset 48: checkpoint OCC array
         let cpOccCount = Int(referenceSeqLen >> CP_SHIFT) + 1
-        let cpOccByteSize = cpOccCount * MemoryLayout<CheckpointOCC>.size
-        guard let cpData = try fh.read(upToCount: cpOccByteSize), cpData.count == cpOccByteSize else {
-            throw BWAError.indexCorrupted("Cannot read checkpoint OCC array")
-        }
+        let cpStart = base + 48
+        let cpBuffer = cpStart.assumingMemoryBound(to: CheckpointOCC.self)
+        let checkpoints = UnsafeBufferPointer(start: cpBuffer, count: cpOccCount)
 
-        // Copy checkpoint data into allocated buffer
-        let cpBuffer = UnsafeMutablePointer<CheckpointOCC>.allocate(capacity: cpOccCount)
-        cpData.withUnsafeBytes { raw in
-            let src = raw.bindMemory(to: CheckpointOCC.self)
-            cpBuffer.initialize(from: src.baseAddress!, count: cpOccCount)
-        }
+        // sentinel_index: last 8 bytes of file (may not be 8-byte aligned)
+        let sentinelIndex = (base + mf.size - 8).loadUnaligned(as: Int64.self)
 
-        // Read sentinel index (at the end of BWT section, after SA data)
-        // Actually: the .bwt.2bit.64 layout is:
-        //   reference_seq_len (8 bytes)
-        //   count[5] (40 bytes)
-        //   cp_occ[] (cpOccByteSize bytes)
-        //   sa_ms_byte[] (saCount bytes)
-        //   sa_ls_word[] (saCount * 4 bytes)
-        //   sentinel_index (8 bytes)
-        // We skip SA data to read sentinel index
-        let saCompX = 3
-        let saCount = Int(referenceSeqLen >> saCompX) + 1
-        let saSkipBytes = saCount + saCount * 4
-        guard let _ = try fh.read(upToCount: saSkipBytes) else {
-            throw BWAError.indexCorrupted("Cannot skip SA data to read sentinel_index")
-        }
-
-        guard let sentData = try fh.read(upToCount: 8), sentData.count == 8 else {
-            throw BWAError.indexCorrupted("Cannot read sentinel_index")
-        }
-        let sentinelIndex = sentData.withUnsafeBytes { $0.load(as: Int64.self) }
-
-        return BWT(
-            checkpoints: UnsafeBufferPointer(start: cpBuffer, count: cpOccCount),
+        let bwt = BWT(
+            checkpoints: checkpoints,
             count: count,
             length: referenceSeqLen,
             sentinelIndex: sentinelIndex,
-            ownedBase: UnsafeMutableRawPointer(cpBuffer)
+            mappedFile: mf
         )
+        return (bwt, mf, referenceSeqLen)
     }
 
     // MARK: - SA Loading (.bwt.2bit.64)
 
-    /// Load suffix array from .bwt.2bit.64 file
-    public static func loadSA(from prefix: String, referenceSeqLen: Int64) throws -> SuffixArray {
-        let path = prefix + ".bwt.2bit.64"
-        guard let fh = FileHandle(forReadingAtPath: path) else {
-            throw BWAError.indexNotFound(path)
-        }
-        defer { fh.closeFile() }
+    /// Load suffix array from the same .bwt.2bit.64 mmap'd file.
+    /// Reuses the MappedFile from loadBWT — both BWT and SA hold strong references.
+    static func loadSA(from prefix: String, referenceSeqLen: Int64, mappedFile mf: MappedFile) throws -> SuffixArray {
+        let base = mf.pointer
 
-        // Skip: reference_seq_len (8) + count[5] (40) + checkpoints
         let cpOccCount = Int(referenceSeqLen >> CP_SHIFT) + 1
         let cpOccByteSize = cpOccCount * MemoryLayout<CheckpointOCC>.size
-        let skipBytes = UInt64(8 + 40 + cpOccByteSize)
-        fh.seek(toFileOffset: skipBytes)
+        let saOffset = 48 + cpOccByteSize
 
         let saCompX = 3
         let saCount = Int(referenceSeqLen >> saCompX) + 1
 
-        let msBytesSize = saCount
-        guard let msData = try fh.read(upToCount: msBytesSize), msData.count == msBytesSize else {
-            throw BWAError.indexCorrupted("Cannot read SA ms_byte")
-        }
-
-        let lsWordsSize = saCount * 4
-        guard let lsData = try fh.read(upToCount: lsWordsSize), lsData.count == lsWordsSize else {
-            throw BWAError.indexCorrupted("Cannot read SA ls_word")
-        }
-
-        let msBuffer = UnsafeMutablePointer<Int8>.allocate(capacity: saCount)
-        msData.withUnsafeBytes { raw in
-            raw.baseAddress!.withMemoryRebound(to: Int8.self, capacity: saCount) { src in
-                msBuffer.initialize(from: src, count: saCount)
-            }
-        }
-
-        let lsBuffer = UnsafeMutablePointer<UInt32>.allocate(capacity: saCount)
-        lsData.withUnsafeBytes { raw in
-            raw.baseAddress!.withMemoryRebound(to: UInt32.self, capacity: saCount) { src in
-                lsBuffer.initialize(from: src, count: saCount)
-            }
-        }
+        let msStart = (base + saOffset).assumingMemoryBound(to: Int8.self)
+        // ls_words may not be 4-byte aligned (follows variable-length ms_bytes)
+        let lsRaw = base + saOffset + saCount
 
         return SuffixArray(
-            msBytes: UnsafeBufferPointer(start: msBuffer, count: saCount),
-            lsWords: UnsafeBufferPointer(start: lsBuffer, count: saCount),
+            msBytes: UnsafeBufferPointer(start: msStart, count: saCount),
+            lsRawBase: lsRaw,
             count: saCount,
             compressionShift: saCompX,
-            ownedMSBase: UnsafeMutableRawPointer(msBuffer),
-            ownedLSBase: UnsafeMutableRawPointer(lsBuffer)
+            mappedFile: mf
         )
     }
 
     // MARK: - .pac Loading
 
+    /// Load packed reference from .pac file via mmap.
     public static func loadPac(from prefix: String) throws -> PackedReference {
         let path = prefix + ".pac"
-        let url = URL(fileURLWithPath: path)
-        let data: Data
-        do {
-            data = try Data(contentsOf: url)
-        } catch {
-            throw BWAError.indexNotFound(path)
-        }
-        guard data.count >= 1 else {
+        let mf = try MappedFile(path: path)
+        let base = mf.pointer
+
+        guard mf.size >= 1 else {
             throw BWAError.indexCorrupted("Empty .pac file")
         }
 
         // Last byte stores remainder count
-        let lastByte = data[data.count - 1]
+        let lastByte = (base + mf.size - 1).load(as: UInt8.self)
+        let byteCount = mf.size - 1
         let pacLen: Int64
         if lastByte == 0 {
-            pacLen = Int64(data.count - 1) * 4
+            pacLen = Int64(byteCount) * 4
         } else {
-            pacLen = (Int64(data.count - 1) - 1) * 4 + Int64(lastByte)
+            pacLen = (Int64(byteCount) - 1) * 4 + Int64(lastByte)
         }
 
-        let byteCount = data.count - 1
-        let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: byteCount)
-        data.withUnsafeBytes { raw in
-            raw.baseAddress!.withMemoryRebound(to: UInt8.self, capacity: byteCount) { src in
-                buffer.initialize(from: src, count: byteCount)
-            }
-        }
-
+        let dataPtr = base.assumingMemoryBound(to: UInt8.self)
         return PackedReference(
-            data: UnsafeBufferPointer(start: buffer, count: byteCount),
+            data: UnsafeBufferPointer(start: dataPtr, count: byteCount),
             length: pacLen,
-            ownedBase: UnsafeMutableRawPointer(buffer)
+            mappedFile: mf
         )
     }
 

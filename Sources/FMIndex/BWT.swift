@@ -17,19 +17,23 @@ public final class BWT: @unchecked Sendable {
     /// one_hot_mask_array[0] = 0, [1] = 0x8000000000000000, [i] = [i-1] >> 1 | 0x8000000000000000
     public let oneHotMaskArray: [UInt64]
 
-    // Owned allocation for cleanup
+    // Owned allocation for cleanup (nil when mmap'd)
     private let ownedBase: UnsafeMutableRawPointer?
+    // Keeps mmap alive via ARC (nil when heap-allocated)
+    private let mappedFile: MappedFile?
 
     public init(checkpoints: UnsafeBufferPointer<CheckpointOCC>,
                 count: (Int64, Int64, Int64, Int64, Int64),
                 length: Int64,
                 sentinelIndex: Int64,
-                ownedBase: UnsafeMutableRawPointer? = nil) {
+                ownedBase: UnsafeMutableRawPointer? = nil,
+                mappedFile: MappedFile? = nil) {
         self.checkpoints = checkpoints
         self.count = count
         self.length = length
         self.sentinelIndex = sentinelIndex
         self.ownedBase = ownedBase
+        self.mappedFile = mappedFile
 
         // Build one-hot mask array (matches FMI_search.cpp:386-394)
         var masks = [UInt64](repeating: 0, count: 64)

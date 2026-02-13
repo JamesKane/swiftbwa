@@ -30,7 +30,7 @@ struct FMIndexIntegrationTests {
     func testLoadBWT() throws {
         try #require(Self.indexAvailable, "Lambda index not available")
 
-        let bwt = try FMIndexLoader.loadBWT(from: Self.indexPrefix)
+        let (bwt, _, _) = try FMIndexLoader.loadBWT(from: Self.indexPrefix)
 
         // ref_seq_len = 97005 (2 * 48502 + 1 sentinel)
         #expect(bwt.length == 97005)
@@ -55,7 +55,8 @@ struct FMIndexIntegrationTests {
     func testLoadSA() throws {
         try #require(Self.indexAvailable, "Lambda index not available")
 
-        let sa = try FMIndexLoader.loadSA(from: Self.indexPrefix, referenceSeqLen: 97005)
+        let (_, bwtMF, _) = try FMIndexLoader.loadBWT(from: Self.indexPrefix)
+        let sa = try FMIndexLoader.loadSA(from: Self.indexPrefix, referenceSeqLen: 97005, mappedFile: bwtMF)
 
         // SA count: 97005 >> 3 + 1 = 12126
         #expect(sa.count == 12126)
@@ -130,7 +131,7 @@ struct FMIndexIntegrationTests {
     func testInitIntervalReal() throws {
         try #require(Self.indexAvailable, "Lambda index not available")
 
-        let bwt = try FMIndexLoader.loadBWT(from: Self.indexPrefix)
+        let (bwt, _, _) = try FMIndexLoader.loadBWT(from: Self.indexPrefix)
 
         // Each base should have a non-zero interval
         var totalBases: Int64 = 0
@@ -151,7 +152,7 @@ struct FMIndexIntegrationTests {
     func testBackwardExtReal() throws {
         try #require(Self.indexAvailable, "Lambda index not available")
 
-        let bwt = try FMIndexLoader.loadBWT(from: Self.indexPrefix)
+        let (bwt, _, _) = try FMIndexLoader.loadBWT(from: Self.indexPrefix)
 
         // Start with 'A' interval, extend by 'C' to get "CA" interval
         let intA = BackwardSearch.initInterval(bwt: bwt, base: 0)  // A

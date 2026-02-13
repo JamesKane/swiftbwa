@@ -5,27 +5,47 @@ import BWACore
 /// Supports both compressed (every 8th entry) and uncompressed modes.
 public final class SuffixArray: @unchecked Sendable {
     public let msBytes: UnsafeBufferPointer<Int8>
-    public let lsWords: UnsafeBufferPointer<UInt32>
+    /// Raw pointer to ls_word array (UInt32 elements, possibly unaligned when mmap'd)
+    @usableFromInline let lsBase: UnsafeRawPointer
     public let count: Int
     /// SA compression factor (0 = uncompressed, 3 = every 8th position)
     public let compressionShift: Int
 
-    // Owned allocations for cleanup
+    // Owned allocations for cleanup (nil when mmap'd)
     private let ownedMSBase: UnsafeMutableRawPointer?
     private let ownedLSBase: UnsafeMutableRawPointer?
+    // Keeps mmap alive via ARC (nil when heap-allocated)
+    private let mappedFile: MappedFile?
 
     public init(msBytes: UnsafeBufferPointer<Int8>,
                 lsWords: UnsafeBufferPointer<UInt32>,
                 count: Int,
                 compressionShift: Int = 0,
                 ownedMSBase: UnsafeMutableRawPointer? = nil,
-                ownedLSBase: UnsafeMutableRawPointer? = nil) {
+                ownedLSBase: UnsafeMutableRawPointer? = nil,
+                mappedFile: MappedFile? = nil) {
         self.msBytes = msBytes
-        self.lsWords = lsWords
+        self.lsBase = UnsafeRawPointer(lsWords.baseAddress!)
         self.count = count
         self.compressionShift = compressionShift
         self.ownedMSBase = ownedMSBase
         self.ownedLSBase = ownedLSBase
+        self.mappedFile = mappedFile
+    }
+
+    /// Init for mmap path where ls_words may not be 4-byte aligned.
+    init(msBytes: UnsafeBufferPointer<Int8>,
+         lsRawBase: UnsafeRawPointer,
+         count: Int,
+         compressionShift: Int,
+         mappedFile: MappedFile) {
+        self.msBytes = msBytes
+        self.lsBase = lsRawBase
+        self.count = count
+        self.compressionShift = compressionShift
+        self.ownedMSBase = nil
+        self.ownedLSBase = nil
+        self.mappedFile = mappedFile
     }
 
     deinit {
@@ -43,7 +63,7 @@ public final class SuffixArray: @unchecked Sendable {
     public func entry(at pos: Int64) -> Int64 {
         let idx = Int(pos)
         let ms = Int64(msBytes[idx]) & 0xFF
-        let ls = Int64(lsWords[idx])
+        let ls = Int64(lsBase.loadUnaligned(fromByteOffset: idx &* 4, as: UInt32.self))
         return (ms << 32) | ls
     }
 
