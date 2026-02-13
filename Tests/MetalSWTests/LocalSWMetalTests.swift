@@ -8,7 +8,7 @@ import Testing
 struct LocalSWMetalTests {
 
     @Test("Perfect match — GPU matches CPU")
-    func testPerfectMatch() throws {
+    func testPerfectMatch() async throws {
         guard let engine = MetalSWEngine.shared else { return }
         guard engine.localSWPipeline != nil else { return }
 
@@ -19,7 +19,7 @@ struct LocalSWMetalTests {
         let cpuResult = LocalSWAligner.align(query: query, target: target, scoring: scoring)
 
         let task = LocalSWTask(query: query, target: target, scoring: scoring)
-        let gpuResults = LocalSWDispatcher.dispatchBatch(tasks: [task], engine: engine)
+        let gpuResults = await LocalSWDispatcher.dispatchBatch(tasks: [task], engine: engine)
 
         #expect(gpuResults.count == 1)
         if let cpuR = cpuResult, let gpuR = gpuResults[0] {
@@ -32,7 +32,7 @@ struct LocalSWMetalTests {
     }
 
     @Test("Subsequence match — GPU matches CPU")
-    func testSubsequenceMatch() throws {
+    func testSubsequenceMatch() async throws {
         guard let engine = MetalSWEngine.shared else { return }
         guard engine.localSWPipeline != nil else { return }
 
@@ -44,7 +44,7 @@ struct LocalSWMetalTests {
         let cpuResult = LocalSWAligner.align(query: query, target: target, scoring: scoring)
 
         let task = LocalSWTask(query: query, target: target, scoring: scoring)
-        let gpuResults = LocalSWDispatcher.dispatchBatch(tasks: [task], engine: engine)
+        let gpuResults = await LocalSWDispatcher.dispatchBatch(tasks: [task], engine: engine)
 
         #expect(gpuResults.count == 1)
         if let cpuR = cpuResult, let gpuR = gpuResults[0] {
@@ -57,7 +57,7 @@ struct LocalSWMetalTests {
     }
 
     @Test("Batch of multiple tasks — all match CPU")
-    func testBatch() throws {
+    func testBatch() async throws {
         guard let engine = MetalSWEngine.shared else { return }
         guard engine.localSWPipeline != nil else { return }
 
@@ -77,7 +77,7 @@ struct LocalSWMetalTests {
             cpuResults.append(LocalSWAligner.align(query: tc.query, target: tc.target, scoring: scoring))
         }
 
-        let gpuResults = LocalSWDispatcher.dispatchBatch(tasks: tasks, engine: engine)
+        let gpuResults = await LocalSWDispatcher.dispatchBatch(tasks: tasks, engine: engine)
 
         for i in 0..<testCases.count {
             if let cpuR = cpuResults[i], let gpuR = gpuResults[i] {
@@ -98,7 +98,7 @@ struct LocalSWMetalTests {
     }
 
     @Test("150bp mate rescue scenario — GPU matches CPU")
-    func test150bpMateRescue() throws {
+    func test150bpMateRescue() async throws {
         guard let engine = MetalSWEngine.shared else { return }
         guard engine.localSWPipeline != nil else { return }
 
@@ -119,7 +119,7 @@ struct LocalSWMetalTests {
         let cpuResult = LocalSWAligner.align(query: query, target: target, scoring: scoring)
 
         let task = LocalSWTask(query: query, target: target, scoring: scoring)
-        let gpuResults = LocalSWDispatcher.dispatchBatch(tasks: [task], engine: engine)
+        let gpuResults = await LocalSWDispatcher.dispatchBatch(tasks: [task], engine: engine)
 
         if let cpuR = cpuResult, let gpuR = gpuResults[0] {
             #expect(gpuR.score == cpuR.score)

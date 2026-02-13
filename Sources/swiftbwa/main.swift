@@ -269,6 +269,9 @@ struct Mem: AsyncParsableCommand {
             headerLines: options.headerLines
         )
         let outFile = try HTSFile(path: outputPath, mode: outputMode)
+        if outputMode == "wb" {
+            _ = outFile.setThreads(Int32(threads))
+        }
         try header.write(to: outFile)
 
         let chunkBases = batchSize ?? defaultChunkBases

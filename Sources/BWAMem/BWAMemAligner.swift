@@ -42,6 +42,28 @@ struct AlnSegment: Sendable {
     let rid: Int32
 }
 
+/// Pre-computed output specification for one SAM record.
+/// Built during parallel output preparation, consumed during sequential emit.
+struct RecordSpec: Sendable {
+    let readIsRead1: Bool
+    let regionIndex: Int       // -1 for unmapped
+    let cigarInfo: CIGARInfo?  // nil for unmapped
+    let mapq: UInt8
+    let isPrimary: Bool
+    let isSupplementary: Bool
+    let isSecondary: Bool
+    let pairedEnd: PairedEndInfo?
+    let saTag: String?
+    let xaTag: String?
+}
+
+/// Complete pre-computed output plan for one read pair.
+struct PairOutputPlan: Sendable {
+    let regions1: [MemAlnReg]
+    let regions2: [MemAlnReg]
+    let records: [RecordSpec]
+}
+
 /// Main BWA-MEM alignment pipeline.
 /// Orchestrates SMEM finding, chaining, extension, and SAM output.
 public actor BWAMemAligner {
@@ -358,6 +380,181 @@ public actor BWAMemAligner {
         )
     }
 
+    /// Classify alignments for one read into RecordSpecs for later emission.
+    /// Extracted from emitSingleEndAlignments for parallel output preparation.
+    nonisolated func classifyAlignments(
+        read: ReadSequence,
+        regions: [MemAlnReg],
+        readIsRead1: Bool,
+        pairedEnd: PairedEndInfo?,
+        cigarCache: [CIGARInfo],
+        scoringMat: [Int8]
+    ) -> [RecordSpec] {
+        let scoring = options.scoring
+        let outputAll = (scoring.flag & ScoringParameters.flagAll) != 0
+
+        guard !regions.isEmpty else {
+            return [RecordSpec(
+                readIsRead1: readIsRead1, regionIndex: -1, cigarInfo: nil,
+                mapq: 0, isPrimary: false, isSupplementary: false,
+                isSecondary: false, pairedEnd: pairedEnd, saTag: nil, xaTag: nil
+            )]
+        }
+
+        // Pass 1: Classify regions into segments
+        var segments: [AlnSegment] = []
+        var secondaryInfos: [(rname: String, pos: Int64, isReverse: Bool,
+                              cigarString: String, nm: Int32)] = []
+        var nonSecondaryCount = 0
+
+        for (regIdx, region) in regions.enumerated() {
+            guard region.score >= scoring.minOutputScore else { continue }
+
+            let cigarInfo: CIGARInfo
+            if regIdx < cigarCache.count {
+                cigarInfo = cigarCache[regIdx]
+            } else {
+                cigarInfo = generateCIGAR(read: read, region: region, scoringMatrix: scoringMat)
+            }
+            let (rid, localPos) = index.metadata.decodePosition(cigarInfo.pos)
+            let rname = rid >= 0 && rid < index.metadata.annotations.count
+                ? index.metadata.annotations[Int(rid)].name : "*"
+
+            let mapq = MappingQuality.compute(
+                region: region,
+                allRegions: regions,
+                scoring: scoring,
+                readLength: Int32(read.length)
+            )
+
+            if region.secondary >= 0 {
+                let parentIdx = Int(region.secondary)
+                if parentIdx < regions.count && region.score < regions[parentIdx].score / 2 {
+                    continue
+                }
+                if outputAll {
+                    segments.append(AlnSegment(
+                        regionIndex: regIdx, cigarInfo: cigarInfo, mapq: mapq,
+                        isPrimary: false, isSupplementary: false, isSecondary: true,
+                        rname: rname, localPos: localPos, rid: rid
+                    ))
+                } else {
+                    secondaryInfos.append((
+                        rname: rname, pos: localPos, isReverse: cigarInfo.isReverse,
+                        cigarString: cigarInfo.cigarString, nm: cigarInfo.nm
+                    ))
+                }
+            } else {
+                let noMulti = (scoring.flag & ScoringParameters.flagNoMulti) != 0
+                let isPrimary = nonSecondaryCount == 0
+                let isSupplementary = nonSecondaryCount > 0 && !noMulti
+                let isSecondary = nonSecondaryCount > 0 && noMulti
+
+                segments.append(AlnSegment(
+                    regionIndex: regIdx, cigarInfo: cigarInfo, mapq: mapq,
+                    isPrimary: isPrimary, isSupplementary: isSupplementary,
+                    isSecondary: isSecondary, rname: rname, localPos: localPos, rid: rid
+                ))
+                nonSecondaryCount += 1
+            }
+        }
+
+        guard !segments.isEmpty else {
+            return [RecordSpec(
+                readIsRead1: readIsRead1, regionIndex: -1, cigarInfo: nil,
+                mapq: 0, isPrimary: false, isSupplementary: false,
+                isSecondary: false, pairedEnd: pairedEnd, saTag: nil, xaTag: nil
+            )]
+        }
+
+        // -5: Reorder so smallest-coordinate segment becomes primary
+        if (scoring.flag & ScoringParameters.flagPrimary5) != 0 && segments.count > 1 {
+            var minIdx = 0
+            for i in 1..<segments.count {
+                if segments[i].localPos < segments[minIdx].localPos {
+                    minIdx = i
+                }
+            }
+            if minIdx != 0 {
+                segments.swapAt(0, minIdx)
+                for i in 0..<segments.count {
+                    segments[i] = AlnSegment(
+                        regionIndex: segments[i].regionIndex,
+                        cigarInfo: segments[i].cigarInfo,
+                        mapq: segments[i].mapq,
+                        isPrimary: i == 0,
+                        isSupplementary: i > 0,
+                        isSecondary: segments[i].isSecondary,
+                        rname: segments[i].rname,
+                        localPos: segments[i].localPos,
+                        rid: segments[i].rid
+                    )
+                }
+            }
+        }
+
+        // Cap supplementary MAPQ at primary's MAPQ
+        if (scoring.flag & ScoringParameters.flagKeepSuppMapq) == 0 {
+            let primaryMapq = segments[0].mapq
+            for i in 1..<segments.count {
+                if !regions[segments[i].regionIndex].isAlt {
+                    segments[i].mapq = min(segments[i].mapq, primaryMapq)
+                }
+            }
+        }
+
+        // Build SA tag info from all non-secondary segments
+        let saSegmentInfos: [(rname: String, pos: Int64, isReverse: Bool,
+                              cigarString: String, mapq: UInt8, nm: Int32)] =
+            segments.map { seg in
+                (rname: seg.rname, pos: seg.localPos, isReverse: seg.cigarInfo.isReverse,
+                 cigarString: seg.cigarInfo.cigarString, mapq: seg.mapq,
+                 nm: seg.cigarInfo.nm)
+            }
+
+        // Build XA tag from qualifying secondaries
+        let xaTag: String?
+        if outputAll {
+            xaTag = nil
+        } else {
+            let hasAltSecondary = secondaryInfos.contains { sec in
+                regions.contains { r in
+                    r.secondary >= 0 && r.isAlt
+                        && index.metadata.annotations.indices.contains(Int(r.rid))
+                        && index.metadata.annotations[Int(r.rid)].name == sec.rname
+                }
+            }
+            let effectiveMaxXA = hasAltSecondary
+                ? Int(scoring.maxXAHitsAlt)
+                : Int(scoring.maxXAHits)
+            xaTag = SAMOutputBuilder.buildXATag(
+                secondaries: secondaryInfos, maxHits: effectiveMaxXA
+            )
+        }
+
+        // Build RecordSpecs
+        var specs: [RecordSpec] = []
+        specs.reserveCapacity(segments.count)
+        for (segIdx, seg) in segments.enumerated() {
+            let saTag = segments.count > 1
+                ? SAMOutputBuilder.buildSATag(segments: saSegmentInfos, excludeIndex: segIdx)
+                : nil
+            specs.append(RecordSpec(
+                readIsRead1: readIsRead1,
+                regionIndex: seg.regionIndex,
+                cigarInfo: seg.cigarInfo,
+                mapq: seg.mapq,
+                isPrimary: seg.isPrimary,
+                isSupplementary: seg.isSupplementary,
+                isSecondary: seg.isSecondary,
+                pairedEnd: pairedEnd,
+                saTag: saTag,
+                xaTag: seg.isPrimary ? xaTag : nil
+            ))
+        }
+        return specs
+    }
+
     /// Align a batch of reads and write SAM/BAM output.
     ///
     /// Reads are aligned in parallel using a task group, then output is written
@@ -406,28 +603,72 @@ public actor BWAMemAligner {
             cigarsByIdx[idx] = cigars
         }
 
-        // Write output sequentially (ordered by input) — CIGARs already computed
+        // Parallel output classification
         let rgID = options.readGroupID
         let comment = options.appendComment
+        let refHeader = options.outputRefHeader
+        let scoringMat = options.scoring.scoringMatrix()
+
+        var allSpecs = [[RecordSpec]?](repeating: nil, count: reads.count)
+        await withTaskGroup(of: (Int, [RecordSpec]).self) { group in
+            var nextIdx = 0
+            while nextIdx < min(maxConcurrency, reads.count) {
+                let idx = nextIdx
+                let read = reads[idx]
+                let regions = regionsByIdx[idx]
+                let cigars = cigarsByIdx[idx]
+                group.addTask { [self] in
+                    return (idx, self.classifyAlignments(
+                        read: read, regions: regions, readIsRead1: true,
+                        pairedEnd: nil, cigarCache: cigars, scoringMat: scoringMat
+                    ))
+                }
+                nextIdx += 1
+            }
+            for await (idx, specs) in group {
+                allSpecs[idx] = specs
+                if nextIdx < reads.count {
+                    let idx = nextIdx
+                    let read = reads[idx]
+                    let regions = regionsByIdx[idx]
+                    let cigars = cigarsByIdx[idx]
+                    group.addTask { [self] in
+                        return (idx, self.classifyAlignments(
+                            read: read, regions: regions, readIsRead1: true,
+                            pairedEnd: nil, cigarCache: cigars, scoringMat: scoringMat
+                        ))
+                    }
+                    nextIdx += 1
+                }
+            }
+        }
+
+        // Sequential record building + writing
         for idx in 0..<reads.count {
             let read = reads[idx]
             let regions = regionsByIdx[idx]
-            let cigars = cigarsByIdx[idx]
-
-            if regions.isEmpty {
-                let record = try SAMOutputBuilder.buildUnmappedRecord(
-                    read: read, readGroupID: rgID,
-                    appendComment: comment
-                )
-                try outputFile.write(record: record, header: header)
-            } else {
-                try emitSingleEndAlignments(
-                    read: read,
-                    regions: regions,
-                    outputFile: outputFile,
-                    header: header,
-                    cigarCache: cigars
-                )
+            for spec in allSpecs[idx]! {
+                if spec.regionIndex < 0 {
+                    let record = try SAMOutputBuilder.buildUnmappedRecord(
+                        read: read, readGroupID: rgID, appendComment: comment
+                    )
+                    try outputFile.write(record: record, header: header)
+                } else {
+                    let cigar = spec.cigarInfo!
+                    let record = try SAMOutputBuilder.buildRecord(
+                        read: read, region: regions[spec.regionIndex],
+                        allRegions: regions, metadata: index.metadata,
+                        scoring: options.scoring, cigar: cigar.cigar,
+                        nm: cigar.nm, md: cigar.md,
+                        isPrimary: spec.isPrimary,
+                        isSupplementary: spec.isSupplementary,
+                        mapqOverride: spec.mapq, adjustedPos: cigar.pos,
+                        pairedEnd: nil, saTag: spec.saTag,
+                        xaTag: spec.xaTag, readGroupID: rgID,
+                        outputRefHeader: refHeader, appendComment: comment
+                    )
+                    try outputFile.write(record: record, header: header)
+                }
             }
         }
     }
@@ -734,371 +975,80 @@ public actor BWAMemAligner {
         let skipPairing = (options.scoring.flag & ScoringParameters.flagNoPairing) != 0
         let rgID = options.readGroupID
         let comment = options.appendComment
-        let scoringMat = options.scoring.scoringMatrix()
-        for i in 0..<pairCount {
-            let read1 = reads1[i]
-            let read2 = reads2[i]
-            let regions1 = mutableRegions1[i]
-            let regions2 = mutableRegions2[i]
-            let (cigars1, cigars2) = allCigars[i]
-
-            let r1Empty = regions1.isEmpty
-            let r2Empty = regions2.isEmpty
-
-            if r1Empty && r2Empty {
-                // Both unmapped
-                let pe1 = PairedEndInfo(
-                    isRead1: true, isProperPair: false,
-                    mateTid: -1, matePos: -1,
-                    mateIsReverse: false, mateIsUnmapped: true,
-                    tlen: 0
-                )
-                let pe2 = PairedEndInfo(
-                    isRead1: false, isProperPair: false,
-                    mateTid: -1, matePos: -1,
-                    mateIsReverse: false, mateIsUnmapped: true,
-                    tlen: 0
-                )
-                let rec1 = try SAMOutputBuilder.buildUnmappedRecord(
-                    read: read1, pairedEnd: pe1, readGroupID: rgID,
-                    appendComment: comment
-                )
-                try outputFile.write(record: rec1, header: header)
-                let rec2 = try SAMOutputBuilder.buildUnmappedRecord(
-                    read: read2, pairedEnd: pe2, readGroupID: rgID,
-                    appendComment: comment
-                )
-                try outputFile.write(record: rec2, header: header)
-                continue
-            }
-
-            // Try to resolve best pair (skip if -P)
-            let decision = skipPairing ? nil : PairedEndResolver.resolve(
-                regions1: regions1,
-                regions2: regions2,
-                dist: dist,
-                genomeLength: genomeLen,
-                scoring: options.scoring
-            )
-
-            if let decision = decision {
-                // Both mapped and paired
-                // Promote paired regions to primary position (matches bwa-mem2's
-                // mem_sam_pe swap logic that puts the paired region at index 0)
-                var pairedRegions1 = regions1
-                var pairedRegions2 = regions2
-                var pairedCigars1 = cigars1
-                var pairedCigars2 = cigars2
-                promotePairedRegion(regions: &pairedRegions1, pairedIdx: decision.idx1)
-                promotePairedRegion(regions: &pairedRegions2, pairedIdx: decision.idx2)
-                if decision.idx1 > 0 && decision.idx1 < pairedCigars1.count {
-                    pairedCigars1.swapAt(0, decision.idx1)
-                }
-                if decision.idx2 > 0 && decision.idx2 < pairedCigars2.count {
-                    pairedCigars2.swapAt(0, decision.idx2)
-                }
-
-                // Regenerate on demand if a promoted secondary had its CIGAR skipped
-                if pairedCigars1[0].cigarString == "*" {
-                    pairedCigars1[0] = generateCIGAR(read: read1, region: pairedRegions1[0], scoringMatrix: scoringMat)
-                }
-                if pairedCigars2[0].cigarString == "*" {
-                    pairedCigars2[0] = generateCIGAR(read: read2, region: pairedRegions2[0], scoringMatrix: scoringMat)
-                }
-
-                let cigar1 = pairedCigars1[0]
-                let cigar2 = pairedCigars2[0]
-
-                let (rid1, localPos1) = index.metadata.decodePosition(cigar1.pos)
-                let (rid2, localPos2) = index.metadata.decodePosition(cigar2.pos)
-
-                let (tlen1, tlen2) = PairedEndResolver.computeTLEN(
-                    pos1: localPos1, isReverse1: cigar1.isReverse, refLen1: cigar1.refConsumed,
-                    pos2: localPos2, isReverse2: cigar2.isReverse, refLen2: cigar2.refConsumed
-                )
-
-                let pe1 = PairedEndInfo(
-                    isRead1: true, isProperPair: decision.isProperPair,
-                    mateTid: rid2, matePos: localPos2,
-                    mateIsReverse: cigar2.isReverse, mateIsUnmapped: false,
-                    tlen: tlen1, mateCigarString: cigar2.cigarString
-                )
-                let pe2 = PairedEndInfo(
-                    isRead1: false, isProperPair: decision.isProperPair,
-                    mateTid: rid1, matePos: localPos1,
-                    mateIsReverse: cigar1.isReverse, mateIsUnmapped: false,
-                    tlen: tlen2, mateCigarString: cigar1.cigarString
-                )
-
-                // Emit primary read1 using emitSingleEndAlignments for full supplementary handling
-                try emitSingleEndAlignments(
-                    read: read1, regions: pairedRegions1,
-                    outputFile: outputFile, header: header,
-                    pairedEnd: pe1, cigarCache: pairedCigars1
-                )
-
-                // Emit primary read2 using emitSingleEndAlignments for full supplementary handling
-                try emitSingleEndAlignments(
-                    read: read2, regions: pairedRegions2,
-                    outputFile: outputFile, header: header,
-                    pairedEnd: pe2, cigarCache: pairedCigars2
-                )
-            } else if !r1Empty && r2Empty {
-                // Read 1 mapped, read 2 unmapped
-                writeMappedUnmappedPair(
-                    mappedRead: read1, mappedRegions: regions1,
-                    unmappedRead: read2,
-                    mappedIsRead1: true,
-                    outputFile: outputFile, header: header,
-                    cigarCache: cigars1
-                )
-            } else if r1Empty && !r2Empty {
-                // Read 1 unmapped, read 2 mapped
-                writeMappedUnmappedPair(
-                    mappedRead: read2, mappedRegions: regions2,
-                    unmappedRead: read1,
-                    mappedIsRead1: false,
-                    outputFile: outputFile, header: header,
-                    cigarCache: cigars2
-                )
-            } else {
-                // Both have regions but no valid pairing (e.g., different chromosomes)
-                // Use best region for mate info, then emit with full supplementary handling
-                let cigar1 = cigars1[0]
-                let cigar2 = cigars2[0]
-
-                let (rid1, localPos1) = index.metadata.decodePosition(cigar1.pos)
-                let (rid2, localPos2) = index.metadata.decodePosition(cigar2.pos)
-
-                let pe1 = PairedEndInfo(
-                    isRead1: true, isProperPair: false,
-                    mateTid: rid2, matePos: localPos2,
-                    mateIsReverse: cigar2.isReverse, mateIsUnmapped: false,
-                    tlen: 0, mateCigarString: cigar2.cigarString
-                )
-                let pe2 = PairedEndInfo(
-                    isRead1: false, isProperPair: false,
-                    mateTid: rid1, matePos: localPos1,
-                    mateIsReverse: cigar1.isReverse, mateIsUnmapped: false,
-                    tlen: 0, mateCigarString: cigar1.cigarString
-                )
-
-                try emitSingleEndAlignments(
-                    read: read1, regions: regions1,
-                    outputFile: outputFile, header: header,
-                    pairedEnd: pe1, cigarCache: cigars1
-                )
-                try emitSingleEndAlignments(
-                    read: read2, regions: regions2,
-                    outputFile: outputFile, header: header,
-                    pairedEnd: pe2, cigarCache: cigars2
-                )
-            }
-        }
-    }
-
-    // MARK: - Supplementary/Chimeric Output
-
-    /// Classify and emit alignments for a single read with proper primary/supplementary/secondary handling.
-    /// Matches bwa-mem2's mem_reg2sam() two-pass approach.
-    func emitSingleEndAlignments(
-        read: ReadSequence,
-        regions: [MemAlnReg],
-        outputFile: borrowing HTSFile,
-        header: SAMHeader,
-        pairedEnd: PairedEndInfo? = nil,
-        cigarCache: [CIGARInfo]? = nil
-    ) throws {
-        let scoring = options.scoring
-        let rgID = options.readGroupID
         let refHeader = options.outputRefHeader
-        let comment = options.appendComment
-        let outputAll = (scoring.flag & ScoringParameters.flagAll) != 0
-        let scoringMat = scoring.scoringMatrix()
+        let scoringMat = options.scoring.scoringMatrix()
 
-        // Pass 1: Classify regions into segments
-        var segments: [AlnSegment] = []
-        var secondaryInfos: [(rname: String, pos: Int64, isReverse: Bool,
-                              cigarString: String, nm: Int32)] = []
-        var nonSecondaryCount = 0
+        // Snapshot mutable arrays so closures capture Sendable values
+        let capturedRegions1 = mutableRegions1
+        let capturedRegions2 = mutableRegions2
+        let capturedCigars = allCigars
 
-        for (regIdx, region) in regions.enumerated() {
-            guard region.score >= scoring.minOutputScore else { continue }
-
-            let cigarInfo: CIGARInfo
-            if let cache = cigarCache, regIdx < cache.count {
-                cigarInfo = cache[regIdx]
-            } else {
-                cigarInfo = generateCIGAR(read: read, region: region, scoringMatrix: scoringMat)
-            }
-            let (rid, localPos) = index.metadata.decodePosition(cigarInfo.pos)
-            let rname = rid >= 0 && rid < index.metadata.annotations.count
-                ? index.metadata.annotations[Int(rid)].name : "*"
-
-            let mapq = MappingQuality.compute(
-                region: region,
-                allRegions: regions,
-                scoring: scoring,
-                readLength: Int32(read.length)
-            )
-
-            if region.secondary >= 0 {
-                // True secondary: overlaps a better region
-                // Check drop ratio: skip if score < parent score * 0.5
-                let parentIdx = Int(region.secondary)
-                if parentIdx < regions.count && region.score < regions[parentIdx].score / 2 {
-                    continue
-                }
-                if outputAll {
-                    // -a: emit as full SAM record with 0x100 flag
-                    segments.append(AlnSegment(
-                        regionIndex: regIdx,
-                        cigarInfo: cigarInfo,
-                        mapq: mapq,
-                        isPrimary: false,
-                        isSupplementary: false,
-                        isSecondary: true,
-                        rname: rname,
-                        localPos: localPos,
-                        rid: rid
-                    ))
-                } else {
-                    secondaryInfos.append((
-                        rname: rname,
-                        pos: localPos,
-                        isReverse: cigarInfo.isReverse,
-                        cigarString: cigarInfo.cigarString,
-                        nm: cigarInfo.nm
-                    ))
-                }
-            } else {
-                // Independent region (primary or supplementary)
-                let noMulti = (scoring.flag & ScoringParameters.flagNoMulti) != 0
-                let isPrimary = nonSecondaryCount == 0
-                let isSupplementary = nonSecondaryCount > 0 && !noMulti
-                let isSecondary = nonSecondaryCount > 0 && noMulti
-
-                segments.append(AlnSegment(
-                    regionIndex: regIdx,
-                    cigarInfo: cigarInfo,
-                    mapq: mapq,
-                    isPrimary: isPrimary,
-                    isSupplementary: isSupplementary,
-                    isSecondary: isSecondary,
-                    rname: rname,
-                    localPos: localPos,
-                    rid: rid
-                ))
-                nonSecondaryCount += 1
-            }
-        }
-
-        guard !segments.isEmpty else {
-            let record = try SAMOutputBuilder.buildUnmappedRecord(
-                read: read, pairedEnd: pairedEnd, readGroupID: rgID,
-                appendComment: comment
-            )
-            try outputFile.write(record: record, header: header)
-            return
-        }
-
-        // -5: Reorder so smallest-coordinate segment becomes primary
-        if (scoring.flag & ScoringParameters.flagPrimary5) != 0 && segments.count > 1 {
-            var minIdx = 0
-            for i in 1..<segments.count {
-                if segments[i].localPos < segments[minIdx].localPos {
-                    minIdx = i
-                }
-            }
-            if minIdx != 0 {
-                segments.swapAt(0, minIdx)
-                for i in 0..<segments.count {
-                    segments[i] = AlnSegment(
-                        regionIndex: segments[i].regionIndex,
-                        cigarInfo: segments[i].cigarInfo,
-                        mapq: segments[i].mapq,
-                        isPrimary: i == 0,
-                        isSupplementary: i > 0,
-                        isSecondary: segments[i].isSecondary,
-                        rname: segments[i].rname,
-                        localPos: segments[i].localPos,
-                        rid: segments[i].rid
+        // Phase 1: Parallel output preparation
+        var plans = [PairOutputPlan?](repeating: nil, count: pairCount)
+        await withTaskGroup(of: (Int, PairOutputPlan).self) { group in
+            var nextIdx = 0
+            while nextIdx < min(maxConcurrencyOut, pairCount) {
+                let i = nextIdx
+                group.addTask { [self] in
+                    let plan = self.preparePairOutput(
+                        read1: reads1[i], read2: reads2[i],
+                        regions1: capturedRegions1[i], regions2: capturedRegions2[i],
+                        cigars1: capturedCigars[i].0, cigars2: capturedCigars[i].1,
+                        dist: dist, genomeLen: genomeLen,
+                        skipPairing: skipPairing, scoringMat: scoringMat
                     )
+                    return (i, plan)
+                }
+                nextIdx += 1
+            }
+            for await (i, plan) in group {
+                plans[i] = plan
+                if nextIdx < pairCount {
+                    let i = nextIdx
+                    group.addTask { [self] in
+                        let plan = self.preparePairOutput(
+                            read1: reads1[i], read2: reads2[i],
+                            regions1: capturedRegions1[i], regions2: capturedRegions2[i],
+                            cigars1: capturedCigars[i].0, cigars2: capturedCigars[i].1,
+                            dist: dist, genomeLen: genomeLen,
+                            skipPairing: skipPairing, scoringMat: scoringMat
+                        )
+                        return (i, plan)
+                    }
+                    nextIdx += 1
                 }
             }
         }
 
-        // Cap supplementary MAPQ at primary's MAPQ, except for ALT hits
-        // Skip if -q or -5 (flagKeepSuppMapq)
-        if (scoring.flag & ScoringParameters.flagKeepSuppMapq) == 0 {
-            let primaryMapq = segments[0].mapq
-            for i in 1..<segments.count {
-                if !regions[segments[i].regionIndex].isAlt {
-                    segments[i].mapq = min(segments[i].mapq, primaryMapq)
+        // Phase 2: Sequential record building + writing
+        for i in 0..<pairCount {
+            let plan = plans[i]!
+            for spec in plan.records {
+                let read = spec.readIsRead1 ? reads1[i] : reads2[i]
+                if spec.regionIndex < 0 {
+                    let record = try SAMOutputBuilder.buildUnmappedRecord(
+                        read: read, pairedEnd: spec.pairedEnd,
+                        readGroupID: rgID, appendComment: comment
+                    )
+                    try outputFile.write(record: record, header: header)
+                } else {
+                    let regions = spec.readIsRead1 ? plan.regions1 : plan.regions2
+                    let cigar = spec.cigarInfo!
+                    let record = try SAMOutputBuilder.buildRecord(
+                        read: read, region: regions[spec.regionIndex],
+                        allRegions: regions, metadata: index.metadata,
+                        scoring: options.scoring, cigar: cigar.cigar,
+                        nm: cigar.nm, md: cigar.md,
+                        isPrimary: spec.isPrimary,
+                        isSupplementary: spec.isSupplementary,
+                        mapqOverride: spec.mapq, adjustedPos: cigar.pos,
+                        pairedEnd: spec.pairedEnd, saTag: spec.saTag,
+                        xaTag: spec.xaTag, readGroupID: rgID,
+                        outputRefHeader: refHeader, appendComment: comment
+                    )
+                    try outputFile.write(record: record, header: header)
                 }
             }
-        }
-
-        // Build SA tag info from all non-secondary segments
-        let saSegmentInfos: [(rname: String, pos: Int64, isReverse: Bool,
-                              cigarString: String, mapq: UInt8, nm: Int32)] =
-            segments.map { seg in
-                (rname: seg.rname, pos: seg.localPos, isReverse: seg.cigarInfo.isReverse,
-                 cigarString: seg.cigarInfo.cigarString, mapq: seg.mapq,
-                 nm: seg.cigarInfo.nm)
-            }
-
-        // Build XA tag from qualifying secondaries (on primary record only)
-        // When -a is set, secondaries are emitted as full records, so skip XA
-        let xaTag: String?
-        if outputAll {
-            xaTag = nil
-        } else {
-            let hasAltSecondary = secondaryInfos.contains { sec in
-                regions.contains { r in
-                    r.secondary >= 0 && r.isAlt
-                        && index.metadata.annotations.indices.contains(Int(r.rid))
-                        && index.metadata.annotations[Int(r.rid)].name == sec.rname
-                }
-            }
-            let effectiveMaxXA = hasAltSecondary
-                ? Int(scoring.maxXAHitsAlt)
-                : Int(scoring.maxXAHits)
-            xaTag = SAMOutputBuilder.buildXATag(
-                secondaries: secondaryInfos, maxHits: effectiveMaxXA
-            )
-        }
-
-        // Pass 2: Emit records
-        for (segIdx, seg) in segments.enumerated() {
-            let region = regions[seg.regionIndex]
-
-            // SA tag: present on all non-secondary segments, excluding self
-            let saTag = segments.count > 1
-                ? SAMOutputBuilder.buildSATag(segments: saSegmentInfos, excludeIndex: segIdx)
-                : nil
-
-            let record = try SAMOutputBuilder.buildRecord(
-                read: read,
-                region: region,
-                allRegions: regions,
-                metadata: index.metadata,
-                scoring: scoring,
-                cigar: seg.cigarInfo.cigar,
-                nm: seg.cigarInfo.nm,
-                md: seg.cigarInfo.md,
-                isPrimary: seg.isPrimary,
-                isSupplementary: seg.isSupplementary,
-                mapqOverride: seg.mapq,
-                adjustedPos: seg.cigarInfo.pos,
-                pairedEnd: pairedEnd,
-                saTag: saTag,
-                xaTag: seg.isPrimary ? xaTag : nil,
-                readGroupID: rgID,
-                outputRefHeader: refHeader,
-                appendComment: comment
-            )
-            try outputFile.write(record: record, header: header)
         }
     }
 
@@ -1107,7 +1057,7 @@ public actor BWAMemAligner {
     /// Promote the paired region to index 0 for primary output.
     /// Matches bwa-mem2's mem_sam_pe() swap logic that ensures the paired region
     /// is emitted as primary. Fixes secondary references accordingly.
-    private func promotePairedRegion(regions: inout [MemAlnReg], pairedIdx: Int) {
+    nonisolated private func promotePairedRegion(regions: inout [MemAlnReg], pairedIdx: Int) {
         guard pairedIdx > 0 && pairedIdx < regions.count else { return }
 
         // Swap the paired region to position 0
@@ -1124,6 +1074,209 @@ public actor BWAMemAligner {
 
         // Ensure the promoted region is marked as primary
         regions[0].secondary = -1
+    }
+
+    /// Prepare complete output plan for one read pair (parallel-safe).
+    /// Handles all PE cases: both-unmapped, pairing resolved, mapped/unmapped, unpaired.
+    nonisolated func preparePairOutput(
+        read1: ReadSequence, read2: ReadSequence,
+        regions1: [MemAlnReg], regions2: [MemAlnReg],
+        cigars1: [CIGARInfo], cigars2: [CIGARInfo],
+        dist: InsertSizeDistribution,
+        genomeLen: Int64,
+        skipPairing: Bool,
+        scoringMat: [Int8]
+    ) -> PairOutputPlan {
+        let r1Empty = regions1.isEmpty
+        let r2Empty = regions2.isEmpty
+
+        if r1Empty && r2Empty {
+            let pe1 = PairedEndInfo(
+                isRead1: true, isProperPair: false,
+                mateTid: -1, matePos: -1,
+                mateIsReverse: false, mateIsUnmapped: true, tlen: 0
+            )
+            let pe2 = PairedEndInfo(
+                isRead1: false, isProperPair: false,
+                mateTid: -1, matePos: -1,
+                mateIsReverse: false, mateIsUnmapped: true, tlen: 0
+            )
+            return PairOutputPlan(
+                regions1: regions1, regions2: regions2,
+                records: [
+                    RecordSpec(readIsRead1: true, regionIndex: -1, cigarInfo: nil,
+                               mapq: 0, isPrimary: false, isSupplementary: false,
+                               isSecondary: false, pairedEnd: pe1, saTag: nil, xaTag: nil),
+                    RecordSpec(readIsRead1: false, regionIndex: -1, cigarInfo: nil,
+                               mapq: 0, isPrimary: false, isSupplementary: false,
+                               isSecondary: false, pairedEnd: pe2, saTag: nil, xaTag: nil),
+                ]
+            )
+        }
+
+        let decision = skipPairing ? nil : PairedEndResolver.resolve(
+            regions1: regions1, regions2: regions2,
+            dist: dist, genomeLength: genomeLen, scoring: options.scoring
+        )
+
+        if let decision = decision {
+            // Both mapped and paired — promote paired regions to primary
+            var pairedRegions1 = regions1
+            var pairedRegions2 = regions2
+            var pairedCigars1 = cigars1
+            var pairedCigars2 = cigars2
+            promotePairedRegion(regions: &pairedRegions1, pairedIdx: decision.idx1)
+            promotePairedRegion(regions: &pairedRegions2, pairedIdx: decision.idx2)
+            if decision.idx1 > 0 && decision.idx1 < pairedCigars1.count {
+                pairedCigars1.swapAt(0, decision.idx1)
+            }
+            if decision.idx2 > 0 && decision.idx2 < pairedCigars2.count {
+                pairedCigars2.swapAt(0, decision.idx2)
+            }
+
+            // Regenerate CIGAR if a promoted secondary had its CIGAR skipped
+            if pairedCigars1[0].cigarString == "*" {
+                pairedCigars1[0] = generateCIGAR(read: read1, region: pairedRegions1[0], scoringMatrix: scoringMat)
+            }
+            if pairedCigars2[0].cigarString == "*" {
+                pairedCigars2[0] = generateCIGAR(read: read2, region: pairedRegions2[0], scoringMatrix: scoringMat)
+            }
+
+            let cigar1 = pairedCigars1[0]
+            let cigar2 = pairedCigars2[0]
+            let (rid1, localPos1) = index.metadata.decodePosition(cigar1.pos)
+            let (rid2, localPos2) = index.metadata.decodePosition(cigar2.pos)
+            let (tlen1, tlen2) = PairedEndResolver.computeTLEN(
+                pos1: localPos1, isReverse1: cigar1.isReverse, refLen1: cigar1.refConsumed,
+                pos2: localPos2, isReverse2: cigar2.isReverse, refLen2: cigar2.refConsumed
+            )
+
+            let pe1 = PairedEndInfo(
+                isRead1: true, isProperPair: decision.isProperPair,
+                mateTid: rid2, matePos: localPos2,
+                mateIsReverse: cigar2.isReverse, mateIsUnmapped: false,
+                tlen: tlen1, mateCigarString: cigar2.cigarString
+            )
+            let pe2 = PairedEndInfo(
+                isRead1: false, isProperPair: decision.isProperPair,
+                mateTid: rid1, matePos: localPos1,
+                mateIsReverse: cigar1.isReverse, mateIsUnmapped: false,
+                tlen: tlen2, mateCigarString: cigar1.cigarString
+            )
+
+            var records: [RecordSpec] = []
+            records.append(contentsOf: classifyAlignments(
+                read: read1, regions: pairedRegions1, readIsRead1: true,
+                pairedEnd: pe1, cigarCache: pairedCigars1, scoringMat: scoringMat
+            ))
+            records.append(contentsOf: classifyAlignments(
+                read: read2, regions: pairedRegions2, readIsRead1: false,
+                pairedEnd: pe2, cigarCache: pairedCigars2, scoringMat: scoringMat
+            ))
+            return PairOutputPlan(
+                regions1: pairedRegions1, regions2: pairedRegions2, records: records
+            )
+
+        } else if !r1Empty && r2Empty {
+            return prepareMappedUnmappedPlan(
+                mappedRead: read1, mappedRegions: regions1, unmappedRead: read2,
+                mappedIsRead1: true, cigarCache: cigars1, scoringMat: scoringMat
+            )
+
+        } else if r1Empty && !r2Empty {
+            return prepareMappedUnmappedPlan(
+                mappedRead: read2, mappedRegions: regions2, unmappedRead: read1,
+                mappedIsRead1: false, cigarCache: cigars2, scoringMat: scoringMat
+            )
+
+        } else {
+            // Both mapped but no valid pairing
+            let cigar1 = cigars1[0]
+            let cigar2 = cigars2[0]
+            let (rid1, localPos1) = index.metadata.decodePosition(cigar1.pos)
+            let (rid2, localPos2) = index.metadata.decodePosition(cigar2.pos)
+
+            let pe1 = PairedEndInfo(
+                isRead1: true, isProperPair: false,
+                mateTid: rid2, matePos: localPos2,
+                mateIsReverse: cigar2.isReverse, mateIsUnmapped: false,
+                tlen: 0, mateCigarString: cigar2.cigarString
+            )
+            let pe2 = PairedEndInfo(
+                isRead1: false, isProperPair: false,
+                mateTid: rid1, matePos: localPos1,
+                mateIsReverse: cigar1.isReverse, mateIsUnmapped: false,
+                tlen: 0, mateCigarString: cigar1.cigarString
+            )
+
+            var records: [RecordSpec] = []
+            records.append(contentsOf: classifyAlignments(
+                read: read1, regions: regions1, readIsRead1: true,
+                pairedEnd: pe1, cigarCache: cigars1, scoringMat: scoringMat
+            ))
+            records.append(contentsOf: classifyAlignments(
+                read: read2, regions: regions2, readIsRead1: false,
+                pairedEnd: pe2, cigarCache: cigars2, scoringMat: scoringMat
+            ))
+            return PairOutputPlan(
+                regions1: regions1, regions2: regions2, records: records
+            )
+        }
+    }
+
+    /// Prepare output plan for a mapped/unmapped pair (primary only, no supplementaries).
+    nonisolated private func prepareMappedUnmappedPlan(
+        mappedRead: ReadSequence,
+        mappedRegions: [MemAlnReg],
+        unmappedRead: ReadSequence,
+        mappedIsRead1: Bool,
+        cigarCache: [CIGARInfo],
+        scoringMat: [Int8]
+    ) -> PairOutputPlan {
+        let region = mappedRegions[0]
+        let cigar = cigarCache.first ?? generateCIGAR(read: mappedRead, region: region, scoringMatrix: scoringMat)
+        let (rid, localPos) = index.metadata.decodePosition(cigar.pos)
+
+        let mappedPE = PairedEndInfo(
+            isRead1: mappedIsRead1, isProperPair: false,
+            mateTid: rid, matePos: localPos,
+            mateIsReverse: false, mateIsUnmapped: true, tlen: 0
+        )
+        let unmappedPE = PairedEndInfo(
+            isRead1: !mappedIsRead1, isProperPair: false,
+            mateTid: rid, matePos: localPos,
+            mateIsReverse: cigar.isReverse, mateIsUnmapped: false, tlen: 0
+        )
+
+        let mapq = MappingQuality.compute(
+            region: region, allRegions: mappedRegions,
+            scoring: options.scoring, readLength: Int32(mappedRead.length)
+        )
+
+        var records: [RecordSpec] = []
+        let mappedSpec = RecordSpec(
+            readIsRead1: mappedIsRead1, regionIndex: 0, cigarInfo: cigar,
+            mapq: mapq, isPrimary: true, isSupplementary: false,
+            isSecondary: false, pairedEnd: mappedPE, saTag: nil, xaTag: nil
+        )
+        let unmappedSpec = RecordSpec(
+            readIsRead1: !mappedIsRead1, regionIndex: -1, cigarInfo: nil,
+            mapq: 0, isPrimary: false, isSupplementary: false,
+            isSecondary: false, pairedEnd: unmappedPE, saTag: nil, xaTag: nil
+        )
+
+        if mappedIsRead1 {
+            records.append(mappedSpec)
+            records.append(unmappedSpec)
+        } else {
+            records.append(unmappedSpec)
+            records.append(mappedSpec)
+        }
+
+        let (r1, r2) = mappedIsRead1
+            ? (mappedRegions, [MemAlnReg]())
+            : ([MemAlnReg](), mappedRegions)
+        return PairOutputPlan(regions1: r1, regions2: r2, records: records)
     }
 
     /// Process a batch of pairs: rescue (CPU or GPU) + CIGAR generation.
@@ -1963,75 +2116,4 @@ public actor BWAMemAligner {
     }
     #endif
 
-    /// Write a pair where one read is mapped and the other is unmapped.
-    private func writeMappedUnmappedPair(
-        mappedRead: ReadSequence,
-        mappedRegions: [MemAlnReg],
-        unmappedRead: ReadSequence,
-        mappedIsRead1: Bool,
-        outputFile: borrowing HTSFile,
-        header: SAMHeader,
-        cigarCache: [CIGARInfo]? = nil
-    ) {
-        let region = mappedRegions[0]
-        let cigar = cigarCache?.first ?? generateCIGAR(read: mappedRead, region: region)
-        let (rid, localPos) = index.metadata.decodePosition(cigar.pos)
-        let rgID = options.readGroupID
-        let refHeader = options.outputRefHeader
-        let comment = options.appendComment
-
-        // Mapped read's PE info: mate is unmapped
-        let mappedPE = PairedEndInfo(
-            isRead1: mappedIsRead1, isProperPair: false,
-            mateTid: rid, matePos: localPos,
-            mateIsReverse: false, mateIsUnmapped: true,
-            tlen: 0
-        )
-
-        // Unmapped read's PE info: mate is mapped
-        let unmappedPE = PairedEndInfo(
-            isRead1: !mappedIsRead1, isProperPair: false,
-            mateTid: rid, matePos: localPos,
-            mateIsReverse: cigar.isReverse, mateIsUnmapped: false,
-            tlen: 0
-        )
-
-        do {
-            if mappedIsRead1 {
-                let rec1 = try SAMOutputBuilder.buildRecord(
-                    read: mappedRead, region: region, allRegions: mappedRegions,
-                    metadata: index.metadata, scoring: options.scoring,
-                    cigar: cigar.cigar, nm: cigar.nm, md: cigar.md,
-                    isPrimary: true, adjustedPos: cigar.pos, pairedEnd: mappedPE,
-                    readGroupID: rgID,
-                    outputRefHeader: refHeader, appendComment: comment
-                )
-                try outputFile.write(record: rec1, header: header)
-                let rec2 = try SAMOutputBuilder.buildUnmappedRecord(
-                    read: unmappedRead, pairedEnd: unmappedPE, readGroupID: rgID,
-                    appendComment: comment
-                )
-                try outputFile.write(record: rec2, header: header)
-            } else {
-                let rec1 = try SAMOutputBuilder.buildUnmappedRecord(
-                    read: unmappedRead, pairedEnd: unmappedPE, readGroupID: rgID,
-                    appendComment: comment
-                )
-                try outputFile.write(record: rec1, header: header)
-                let rec2 = try SAMOutputBuilder.buildRecord(
-                    read: mappedRead, region: region, allRegions: mappedRegions,
-                    metadata: index.metadata, scoring: options.scoring,
-                    cigar: cigar.cigar, nm: cigar.nm, md: cigar.md,
-                    isPrimary: true, adjustedPos: cigar.pos, pairedEnd: mappedPE,
-                    readGroupID: rgID,
-                    outputRefHeader: refHeader, appendComment: comment
-                )
-                try outputFile.write(record: rec2, header: header)
-            }
-        } catch {
-            if options.verbosity >= 1 {
-                fputs("[PE] Error writing mapped/unmapped pair: \(error)\n", stderr)
-            }
-        }
-    }
 }
