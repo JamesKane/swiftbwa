@@ -1151,9 +1151,12 @@ public actor BWAMemAligner {
                 // GPU per-batch rescue: collect candidates, dispatch, apply
                 let genomeLen = index.genomeLength
 
-                // --- Rescue read2 from read1 templates ---
-                var allCands2: [MateRescue.RescueCandidate] = []
+                // --- Collect ALL rescue candidates (both directions) upfront ---
+                var allCands: [MateRescue.RescueCandidate] = []
                 var candRanges2 = [(start: Int, count: Int)](repeating: (0, 0), count: count)
+                var candRanges1 = [(start: Int, count: Int)](repeating: (0, 0), count: count)
+
+                // Direction 1: rescue R2 from R1 templates
                 for li in 0..<count {
                     let gi = batchStart + li
                     let templates = Self.selectRescueCandidates(finalRegs1[li], scoring: scoring)
@@ -1168,21 +1171,44 @@ public actor BWAMemAligner {
                         metadata: index.metadata
                     )
                     if !cands.isEmpty {
-                        candRanges2[li] = (start: allCands2.count, count: cands.count)
-                        allCands2.append(contentsOf: cands)
+                        candRanges2[li] = (start: allCands.count, count: cands.count)
+                        allCands.append(contentsOf: cands)
                     }
                 }
 
-                if !allCands2.isEmpty {
-                    let tasks = allCands2.map {
+                // Direction 2: rescue R1 from original R2 templates
+                for li in 0..<count {
+                    let gi = batchStart + li
+                    let templates = Self.selectRescueCandidates(finalRegs2[li], scoring: scoring)
+                    guard !templates.isEmpty else { continue }
+                    let cands = MateRescue.collectCandidates(
+                        templateRegions: templates,
+                        mateRead: reads1[gi],
+                        mateRegions: finalRegs1[li],
+                        dist: dist,
+                        genomeLength: genomeLen,
+                        packedRef: index.packedRef,
+                        metadata: index.metadata
+                    )
+                    if !cands.isEmpty {
+                        candRanges1[li] = (start: allCands.count, count: cands.count)
+                        allCands.append(contentsOf: cands)
+                    }
+                }
+
+                // --- Single GPU dispatch for both directions ---
+                if !allCands.isEmpty {
+                    let tasks = allCands.map {
                         LocalSWTask(query: $0.mateSeq, target: $0.refBases, scoring: scoring)
                     }
                     let gpuResults = LocalSWDispatcher.dispatchBatch(tasks: tasks, engine: engine)
+
+                    // Apply direction 1 results: rescue R2
                     for li in 0..<count {
                         let r = candRanges2[li]
                         for j in 0..<r.count {
                             let ci = r.start + j
-                            let cand = allCands2[ci]
+                            let cand = allCands[ci]
                             let sw: (score: Int32, qb: Int32, qe: Int32, tb: Int32, te: Int32)?
                             if let g = gpuResults[ci] {
                                 sw = (g.score, g.queryBegin, g.queryEnd, g.targetBegin, g.targetEnd)
@@ -1203,40 +1229,13 @@ public actor BWAMemAligner {
                             }
                         }
                     }
-                }
 
-                // --- Rescue read1 from (updated) read2 templates ---
-                var allCands1: [MateRescue.RescueCandidate] = []
-                var candRanges1 = [(start: Int, count: Int)](repeating: (0, 0), count: count)
-                for li in 0..<count {
-                    let gi = batchStart + li
-                    let templates = Self.selectRescueCandidates(finalRegs2[li], scoring: scoring)
-                    guard !templates.isEmpty else { continue }
-                    let cands = MateRescue.collectCandidates(
-                        templateRegions: templates,
-                        mateRead: reads1[gi],
-                        mateRegions: finalRegs1[li],
-                        dist: dist,
-                        genomeLength: genomeLen,
-                        packedRef: index.packedRef,
-                        metadata: index.metadata
-                    )
-                    if !cands.isEmpty {
-                        candRanges1[li] = (start: allCands1.count, count: cands.count)
-                        allCands1.append(contentsOf: cands)
-                    }
-                }
-
-                if !allCands1.isEmpty {
-                    let tasks = allCands1.map {
-                        LocalSWTask(query: $0.mateSeq, target: $0.refBases, scoring: scoring)
-                    }
-                    let gpuResults = LocalSWDispatcher.dispatchBatch(tasks: tasks, engine: engine)
+                    // Apply direction 2 results: rescue R1
                     for li in 0..<count {
                         let r = candRanges1[li]
                         for j in 0..<r.count {
                             let ci = r.start + j
-                            let cand = allCands1[ci]
+                            let cand = allCands[ci]
                             let sw: (score: Int32, qb: Int32, qe: Int32, tb: Int32, te: Int32)?
                             if let g = gpuResults[ci] {
                                 sw = (g.score, g.queryBegin, g.queryEnd, g.targetBegin, g.targetEnd)
