@@ -581,7 +581,7 @@ public actor BWAMemAligner {
         }
         #endif
 
-        let results: [(Int, [MemAlnReg], [CIGARInfo])]
+        let results: [(Int, [MemAlnReg], [RecordSpec])]
 
         #if canImport(Metal)
         if let engine = gpuSeedingEngine {
@@ -597,57 +597,21 @@ public actor BWAMemAligner {
 
         // Place results by idx for ordered output
         var regionsByIdx = Array(repeating: [MemAlnReg](), count: reads.count)
-        var cigarsByIdx = Array(repeating: [CIGARInfo](), count: reads.count)
-        for (idx, regions, cigars) in results {
+        var specsByIdx = [[RecordSpec]?](repeating: nil, count: reads.count)
+        for (idx, regions, specs) in results {
             regionsByIdx[idx] = regions
-            cigarsByIdx[idx] = cigars
+            specsByIdx[idx] = specs
         }
 
-        // Parallel output classification
         let rgID = options.readGroupID
         let comment = options.appendComment
         let refHeader = options.outputRefHeader
-        let scoringMat = options.scoring.scoringMatrix()
-
-        var allSpecs = [[RecordSpec]?](repeating: nil, count: reads.count)
-        await withTaskGroup(of: (Int, [RecordSpec]).self) { group in
-            var nextIdx = 0
-            while nextIdx < min(maxConcurrency, reads.count) {
-                let idx = nextIdx
-                let read = reads[idx]
-                let regions = regionsByIdx[idx]
-                let cigars = cigarsByIdx[idx]
-                group.addTask { [self] in
-                    return (idx, self.classifyAlignments(
-                        read: read, regions: regions, readIsRead1: true,
-                        pairedEnd: nil, cigarCache: cigars, scoringMat: scoringMat
-                    ))
-                }
-                nextIdx += 1
-            }
-            for await (idx, specs) in group {
-                allSpecs[idx] = specs
-                if nextIdx < reads.count {
-                    let idx = nextIdx
-                    let read = reads[idx]
-                    let regions = regionsByIdx[idx]
-                    let cigars = cigarsByIdx[idx]
-                    group.addTask { [self] in
-                        return (idx, self.classifyAlignments(
-                            read: read, regions: regions, readIsRead1: true,
-                            pairedEnd: nil, cigarCache: cigars, scoringMat: scoringMat
-                        ))
-                    }
-                    nextIdx += 1
-                }
-            }
-        }
 
         // Sequential record building + writing
         for idx in 0..<reads.count {
             let read = reads[idx]
             let regions = regionsByIdx[idx]
-            for spec in allSpecs[idx]! {
+            for spec in specsByIdx[idx]! {
                 if spec.regionIndex < 0 {
                     let record = try SAMOutputBuilder.buildUnmappedRecord(
                         read: read, readGroupID: rgID, appendComment: comment
@@ -673,17 +637,17 @@ public actor BWAMemAligner {
         }
     }
 
-    /// SE CPU path: per-read parallel align + CIGAR.
+    /// SE CPU path: per-read parallel align + CIGAR + classify.
     private func alignBatchCPU(
         reads: [ReadSequence],
         maxConcurrency: Int
-    ) async -> [(Int, [MemAlnReg], [CIGARInfo])] {
+    ) async -> [(Int, [MemAlnReg], [RecordSpec])] {
         await withTaskGroup(
-            of: (Int, [MemAlnReg], [CIGARInfo]).self,
-            returning: [(Int, [MemAlnReg], [CIGARInfo])].self
+            of: (Int, [MemAlnReg], [RecordSpec]).self,
+            returning: [(Int, [MemAlnReg], [RecordSpec])].self
         ) { group in
             var nextIdx = 0
-            var collected: [(Int, [MemAlnReg], [CIGARInfo])] = []
+            var collected: [(Int, [MemAlnReg], [RecordSpec])] = []
             collected.reserveCapacity(reads.count)
 
             while nextIdx < min(maxConcurrency, reads.count) {
@@ -693,7 +657,11 @@ public actor BWAMemAligner {
                     let regions = self.alignRead(read, readId: UInt64(idx))
                     let mat = self.options.scoring.scoringMatrix()
                     let cigars = self.generateFilteredCIGARs(read: read, regions: regions, scoringMatrix: mat)
-                    return (idx, regions, cigars)
+                    let specs = self.classifyAlignments(
+                        read: read, regions: regions, readIsRead1: true,
+                        pairedEnd: nil, cigarCache: cigars, scoringMat: mat
+                    )
+                    return (idx, regions, specs)
                 }
                 nextIdx += 1
             }
@@ -707,7 +675,11 @@ public actor BWAMemAligner {
                         let regions = self.alignRead(read, readId: UInt64(idx))
                         let mat = self.options.scoring.scoringMatrix()
                         let cigars = self.generateFilteredCIGARs(read: read, regions: regions, scoringMatrix: mat)
-                        return (idx, regions, cigars)
+                        let specs = self.classifyAlignments(
+                            read: read, regions: regions, readIsRead1: true,
+                            pairedEnd: nil, cigarCache: cigars, scoringMat: mat
+                        )
+                        return (idx, regions, specs)
                     }
                     nextIdx += 1
                 }
@@ -718,16 +690,16 @@ public actor BWAMemAligner {
     }
 
     #if canImport(Metal)
-    /// SE GPU-seeded path: batch SMEM finding on GPU, then per-read CPU pipeline + CIGAR.
+    /// SE GPU-seeded path: batch SMEM finding on GPU, then per-read CPU pipeline + CIGAR + classify.
     private func alignBatchGPUSeeded(
         reads: [ReadSequence],
         engine: MetalSWEngine,
         maxConcurrency: Int
-    ) async -> [(Int, [MemAlnReg], [CIGARInfo])] {
+    ) async -> [(Int, [MemAlnReg], [RecordSpec])] {
         let scoring = options.scoring
         let gpuBatchSize = 4096
         let readCount = reads.count
-        var allCollected: [(Int, [MemAlnReg], [CIGARInfo])] = []
+        var allCollected: [(Int, [MemAlnReg], [RecordSpec])] = []
         allCollected.reserveCapacity(readCount)
 
         var batchStart = 0
@@ -748,24 +720,28 @@ public actor BWAMemAligner {
                 minSeedLen: scoring.minSeedLength
             )
 
-            // Phases 1.5-5 + CIGAR: parallel per-read on CPU
+            // Phases 1.5-5 + CIGAR + classify: parallel per-read on CPU
             let batchResults = await withTaskGroup(
-                of: (Int, [MemAlnReg], [CIGARInfo]).self,
-                returning: [(Int, [MemAlnReg], [CIGARInfo])].self
+                of: (Int, [MemAlnReg], [RecordSpec]).self,
+                returning: [(Int, [MemAlnReg], [RecordSpec])].self
             ) { group in
                 var nextIdx = 0
-                var collected: [(Int, [MemAlnReg], [CIGARInfo])] = []
+                var collected: [(Int, [MemAlnReg], [RecordSpec])] = []
                 collected.reserveCapacity(batchCount)
 
                 let capturedBatchStart = batchStart
-                func addTask(_ group: inout TaskGroup<(Int, [MemAlnReg], [CIGARInfo])>, idx: Int) {
+                func addTask(_ group: inout TaskGroup<(Int, [MemAlnReg], [RecordSpec])>, idx: Int) {
                     let read = batchReads[idx]
                     let smems = gpuSMEMs[idx]
                     let gi = capturedBatchStart + idx
                     group.addTask { [self] in
                         let chains = self.alignReadPhase1_5to3(read, gpuSMEMs: smems)
                         guard !chains.isEmpty else {
-                            return (gi, [], [])
+                            let specs = self.classifyAlignments(
+                                read: read, regions: [], readIsRead1: true,
+                                pairedEnd: nil, cigarCache: [], scoringMat: []
+                            )
+                            return (gi, [], specs)
                         }
 
                         var regions: [MemAlnReg] = []
@@ -788,7 +764,11 @@ public actor BWAMemAligner {
                         let cigars = self.generateFilteredCIGARs(
                             read: read, regions: finalRegions, scoringMatrix: mat
                         )
-                        return (gi, finalRegions, cigars)
+                        let specs = self.classifyAlignments(
+                            read: read, regions: finalRegions, readIsRead1: true,
+                            pairedEnd: nil, cigarCache: cigars, scoringMat: mat
+                        )
+                        return (gi, finalRegions, specs)
                     }
                 }
 
@@ -884,9 +864,7 @@ public actor BWAMemAligner {
             }
         }
 
-        // Phase 2.5+3: Rescue + CIGAR pre-computation (merged into one parallel phase).
-        var mutableRegions1 = allRegions1
-        var mutableRegions2 = allRegions2
+        // Merged rescue + CIGAR + output preparation + streaming write
         let skipRescue = (options.scoring.flag & ScoringParameters.flagNoRescue) != 0
         let doRescue = !primaryStats.failed && !skipRescue
 
@@ -900,41 +878,45 @@ public actor BWAMemAligner {
         #endif
         let batchCount = (pairCount + batchSize - 1) / batchSize
 
-        var rescueCount1 = 0, rescueCount2 = 0
-
         #if canImport(Metal)
         let gpuEngine: MetalSWEngine? = options.useGPU ? MetalSWEngine.shared : nil
         #else
         let gpuEngine: Bool? = nil
         #endif
 
-        typealias PairResult = (Int, [MemAlnReg], [MemAlnReg], [CIGARInfo], [CIGARInfo], Int, Int)
-        let mergedResults = await withTaskGroup(
-            of: [PairResult].self,
-            returning: [[PairResult]].self
-        ) { group in
+        let skipPairing = (options.scoring.flag & ScoringParameters.flagNoPairing) != 0
+        let rgID = options.readGroupID
+        let comment = options.appendComment
+        let refHeader = options.outputRefHeader
+        let scoringMat = options.scoring.scoringMatrix()
+
+        var rescueCount1 = 0, rescueCount2 = 0
+        var plans = [PairOutputPlan?](repeating: nil, count: pairCount)
+        var nextWrite = 0
+
+        typealias FullBatchResult = [(Int, PairOutputPlan, Int, Int)]
+        try await withThrowingTaskGroup(of: FullBatchResult.self) { group in
             let scoring = options.scoring
             let capturedReads1 = reads1
             let capturedReads2 = reads2
-            let capturedRegs1 = mutableRegions1
-            let capturedRegs2 = mutableRegions2
+            let capturedRegs1 = allRegions1
+            let capturedRegs2 = allRegions2
 
             var nextBatch = 0
-            var collected: [[PairResult]] = []
-            collected.reserveCapacity(batchCount)
 
             func addBatchTask(
-                _ group: inout TaskGroup<[PairResult]>,
+                _ group: inout ThrowingTaskGroup<FullBatchResult, Error>,
                 batchStart: Int
             ) {
                 let batchEnd = min(batchStart + batchSize, pairCount)
                 group.addTask { [self] in
-                    await self.processRescueCIGARBatch(
+                    await self.processFullBatch(
                         batchStart: batchStart, batchEnd: batchEnd,
                         reads1: capturedReads1, reads2: capturedReads2,
                         regs1: capturedRegs1, regs2: capturedRegs2,
                         doRescue: doRescue, dist: dist, scoring: scoring,
-                        gpuEngine: gpuEngine
+                        gpuEngine: gpuEngine,
+                        skipPairing: skipPairing, scoringMat: scoringMat
                     )
                 }
             }
@@ -945,110 +927,54 @@ public actor BWAMemAligner {
                 nextBatch += 1
             }
 
-            for await batchResult in group {
-                collected.append(batchResult)
+            for try await batchResult in group {
+                for (idx, plan, rc1, rc2) in batchResult {
+                    plans[idx] = plan
+                    rescueCount1 += rc1
+                    rescueCount2 += rc2
+                }
+
+                // Write all consecutive completed plans
+                while nextWrite < pairCount, let plan = plans[nextWrite] {
+                    for spec in plan.records {
+                        let read = spec.readIsRead1 ? reads1[nextWrite] : reads2[nextWrite]
+                        if spec.regionIndex < 0 {
+                            let record = try SAMOutputBuilder.buildUnmappedRecord(
+                                read: read, pairedEnd: spec.pairedEnd,
+                                readGroupID: rgID, appendComment: comment
+                            )
+                            try outputFile.write(record: record, header: header)
+                        } else {
+                            let regions = spec.readIsRead1 ? plan.regions1 : plan.regions2
+                            let cigar = spec.cigarInfo!
+                            let record = try SAMOutputBuilder.buildRecord(
+                                read: read, region: regions[spec.regionIndex],
+                                allRegions: regions, metadata: index.metadata,
+                                scoring: options.scoring, cigar: cigar.cigar,
+                                nm: cigar.nm, md: cigar.md,
+                                isPrimary: spec.isPrimary,
+                                isSupplementary: spec.isSupplementary,
+                                mapqOverride: spec.mapq, adjustedPos: cigar.pos,
+                                pairedEnd: spec.pairedEnd, saTag: spec.saTag,
+                                xaTag: spec.xaTag, readGroupID: rgID,
+                                outputRefHeader: refHeader, appendComment: comment
+                            )
+                            try outputFile.write(record: record, header: header)
+                        }
+                    }
+                    plans[nextWrite] = nil  // release memory
+                    nextWrite += 1
+                }
+
                 if nextBatch < batchCount {
                     addBatchTask(&group, batchStart: nextBatch * batchSize)
                     nextBatch += 1
                 }
             }
-
-            return collected
-        }
-
-        // Unpack merged results
-        var allCigars = Array(repeating: ([CIGARInfo](), [CIGARInfo]()), count: pairCount)
-        for batch in mergedResults {
-            for (idx, regs1, regs2, cig1, cig2, rc1, rc2) in batch {
-                mutableRegions1[idx] = regs1
-                mutableRegions2[idx] = regs2
-                allCigars[idx] = (cig1, cig2)
-                rescueCount1 += rc1
-                rescueCount2 += rc2
-            }
         }
 
         if doRescue && options.verbosity >= 3 {
             fputs("[PE] Mate rescue: \(rescueCount1) read1 + \(rescueCount2) read2 rescued\n", stderr)
-        }
-
-        let skipPairing = (options.scoring.flag & ScoringParameters.flagNoPairing) != 0
-        let rgID = options.readGroupID
-        let comment = options.appendComment
-        let refHeader = options.outputRefHeader
-        let scoringMat = options.scoring.scoringMatrix()
-
-        // Snapshot mutable arrays so closures capture Sendable values
-        let capturedRegions1 = mutableRegions1
-        let capturedRegions2 = mutableRegions2
-        let capturedCigars = allCigars
-
-        // Phase 1: Parallel output preparation
-        var plans = [PairOutputPlan?](repeating: nil, count: pairCount)
-        await withTaskGroup(of: (Int, PairOutputPlan).self) { group in
-            var nextIdx = 0
-            while nextIdx < min(maxConcurrencyOut, pairCount) {
-                let i = nextIdx
-                group.addTask { [self] in
-                    let plan = self.preparePairOutput(
-                        read1: reads1[i], read2: reads2[i],
-                        regions1: capturedRegions1[i], regions2: capturedRegions2[i],
-                        cigars1: capturedCigars[i].0, cigars2: capturedCigars[i].1,
-                        dist: dist, genomeLen: genomeLen,
-                        skipPairing: skipPairing, scoringMat: scoringMat
-                    )
-                    return (i, plan)
-                }
-                nextIdx += 1
-            }
-            for await (i, plan) in group {
-                plans[i] = plan
-                if nextIdx < pairCount {
-                    let i = nextIdx
-                    group.addTask { [self] in
-                        let plan = self.preparePairOutput(
-                            read1: reads1[i], read2: reads2[i],
-                            regions1: capturedRegions1[i], regions2: capturedRegions2[i],
-                            cigars1: capturedCigars[i].0, cigars2: capturedCigars[i].1,
-                            dist: dist, genomeLen: genomeLen,
-                            skipPairing: skipPairing, scoringMat: scoringMat
-                        )
-                        return (i, plan)
-                    }
-                    nextIdx += 1
-                }
-            }
-        }
-
-        // Phase 2: Sequential record building + writing
-        for i in 0..<pairCount {
-            let plan = plans[i]!
-            for spec in plan.records {
-                let read = spec.readIsRead1 ? reads1[i] : reads2[i]
-                if spec.regionIndex < 0 {
-                    let record = try SAMOutputBuilder.buildUnmappedRecord(
-                        read: read, pairedEnd: spec.pairedEnd,
-                        readGroupID: rgID, appendComment: comment
-                    )
-                    try outputFile.write(record: record, header: header)
-                } else {
-                    let regions = spec.readIsRead1 ? plan.regions1 : plan.regions2
-                    let cigar = spec.cigarInfo!
-                    let record = try SAMOutputBuilder.buildRecord(
-                        read: read, region: regions[spec.regionIndex],
-                        allRegions: regions, metadata: index.metadata,
-                        scoring: options.scoring, cigar: cigar.cigar,
-                        nm: cigar.nm, md: cigar.md,
-                        isPrimary: spec.isPrimary,
-                        isSupplementary: spec.isSupplementary,
-                        mapqOverride: spec.mapq, adjustedPos: cigar.pos,
-                        pairedEnd: spec.pairedEnd, saTag: spec.saTag,
-                        xaTag: spec.xaTag, readGroupID: rgID,
-                        outputRefHeader: refHeader, appendComment: comment
-                    )
-                    try outputFile.write(record: record, header: header)
-                }
-            }
         }
     }
 
@@ -1279,18 +1205,18 @@ public actor BWAMemAligner {
         return PairOutputPlan(regions1: r1, regions2: r2, records: records)
     }
 
-    /// Process a batch of pairs: rescue (CPU or GPU) + CIGAR generation.
+    /// Process a batch of pairs: rescue + CIGAR + output preparation (fully merged).
     /// When gpuEngine is available, collects all rescue candidates for the batch,
-    /// dispatches 2 GPU batches (read2 then read1), applies results, then generates CIGARs.
-    /// This allows GPU rescue and CPU CIGAR generation to overlap across concurrent batches.
-    nonisolated private func processRescueCIGARBatch(
+    /// dispatches GPU batches, applies results, generates CIGARs, then builds output plans.
+    nonisolated private func processFullBatch(
         batchStart: Int, batchEnd: Int,
         reads1: [ReadSequence], reads2: [ReadSequence],
         regs1: [[MemAlnReg]], regs2: [[MemAlnReg]],
         doRescue: Bool, dist: InsertSizeDistribution,
         scoring: ScoringParameters,
-        gpuEngine: Any?
-    ) async -> [(Int, [MemAlnReg], [MemAlnReg], [CIGARInfo], [CIGARInfo], Int, Int)] {
+        gpuEngine: Any?,
+        skipPairing: Bool, scoringMat: [Int8]
+    ) async -> [(Int, PairOutputPlan, Int, Int)] {
         let mat = scoring.scoringMatrix()
         let count = batchEnd - batchStart
         var finalRegs1 = (batchStart..<batchEnd).map { regs1[$0] }
@@ -1452,15 +1378,21 @@ public actor BWAMemAligner {
             #endif
         }
 
-        // CIGAR generation
-        var results: [(Int, [MemAlnReg], [MemAlnReg], [CIGARInfo], [CIGARInfo], Int, Int)] = []
+        // CIGAR generation + output preparation
+        var results: [(Int, PairOutputPlan, Int, Int)] = []
         results.reserveCapacity(count)
         for li in 0..<count {
             let gi = batchStart + li
             let cig1 = generateFilteredCIGARs(read: reads1[gi], regions: finalRegs1[li], scoringMatrix: mat)
             let cig2 = generateFilteredCIGARs(read: reads2[gi], regions: finalRegs2[li], scoringMatrix: mat)
-            results.append((gi, finalRegs1[li], finalRegs2[li], cig1, cig2,
-                            rescueCounts1[li], rescueCounts2[li]))
+            let plan = preparePairOutput(
+                read1: reads1[gi], read2: reads2[gi],
+                regions1: finalRegs1[li], regions2: finalRegs2[li],
+                cigars1: cig1, cigars2: cig2,
+                dist: dist, genomeLen: index.genomeLength,
+                skipPairing: skipPairing, scoringMat: scoringMat
+            )
+            results.append((gi, plan, rescueCounts1[li], rescueCounts2[li]))
         }
         return results
     }
