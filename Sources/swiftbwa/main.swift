@@ -271,220 +271,188 @@ struct Mem: AsyncParsableCommand {
         let outFile = try HTSFile(path: outputPath, mode: outputMode)
         try header.write(to: outFile)
 
-        let loadReads = appendComment ? readFASTQWithComments : readFASTQ
+        let chunkBases = batchSize ?? defaultChunkBases
 
         if p {
-            // Interleaved paired-end mode: single file, odd/even split
-            let allReads = try loadReads(fastqFiles[0])
-            guard allReads.count % 2 == 0 else {
-                throw BWAError.fileIOError(
-                    "Interleaved FASTQ has odd number of records: \(allReads.count)"
+            // Interleaved paired-end mode: stream pairs from one file
+            let inFile = try HTSFile(path: fastqFiles[0], mode: "r")
+            let inHeader = try inFile.samHeader()
+            let iter = inFile.samIterator(header: inHeader)
+            var totalPairs = 0
+            var totalBases = 0
+            if v >= 3 { fputs("Aligning interleaved paired-end...\n", stderr) }
+            while true {
+                let (chunk1, chunk2) = readInterleavedChunk(
+                    from: iter, maxBases: chunkBases,
+                    preserveComments: appendComment
+                )
+                if chunk1.isEmpty { break }
+                guard chunk1.count == chunk2.count else {
+                    throw BWAError.fileIOError(
+                        "Interleaved FASTQ has odd number of records"
+                    )
+                }
+                totalPairs += chunk1.count
+                totalBases += chunk1.reduce(0) { $0 + $1.length }
+                    + chunk2.reduce(0) { $0 + $1.length }
+                if v >= 3 {
+                    fputs("[M::main] Processed \(totalPairs) pairs "
+                        + "(\(String(format: "%.1f", Double(totalBases) / 1_000_000))M bases)\n",
+                        stderr)
+                }
+                try await aligner.alignPairedBatch(
+                    reads1: chunk1, reads2: chunk2,
+                    outputFile: outFile, header: header
                 )
             }
-            var reads1: [ReadSequence] = []
-            var reads2: [ReadSequence] = []
-            reads1.reserveCapacity(allReads.count / 2)
-            reads2.reserveCapacity(allReads.count / 2)
-            for i in stride(from: 0, to: allReads.count, by: 2) {
-                reads1.append(allReads[i])
-                reads2.append(allReads[i + 1])
-            }
-            if v >= 3 { fputs("Loaded \(reads1.count) paired reads (interleaved)\n", stderr) }
-            if v >= 3 { fputs("Aligning paired-end...\n", stderr) }
-
-            try await alignPairedInChunks(
-                reads1: reads1, reads2: reads2,
-                chunkSize: batchSize, aligner: aligner,
-                outputFile: outFile, header: header
-            )
         } else if options.isPairedEnd {
-            // Two-file paired-end mode
-            let reads1 = try loadReads(fastqFiles[0])
-            let reads2 = try loadReads(fastqFiles[1])
-            guard reads1.count == reads2.count else {
-                throw BWAError.fileIOError(
-                    "R1 and R2 have different read counts: "
-                    + "\(reads1.count) vs \(reads2.count)"
+            // Two-file paired-end mode: stream from both files
+            let inFile1 = try HTSFile(path: fastqFiles[0], mode: "r")
+            let inHeader1 = try inFile1.samHeader()
+            let iter1 = inFile1.samIterator(header: inHeader1)
+            let inFile2 = try HTSFile(path: fastqFiles[1], mode: "r")
+            let inHeader2 = try inFile2.samHeader()
+            let iter2 = inFile2.samIterator(header: inHeader2)
+            var totalPairs = 0
+            var totalBases = 0
+            if v >= 3 { fputs("Aligning paired-end...\n", stderr) }
+            while true {
+                let chunk1 = readChunk(
+                    from: iter1, maxBases: chunkBases,
+                    preserveComments: appendComment
+                )
+                if chunk1.isEmpty { break }
+                let chunk2 = readExactCount(
+                    from: iter2, count: chunk1.count,
+                    preserveComments: appendComment
+                )
+                guard chunk2.count == chunk1.count else {
+                    throw BWAError.fileIOError(
+                        "R1 and R2 have different read counts"
+                    )
+                }
+                totalPairs += chunk1.count
+                totalBases += chunk1.reduce(0) { $0 + $1.length }
+                    + chunk2.reduce(0) { $0 + $1.length }
+                if v >= 3 {
+                    fputs("[M::main] Processed \(totalPairs) pairs "
+                        + "(\(String(format: "%.1f", Double(totalBases) / 1_000_000))M bases)\n",
+                        stderr)
+                }
+                try await aligner.alignPairedBatch(
+                    reads1: chunk1, reads2: chunk2,
+                    outputFile: outFile, header: header
                 )
             }
-            if v >= 3 { fputs("Loaded \(reads1.count) paired reads\n", stderr) }
-            if v >= 3 { fputs("Aligning paired-end...\n", stderr) }
-
-            try await alignPairedInChunks(
-                reads1: reads1, reads2: reads2,
-                chunkSize: batchSize, aligner: aligner,
-                outputFile: outFile, header: header
-            )
         } else {
-            // Single-end mode
-            let reads = try loadReads(fastqFiles[0])
-            if v >= 3 { fputs("Loaded \(reads.count) reads from \(fastqFiles[0])\n", stderr) }
+            // Single-end mode: stream from one file
+            let inFile = try HTSFile(path: fastqFiles[0], mode: "r")
+            let inHeader = try inFile.samHeader()
+            let iter = inFile.samIterator(header: inHeader)
+            var totalReads = 0
+            var totalBases = 0
             if v >= 3 { fputs("Aligning...\n", stderr) }
-
-            try await alignSEInChunks(
-                reads: reads, chunkSize: batchSize,
-                aligner: aligner, outputFile: outFile, header: header
-            )
+            while true {
+                let chunk = readChunk(
+                    from: iter, maxBases: chunkBases,
+                    preserveComments: appendComment
+                )
+                if chunk.isEmpty { break }
+                totalReads += chunk.count
+                totalBases += chunk.reduce(0) { $0 + $1.length }
+                if v >= 3 {
+                    fputs("[M::main] Processed \(totalReads) reads "
+                        + "(\(String(format: "%.1f", Double(totalBases) / 1_000_000))M bases)\n",
+                        stderr)
+                }
+                try await aligner.alignBatch(
+                    reads: chunk, outputFile: outFile, header: header
+                )
+            }
         }
 
         if v >= 3 { fputs("Done.\n", stderr) }
     }
 }
 
-// MARK: - FASTQ Reader
+// MARK: - Streaming FASTQ Reader
 
-func readFASTQ(path: String) throws -> [ReadSequence] {
-    let file = try HTSFile(path: path, mode: "r")
-    let header = try file.samHeader()
-    let iterator = file.samIterator(header: header)
+/// Default chunk size: ~50M bases per chunk (~330K reads of 150bp, ~100MB memory).
+let defaultChunkBases = 50_000_000
 
+/// Parse a BAMRecord into a ReadSequence.
+func parseBAMRecord(_ record: borrowing BAMRecord, preserveComments: Bool) -> ReadSequence {
+    let name = record.queryName
+    let seq = record.sequence
+    let quals = record.qualities
+
+    let bases: [UInt8] = (0..<seq.count).map { i in
+        switch seq[i] {
+        case "A", "a": return 0
+        case "C", "c": return 1
+        case "G", "g": return 2
+        case "T", "t": return 3
+        default:       return 4  // N
+        }
+    }
+    let qualities: [UInt8] = (0..<quals.count).map { quals[$0] }
+    let comment = preserveComments ? (record.auxiliaryData.string(forTag: "CO") ?? "") : ""
+
+    return ReadSequence(name: name, bases: bases, qualities: qualities, comment: comment)
+}
+
+/// Read a chunk of reads from an iterator, up to `maxBases` total bases.
+func readChunk(
+    from iterator: SAMRecordIterator,
+    maxBases: Int,
+    preserveComments: Bool
+) -> [ReadSequence] {
     var reads: [ReadSequence] = []
+    var bases = 0
     while let record = iterator.next() {
-        let name = record.queryName
-        let seq = record.sequence
-        let quals = record.qualities
-
-        let bases: [UInt8] = (0..<seq.count).map { i in
-            switch seq[i] {
-            case "A", "a": return 0
-            case "C", "c": return 1
-            case "G", "g": return 2
-            case "T", "t": return 3
-            default:       return 4  // N
-            }
-        }
-        let qualities: [UInt8] = (0..<quals.count).map { quals[$0] }
-
-        reads.append(ReadSequence(name: name, bases: bases, qualities: qualities))
+        let read = parseBAMRecord(record, preserveComments: preserveComments)
+        bases += read.length
+        reads.append(read)
+        if bases >= maxBases { break }
     }
     return reads
 }
 
-/// Read FASTQ file preserving comment text from header lines.
-///
-/// For `-C` flag support: parses FASTQ headers to extract the comment
-/// (text after first whitespace in the `@name comment` line).
-/// Handles gzip-compressed files by piping through gunzip.
-func readFASTQWithComments(path: String) throws -> [ReadSequence] {
-    let lines: [String]
-
-    // Detect gzip by magic bytes or extension
-    let isGzip = path.hasSuffix(".gz") || path.hasSuffix(".bgz") || {
-        guard let fh = FileHandle(forReadingAtPath: path) else { return false }
-        defer { fh.closeFile() }
-        let magic = fh.readData(ofLength: 2)
-        return magic.count == 2 && magic[0] == 0x1f && magic[1] == 0x8b
-    }()
-
-    if isGzip {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/gunzip")
-        process.arguments = ["-c", path]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        try process.run()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        guard let text = String(data: data, encoding: .utf8) else {
-            throw BWAError.fileIOError("Failed to decode gzip FASTQ: \(path)")
-        }
-        lines = text.components(separatedBy: "\n")
-    } else {
-        let text = try String(contentsOfFile: path, encoding: .utf8)
-        lines = text.components(separatedBy: "\n")
-    }
-
+/// Read exactly `count` records from an iterator (for PE R2 synchronization).
+func readExactCount(
+    from iterator: SAMRecordIterator,
+    count: Int,
+    preserveComments: Bool
+) -> [ReadSequence] {
     var reads: [ReadSequence] = []
-    var i = 0
-    while i + 3 < lines.count {
-        let headerLine = lines[i]
-        let seqLine = lines[i + 1]
-        // lines[i + 2] is the '+' line
-        let qualLine = lines[i + 3]
-        i += 4
-
-        guard headerLine.hasPrefix("@") else { continue }
-
-        // Split header: @name comment
-        let header = headerLine.dropFirst() // remove '@'
-        let name: String
-        let comment: String
-        if let spaceIdx = header.firstIndex(where: { $0 == " " || $0 == "\t" }) {
-            name = String(header[header.startIndex..<spaceIdx])
-            comment = String(header[header.index(after: spaceIdx)...])
-        } else {
-            name = String(header)
-            comment = ""
-        }
-
-        reads.append(ReadSequence(
-            name: name, sequence: seqLine, qualityString: qualLine, comment: comment
-        ))
+    reads.reserveCapacity(count)
+    for _ in 0..<count {
+        guard let record = iterator.next() else { break }
+        reads.append(parseBAMRecord(record, preserveComments: preserveComments))
     }
     return reads
 }
 
-// MARK: - Chunked Alignment
-
-/// Align single-end reads in chunks of at most `chunkSize` input bases.
-/// When `chunkSize` is nil, all reads are processed as a single batch.
-func alignSEInChunks(
-    reads: [ReadSequence],
-    chunkSize: Int?,
-    aligner: BWAMemAligner,
-    outputFile: borrowing HTSFile,
-    header: SAMHeader
-) async throws {
-    guard let chunkSize = chunkSize else {
-        try await aligner.alignBatch(reads: reads, outputFile: outputFile, header: header)
-        return
-    }
-    var startIdx = 0
-    while startIdx < reads.count {
-        var basesInChunk = 0
-        var endIdx = startIdx
-        while endIdx < reads.count && basesInChunk < chunkSize {
-            basesInChunk += reads[endIdx].length
-            endIdx += 1
+/// Read interleaved pairs (R1, R2, R1, R2, ...) up to `maxBases` bases (counted from R1).
+func readInterleavedChunk(
+    from iterator: SAMRecordIterator,
+    maxBases: Int,
+    preserveComments: Bool
+) -> ([ReadSequence], [ReadSequence]) {
+    var reads1: [ReadSequence] = []
+    var reads2: [ReadSequence] = []
+    var bases = 0
+    while let r1Record = iterator.next() {
+        guard let r2Record = iterator.next() else {
+            reads1.append(parseBAMRecord(r1Record, preserveComments: preserveComments))
+            break
         }
-        let chunk = Array(reads[startIdx..<endIdx])
-        try await aligner.alignBatch(reads: chunk, outputFile: outputFile, header: header)
-        startIdx = endIdx
+        let r1 = parseBAMRecord(r1Record, preserveComments: preserveComments)
+        let r2 = parseBAMRecord(r2Record, preserveComments: preserveComments)
+        bases += r1.length
+        reads1.append(r1)
+        reads2.append(r2)
+        if bases >= maxBases { break }
     }
-}
-
-/// Align paired-end reads in chunks of at most `chunkSize` input bases (counted from read1).
-/// When `chunkSize` is nil, all reads are processed as a single batch.
-func alignPairedInChunks(
-    reads1: [ReadSequence],
-    reads2: [ReadSequence],
-    chunkSize: Int?,
-    aligner: BWAMemAligner,
-    outputFile: borrowing HTSFile,
-    header: SAMHeader
-) async throws {
-    guard let chunkSize = chunkSize else {
-        try await aligner.alignPairedBatch(
-            reads1: reads1, reads2: reads2,
-            outputFile: outputFile, header: header
-        )
-        return
-    }
-    let pairCount = min(reads1.count, reads2.count)
-    var startIdx = 0
-    while startIdx < pairCount {
-        var basesInChunk = 0
-        var endIdx = startIdx
-        while endIdx < pairCount && basesInChunk < chunkSize {
-            basesInChunk += reads1[endIdx].length
-            endIdx += 1
-        }
-        let chunk1 = Array(reads1[startIdx..<endIdx])
-        let chunk2 = Array(reads2[startIdx..<endIdx])
-        try await aligner.alignPairedBatch(
-            reads1: chunk1, reads2: chunk2,
-            outputFile: outputFile, header: header
-        )
-        startIdx = endIdx
-    }
+    return (reads1, reads2)
 }
