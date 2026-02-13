@@ -246,7 +246,32 @@ public actor BWAMemAligner {
         regions: [MemAlnReg],
         scoringMatrix: [Int8]
     ) -> [CIGARInfo] {
-        let minScore = options.scoring.minOutputScore
+        let scoring = options.scoring
+        let minScore = scoring.minOutputScore
+        let outputAll = (scoring.flag & ScoringParameters.flagAll) != 0
+
+        // When !outputAll, secondaries only appear in the XA tag, which is omitted
+        // entirely when secondary count > maxXAHits. Pre-count to avoid generating
+        // CIGARs that would be thrown away.
+        let skipAllSecondaries: Bool
+        if outputAll {
+            skipAllSecondaries = false
+        } else {
+            var secondaryCount = 0
+            var hasAltSecondary = false
+            for (idx, reg) in regions.enumerated() {
+                if idx > 0 && reg.score < minScore { continue }
+                if reg.secondary >= 0 {
+                    let pi = Int(reg.secondary)
+                    if pi < regions.count && reg.score < regions[pi].score / 2 { continue }
+                    secondaryCount += 1
+                    if reg.isAlt { hasAltSecondary = true }
+                }
+            }
+            let maxXA = hasAltSecondary ? Int(scoring.maxXAHitsAlt) : Int(scoring.maxXAHits)
+            skipAllSecondaries = secondaryCount > maxXA
+        }
+
         return regions.enumerated().map { (idx, reg) -> CIGARInfo in
             // Always generate CIGAR for primary (idx 0) — it's always emitted
             if idx > 0 && reg.score < minScore { return Self.dummyCigar }
@@ -255,6 +280,7 @@ public actor BWAMemAligner {
                 if pi < regions.count && reg.score < regions[pi].score / 2 {
                     return Self.dummyCigar
                 }
+                if idx > 0 && skipAllSecondaries { return Self.dummyCigar }
             }
             return generateCIGAR(read: read, region: reg, scoringMatrix: scoringMatrix)
         }
@@ -708,6 +734,7 @@ public actor BWAMemAligner {
         let skipPairing = (options.scoring.flag & ScoringParameters.flagNoPairing) != 0
         let rgID = options.readGroupID
         let comment = options.appendComment
+        let scoringMat = options.scoring.scoringMatrix()
         for i in 0..<pairCount {
             let read1 = reads1[i]
             let read2 = reads2[i]
@@ -769,6 +796,14 @@ public actor BWAMemAligner {
                 }
                 if decision.idx2 > 0 && decision.idx2 < pairedCigars2.count {
                     pairedCigars2.swapAt(0, decision.idx2)
+                }
+
+                // Regenerate on demand if a promoted secondary had its CIGAR skipped
+                if pairedCigars1[0].cigarString == "*" {
+                    pairedCigars1[0] = generateCIGAR(read: read1, region: pairedRegions1[0], scoringMatrix: scoringMat)
+                }
+                if pairedCigars2[0].cigarString == "*" {
+                    pairedCigars2[0] = generateCIGAR(read: read2, region: pairedRegions2[0], scoringMatrix: scoringMat)
                 }
 
                 let cigar1 = pairedCigars1[0]
