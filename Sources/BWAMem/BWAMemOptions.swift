@@ -33,6 +33,8 @@ public struct BWAMemOptions: Sendable {
     public var manualInsertSize: InsertSizeOverride? = nil
     /// Verbosity level (-v): 1=error, 2=warning, 3=info (default), 4+=debug
     public var verbosity: Int = 3
+    /// Use Metal GPU acceleration for Smith-Waterman kernels
+    public var useGPU: Bool = false
 
     public enum OutputMode: Sendable {
         case sam

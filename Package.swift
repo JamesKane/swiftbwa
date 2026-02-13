@@ -10,6 +10,7 @@ let package = Package(
         .library(name: "Alignment", targets: ["Alignment"]),
         .library(name: "FMIndex", targets: ["FMIndex"]),
         .library(name: "BWACore", targets: ["BWACore"]),
+        .library(name: "MetalSW", targets: ["MetalSW"]),
     ],
     dependencies: [
         .package(path: "../swift-htslib"),
@@ -41,6 +42,14 @@ let package = Package(
             ]
         ),
 
+        // Metal GPU acceleration for Smith-Waterman
+        .target(
+            name: "MetalSW",
+            dependencies: ["BWACore"],
+            resources: [.process("Kernels")],
+            swiftSettings: [.enableExperimentalFeature("StrictConcurrency")]
+        ),
+
         // BWAMem: pipeline orchestration + SAM output
         .target(
             name: "BWAMem",
@@ -48,6 +57,7 @@ let package = Package(
                 "BWACore",
                 "FMIndex",
                 "Alignment",
+                "MetalSW",
                 .product(name: "Htslib", package: "swift-htslib"),
             ],
             swiftSettings: [.enableExperimentalFeature("StrictConcurrency")]
@@ -58,6 +68,7 @@ let package = Package(
             name: "swiftbwa",
             dependencies: [
                 "BWAMem",
+                "MetalSW",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
             swiftSettings: [.enableExperimentalFeature("StrictConcurrency")]
@@ -67,6 +78,7 @@ let package = Package(
         .testTarget(name: "BWACoreTests", dependencies: ["BWACore"]),
         .testTarget(name: "FMIndexTests", dependencies: ["FMIndex"]),
         .testTarget(name: "AlignmentTests", dependencies: ["Alignment"]),
+        .testTarget(name: "MetalSWTests", dependencies: ["MetalSW", "Alignment", "BWACore"]),
         .testTarget(name: "BWAMemTests", dependencies: ["BWAMem", "FMIndex", "Alignment"]),
     ]
 )

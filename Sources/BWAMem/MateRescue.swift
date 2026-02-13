@@ -1,6 +1,9 @@
 import BWACore
 import FMIndex
 import Alignment
+#if canImport(Metal)
+import MetalSW
+#endif
 
 /// Mate rescue: Smith-Waterman alignment of an unmapped mate near the expected
 /// position based on the mapped read and insert size distribution.
@@ -165,6 +168,148 @@ public struct MateRescue: Sendable {
         }
 
         return rescued
+    }
+
+    // MARK: - Batch Candidate Collection (for GPU dispatch)
+
+    /// Metadata for a single rescue SW candidate, used to convert SW results back
+    /// to MemAlnReg coordinates.
+    public struct RescueCandidate: Sendable {
+        public let mateSeq: [UInt8]
+        public let refBases: [UInt8]
+        public let clampedRb: Int64
+        public let isRev: Bool
+        public let rid: Int32
+        public let mateLen: Int64
+    }
+
+    /// Collect rescue SW candidates without executing Smith-Waterman.
+    /// Returns candidates that would be dispatched for a single mate rescue call.
+    public static func collectCandidates(
+        templateRegions: [MemAlnReg],
+        mateRead: ReadSequence,
+        mateRegions: [MemAlnReg],
+        dist: InsertSizeDistribution,
+        genomeLength: Int64,
+        packedRef: PackedReference,
+        metadata: ReferenceMetadata
+    ) -> [RescueCandidate] {
+        guard !templateRegions.isEmpty else { return [] }
+
+        let primaryStats = dist.stats[dist.primaryOrientation.rawValue]
+        guard !primaryStats.failed else { return [] }
+
+        let mateLen = Int64(mateRead.length)
+        var candidates: [RescueCandidate] = []
+        let mateSeqFwd = mateRead.bases
+        let mateSeqRev = mateRead.reverseComplement()
+
+        for a in templateRegions {
+            var allDirectionsSatisfied = true
+
+            for r in 0..<4 {
+                let oriStats = dist.stats[r]
+                guard !oriStats.failed else { continue }
+
+                if hasMateHit(mateRegions: mateRegions, template: a,
+                              direction: r, stats: oriStats, genomeLength: genomeLength) {
+                    continue
+                }
+                allDirectionsSatisfied = false
+
+                let isRev = ((r >> 1) != (r & 1))
+                let isLarger = ((r >> 1) == 0)
+                let pLow = oriStats.properLow
+                let pHigh = oriStats.properHigh
+
+                var rb: Int64
+                var re: Int64
+
+                if !isRev {
+                    if isLarger {
+                        rb = a.rb + pLow
+                        re = a.rb + pHigh + mateLen
+                    } else {
+                        rb = a.rb - pHigh - mateLen
+                        re = a.rb - pLow
+                    }
+                } else {
+                    if isLarger {
+                        rb = a.rb + pLow - mateLen
+                        re = a.rb + pHigh
+                    } else {
+                        rb = a.rb - pHigh
+                        re = a.rb - pLow + mateLen
+                    }
+                }
+
+                rb = max(rb, 0)
+                re = min(re, 2 * genomeLength)
+                guard rb < re else { continue }
+
+                guard let fetched = packedRef.fetchSequence(
+                    bwtBegin: rb, bwtEnd: re,
+                    genomeLength: genomeLength, metadata: metadata
+                ) else { continue }
+                guard fetched.rid == a.rid else { continue }
+
+                candidates.append(RescueCandidate(
+                    mateSeq: isRev ? mateSeqRev : mateSeqFwd,
+                    refBases: fetched.bases,
+                    clampedRb: fetched.clampedBegin,
+                    isRev: isRev,
+                    rid: a.rid,
+                    mateLen: mateLen
+                ))
+            }
+
+            if allDirectionsSatisfied { break }
+        }
+
+        return candidates
+    }
+
+    /// Convert a local SW result and its candidate metadata into a MemAlnReg.
+    /// Returns nil if the score is below minimum.
+    public static func applyResult(
+        candidate: RescueCandidate,
+        score: Int32,
+        queryBegin: Int32,
+        queryEnd: Int32,
+        targetBegin: Int32,
+        targetEnd: Int32,
+        genomeLength: Int64,
+        scoring: ScoringParameters
+    ) -> MemAlnReg? {
+        let minScore = scoring.minSeedLength * scoring.matchScore
+        guard score >= minScore else { return nil }
+
+        var reg = MemAlnReg()
+        reg.score = score
+        reg.trueScore = score
+        reg.rid = candidate.rid
+        reg.secondary = -1
+
+        let tb = Int64(targetBegin)
+        let te = Int64(targetEnd)
+
+        if !candidate.isRev {
+            reg.rb = candidate.clampedRb + tb
+            reg.re = candidate.clampedRb + te + 1
+            reg.qb = queryBegin
+            reg.qe = queryEnd + 1
+        } else {
+            reg.rb = 2 * genomeLength - (candidate.clampedRb + te + 1)
+            reg.re = 2 * genomeLength - (candidate.clampedRb + tb)
+            reg.qb = Int32(candidate.mateLen) - (queryEnd + 1)
+            reg.qe = Int32(candidate.mateLen) - queryBegin
+        }
+
+        let refSpan = te - tb + 1
+        let querySpan = Int64(queryEnd - queryBegin + 1)
+        reg.seedCov = Int32(min(refSpan, querySpan) / 2)
+
+        return reg
     }
 
     // MARK: - Private Helpers

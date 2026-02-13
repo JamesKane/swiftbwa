@@ -4,6 +4,9 @@ import FMIndex
 import BWACore
 import Foundation
 import Htslib
+#if canImport(Metal)
+import MetalSW
+#endif
 
 @main
 struct SwiftBWA: AsyncParsableCommand {
@@ -129,6 +132,9 @@ struct Mem: AsyncParsableCommand {
     @Flag(name: .short, help: "First query file is interleaved paired-end")
     var p: Bool = false
 
+    @Flag(name: .long, help: "Use Metal GPU acceleration for Smith-Waterman")
+    var gpu: Bool = false
+
     @Argument(help: "Index prefix (reference genome)")
     var indexPrefix: String
 
@@ -203,6 +209,7 @@ struct Mem: AsyncParsableCommand {
         options.appendComment = appendComment
         options.outputRefHeader = outputRefHeader
         options.verbosity = v
+        options.useGPU = gpu
         if let bs = batchSize { scoring.chunkSize = bs }
         scoring.reseedLength = y
 
@@ -236,6 +243,19 @@ struct Mem: AsyncParsableCommand {
             fputs("Index loaded: ref_len=\(index.referenceSeqLen), "
                   + "genome_len=\(index.genomeLength), "
                   + "\(index.metadata.numSequences) sequences\n", stderr)
+        }
+
+        // Report GPU status
+        if gpu && v >= 3 {
+            #if canImport(Metal)
+            if let engine = MetalSWEngine.shared {
+                fputs("[GPU] Metal acceleration enabled: \(engine.device.name)\n", stderr)
+            } else {
+                fputs("[GPU] Warning: Metal device not available, falling back to CPU\n", stderr)
+            }
+            #else
+            fputs("[GPU] Warning: Metal not available on this platform, falling back to CPU\n", stderr)
+            #endif
         }
 
         // Output

@@ -2,6 +2,9 @@ import BWACore
 import FMIndex
 import Alignment
 import Htslib
+#if canImport(Metal)
+import MetalSW
+#endif
 #if canImport(Darwin)
 import Darwin
 #elseif canImport(Glibc)
@@ -400,18 +403,29 @@ public actor BWAMemAligner {
             }
         }
 
-        // Phase 2.5+3: Merged rescue + CIGAR pre-computation in one parallel pass.
-        // Eliminates the synchronization barrier between separate rescue and CIGAR phases.
+        // Phase 2.5+3: Rescue + CIGAR pre-computation (merged into one parallel phase).
         var mutableRegions1 = allRegions1
         var mutableRegions2 = allRegions2
         let skipRescue = (options.scoring.flag & ScoringParameters.flagNoRescue) != 0
         let doRescue = !primaryStats.failed && !skipRescue
 
-        // Batch rescue + CIGAR tasks: process multiple pairs per task to reduce
-        // scheduling overhead (500k individual tasks → ~4k batched tasks).
         let maxConcurrencyOut = options.scoring.numThreads
+        #if canImport(Metal)
+        // Larger batches for GPU to amortize Metal command buffer overhead
+        // (~700 rescue candidates per batch → efficient GPU dispatch).
+        let batchSize = (options.useGPU && MetalSWEngine.shared != nil) ? 4096 : 128
+        #else
         let batchSize = 128
+        #endif
         let batchCount = (pairCount + batchSize - 1) / batchSize
+
+        var rescueCount1 = 0, rescueCount2 = 0
+
+        #if canImport(Metal)
+        let gpuEngine: MetalSWEngine? = options.useGPU ? MetalSWEngine.shared : nil
+        #else
+        let gpuEngine: Bool? = nil
+        #endif
 
         typealias PairResult = (Int, [MemAlnReg], [MemAlnReg], [CIGARInfo], [CIGARInfo], Int, Int)
         let mergedResults = await withTaskGroup(
@@ -419,7 +433,6 @@ public actor BWAMemAligner {
             returning: [[PairResult]].self
         ) { group in
             let scoring = options.scoring
-            // Capture arrays for task access (CoW reference counted)
             let capturedReads1 = reads1
             let capturedReads2 = reads2
             let capturedRegs1 = mutableRegions1
@@ -435,27 +448,13 @@ public actor BWAMemAligner {
             ) {
                 let batchEnd = min(batchStart + batchSize, pairCount)
                 group.addTask { [self] in
-                    let mat = scoring.scoringMatrix()
-                    var results: [PairResult] = []
-                    results.reserveCapacity(batchEnd - batchStart)
-                    for idx in batchStart..<batchEnd {
-                        let r1 = capturedReads1[idx]
-                        let r2 = capturedReads2[idx]
-                        var finalRegs1 = capturedRegs1[idx]
-                        var finalRegs2 = capturedRegs2[idx]
-                        var rc1 = 0, rc2 = 0
-                        if doRescue {
-                            let (_, rr1, rr2, c1, c2) = self.rescuePair(
-                                idx: idx, regions1: finalRegs1, regions2: finalRegs2,
-                                read1: r1, read2: r2, dist: dist, scoring: scoring
-                            )
-                            finalRegs1 = rr1; finalRegs2 = rr2; rc1 = c1; rc2 = c2
-                        }
-                        let cig1 = self.generateFilteredCIGARs(read: r1, regions: finalRegs1, scoringMatrix: mat)
-                        let cig2 = self.generateFilteredCIGARs(read: r2, regions: finalRegs2, scoringMatrix: mat)
-                        results.append((idx, finalRegs1, finalRegs2, cig1, cig2, rc1, rc2))
-                    }
-                    return results
+                    self.processRescueCIGARBatch(
+                        batchStart: batchStart, batchEnd: batchEnd,
+                        reads1: capturedReads1, reads2: capturedReads2,
+                        regs1: capturedRegs1, regs2: capturedRegs2,
+                        doRescue: doRescue, dist: dist, scoring: scoring,
+                        gpuEngine: gpuEngine
+                    )
                 }
             }
 
@@ -473,12 +472,11 @@ public actor BWAMemAligner {
                 }
             }
 
-            return collected  // No sort needed: unpacking uses idx-based placement
+            return collected
         }
 
-        // Unpack merged results (batched)
+        // Unpack merged results
         var allCigars = Array(repeating: ([CIGARInfo](), [CIGARInfo]()), count: pairCount)
-        var rescueCount1 = 0, rescueCount2 = 0
         for batch in mergedResults {
             for (idx, regs1, regs2, cig1, cig2, rc1, rc2) in batch {
                 mutableRegions1[idx] = regs1
@@ -877,6 +875,193 @@ public actor BWAMemAligner {
 
         // Ensure the promoted region is marked as primary
         regions[0].secondary = -1
+    }
+
+    /// Process a batch of pairs: rescue (CPU or GPU) + CIGAR generation.
+    /// When gpuEngine is available, collects all rescue candidates for the batch,
+    /// dispatches 2 GPU batches (read2 then read1), applies results, then generates CIGARs.
+    /// This allows GPU rescue and CPU CIGAR generation to overlap across concurrent batches.
+    nonisolated private func processRescueCIGARBatch(
+        batchStart: Int, batchEnd: Int,
+        reads1: [ReadSequence], reads2: [ReadSequence],
+        regs1: [[MemAlnReg]], regs2: [[MemAlnReg]],
+        doRescue: Bool, dist: InsertSizeDistribution,
+        scoring: ScoringParameters,
+        gpuEngine: Any?
+    ) -> [(Int, [MemAlnReg], [MemAlnReg], [CIGARInfo], [CIGARInfo], Int, Int)] {
+        let mat = scoring.scoringMatrix()
+        let count = batchEnd - batchStart
+        var finalRegs1 = (batchStart..<batchEnd).map { regs1[$0] }
+        var finalRegs2 = (batchStart..<batchEnd).map { regs2[$0] }
+        var rescueCounts1 = [Int](repeating: 0, count: count)
+        var rescueCounts2 = [Int](repeating: 0, count: count)
+
+        if doRescue {
+            #if canImport(Metal)
+            if let engine = gpuEngine as? MetalSWEngine {
+                // GPU per-batch rescue: collect candidates, dispatch, apply
+                let genomeLen = index.genomeLength
+
+                // --- Rescue read2 from read1 templates ---
+                var allCands2: [MateRescue.RescueCandidate] = []
+                var candRanges2 = [(start: Int, count: Int)](repeating: (0, 0), count: count)
+                for li in 0..<count {
+                    let gi = batchStart + li
+                    let templates = Self.selectRescueCandidates(finalRegs1[li], scoring: scoring)
+                    guard !templates.isEmpty else { continue }
+                    let cands = MateRescue.collectCandidates(
+                        templateRegions: templates,
+                        mateRead: reads2[gi],
+                        mateRegions: finalRegs2[li],
+                        dist: dist,
+                        genomeLength: genomeLen,
+                        packedRef: index.packedRef,
+                        metadata: index.metadata
+                    )
+                    if !cands.isEmpty {
+                        candRanges2[li] = (start: allCands2.count, count: cands.count)
+                        allCands2.append(contentsOf: cands)
+                    }
+                }
+
+                if !allCands2.isEmpty {
+                    let tasks = allCands2.map {
+                        LocalSWTask(query: $0.mateSeq, target: $0.refBases, scoring: scoring)
+                    }
+                    let gpuResults = LocalSWDispatcher.dispatchBatch(tasks: tasks, engine: engine)
+                    for li in 0..<count {
+                        let r = candRanges2[li]
+                        for j in 0..<r.count {
+                            let ci = r.start + j
+                            let cand = allCands2[ci]
+                            let sw: (score: Int32, qb: Int32, qe: Int32, tb: Int32, te: Int32)?
+                            if let g = gpuResults[ci] {
+                                sw = (g.score, g.queryBegin, g.queryEnd, g.targetBegin, g.targetEnd)
+                            } else if let c = LocalSWAligner.align(
+                                query: cand.mateSeq, target: cand.refBases,
+                                scoring: scoring, scoringMatrix: mat
+                            ) {
+                                sw = (c.score, c.queryBegin, c.queryEnd, c.targetBegin, c.targetEnd)
+                            } else { sw = nil }
+                            if let sw = sw, let reg = MateRescue.applyResult(
+                                candidate: cand, score: sw.score,
+                                queryBegin: sw.qb, queryEnd: sw.qe,
+                                targetBegin: sw.tb, targetEnd: sw.te,
+                                genomeLength: genomeLen, scoring: scoring
+                            ) {
+                                finalRegs2[li].append(reg)
+                                rescueCounts2[li] += 1
+                            }
+                        }
+                    }
+                }
+
+                // --- Rescue read1 from (updated) read2 templates ---
+                var allCands1: [MateRescue.RescueCandidate] = []
+                var candRanges1 = [(start: Int, count: Int)](repeating: (0, 0), count: count)
+                for li in 0..<count {
+                    let gi = batchStart + li
+                    let templates = Self.selectRescueCandidates(finalRegs2[li], scoring: scoring)
+                    guard !templates.isEmpty else { continue }
+                    let cands = MateRescue.collectCandidates(
+                        templateRegions: templates,
+                        mateRead: reads1[gi],
+                        mateRegions: finalRegs1[li],
+                        dist: dist,
+                        genomeLength: genomeLen,
+                        packedRef: index.packedRef,
+                        metadata: index.metadata
+                    )
+                    if !cands.isEmpty {
+                        candRanges1[li] = (start: allCands1.count, count: cands.count)
+                        allCands1.append(contentsOf: cands)
+                    }
+                }
+
+                if !allCands1.isEmpty {
+                    let tasks = allCands1.map {
+                        LocalSWTask(query: $0.mateSeq, target: $0.refBases, scoring: scoring)
+                    }
+                    let gpuResults = LocalSWDispatcher.dispatchBatch(tasks: tasks, engine: engine)
+                    for li in 0..<count {
+                        let r = candRanges1[li]
+                        for j in 0..<r.count {
+                            let ci = r.start + j
+                            let cand = allCands1[ci]
+                            let sw: (score: Int32, qb: Int32, qe: Int32, tb: Int32, te: Int32)?
+                            if let g = gpuResults[ci] {
+                                sw = (g.score, g.queryBegin, g.queryEnd, g.targetBegin, g.targetEnd)
+                            } else if let c = LocalSWAligner.align(
+                                query: cand.mateSeq, target: cand.refBases,
+                                scoring: scoring, scoringMatrix: mat
+                            ) {
+                                sw = (c.score, c.queryBegin, c.queryEnd, c.targetBegin, c.targetEnd)
+                            } else { sw = nil }
+                            if let sw = sw, let reg = MateRescue.applyResult(
+                                candidate: cand, score: sw.score,
+                                queryBegin: sw.qb, queryEnd: sw.qe,
+                                targetBegin: sw.tb, targetEnd: sw.te,
+                                genomeLength: genomeLen, scoring: scoring
+                            ) {
+                                finalRegs1[li].append(reg)
+                                rescueCounts1[li] += 1
+                            }
+                        }
+                    }
+                }
+
+                // Re-mark secondaries after rescue
+                for li in 0..<count {
+                    let gi = batchStart + li
+                    let peId1 = (UInt64(gi) &<< 1) | 0
+                    let peId2 = (UInt64(gi) &<< 1) | 1
+                    if finalRegs1[li].count > 1 {
+                        ChainFilter.markSecondary(
+                            regions: &finalRegs1[li], maskLevel: scoring.maskLevel, readId: peId1
+                        )
+                    }
+                    if finalRegs2[li].count > 1 {
+                        ChainFilter.markSecondary(
+                            regions: &finalRegs2[li], maskLevel: scoring.maskLevel, readId: peId2
+                        )
+                    }
+                }
+            } else {
+                // CPU per-pair rescue
+                for li in 0..<count {
+                    let gi = batchStart + li
+                    let (_, rr1, rr2, c1, c2) = rescuePair(
+                        idx: gi, regions1: finalRegs1[li], regions2: finalRegs2[li],
+                        read1: reads1[gi], read2: reads2[gi], dist: dist, scoring: scoring
+                    )
+                    finalRegs1[li] = rr1; finalRegs2[li] = rr2
+                    rescueCounts1[li] = c1; rescueCounts2[li] = c2
+                }
+            }
+            #else
+            for li in 0..<count {
+                let gi = batchStart + li
+                let (_, rr1, rr2, c1, c2) = rescuePair(
+                    idx: gi, regions1: finalRegs1[li], regions2: finalRegs2[li],
+                    read1: reads1[gi], read2: reads2[gi], dist: dist, scoring: scoring
+                )
+                finalRegs1[li] = rr1; finalRegs2[li] = rr2
+                rescueCounts1[li] = c1; rescueCounts2[li] = c2
+            }
+            #endif
+        }
+
+        // CIGAR generation
+        var results: [(Int, [MemAlnReg], [MemAlnReg], [CIGARInfo], [CIGARInfo], Int, Int)] = []
+        results.reserveCapacity(count)
+        for li in 0..<count {
+            let gi = batchStart + li
+            let cig1 = generateFilteredCIGARs(read: reads1[gi], regions: finalRegs1[li], scoringMatrix: mat)
+            let cig2 = generateFilteredCIGARs(read: reads2[gi], regions: finalRegs2[li], scoringMatrix: mat)
+            results.append((gi, finalRegs1[li], finalRegs2[li], cig1, cig2,
+                            rescueCounts1[li], rescueCounts2[li]))
+        }
+        return results
     }
 
     /// Rescue a single pair: rescue read2 from read1's templates, then read1 from

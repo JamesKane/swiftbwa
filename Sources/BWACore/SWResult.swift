@@ -1,5 +1,3 @@
-import BWACore
-
 /// Result of a banded Smith-Waterman extension.
 public struct SWResult: Sendable, Equatable {
     /// Best alignment score
