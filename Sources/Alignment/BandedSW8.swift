@@ -42,13 +42,20 @@ public struct BandedSW8: Sendable {
         let bias = UInt8(scoring.mismatchPenalty)
         let zeroVec = SIMD16<UInt8>(repeating: 0)
 
-        // Build striped query profile (with bias added to keep values unsigned)
-        var profile = [[SIMD16<UInt8>]](
-            repeating: [SIMD16<UInt8>](repeating: zeroVec, count: stripeCount),
-            count: m
-        )
+        // Single allocation for all DP arrays:
+        // profile: m * stripeCount, H: stripeCount, E: stripeCount
+        let totalVecs = m * stripeCount + stripeCount + stripeCount
+        let mem = UnsafeMutablePointer<SIMD16<UInt8>>.allocate(capacity: totalVecs)
+        mem.initialize(repeating: zeroVec, count: totalVecs)
+        defer { mem.deallocate() }
 
+        let profile = mem                                        // [0 ..< m*stripeCount]
+        let H = mem.advanced(by: m * stripeCount)                // [m*stripeCount ..< m*stripeCount + stripeCount]
+        let E = mem.advanced(by: m * stripeCount + stripeCount)  // [... + stripeCount ..< totalVecs]
+
+        // Build striped query profile (with bias added to keep values unsigned)
         for k in 0..<m {
+            let profK = profile.advanced(by: k * stripeCount)
             for s in 0..<stripeCount {
                 var vec = SIMD16<UInt8>(repeating: 0)
                 for lane in 0..<lanes {
@@ -58,14 +65,11 @@ public struct BandedSW8: Sendable {
                         vec[lane] = UInt8(clamping: Int(sc) + Int(bias))
                     }
                 }
-                profile[k][s] = vec
+                profK[s] = vec
             }
         }
 
         // Initialize H: H[position p] = max(0, h0 - oIns - eIns*(p+1)) for p+1 <= w
-        var H = [SIMD16<UInt8>](repeating: zeroVec, count: stripeCount)
-        var E = [SIMD16<UInt8>](repeating: zeroVec, count: stripeCount)
-
         for s in 0..<stripeCount {
             var vec = SIMD16<UInt8>(repeating: 0)
             for lane in 0..<lanes {
@@ -94,7 +98,7 @@ public struct BandedSW8: Sendable {
 
         for i in 0..<tlen {
             let targetBase = Int(target[i])
-            let prof = profile[targetBase]
+            let prof = profile.advanced(by: targetBase * stripeCount)
 
             // Diagonal: shifted H from previous row's last stripe
             var vH = shiftLanesRight(H[stripeCount - 1])

@@ -31,13 +31,22 @@ public struct BandedSW16: Sendable {
         let eDel = scoring.gapExtendPenaltyDeletion
         let zDrop = scoring.zDrop
 
-        // Build striped query profile
-        var profile = [[SIMD8<Int16>]](
-            repeating: [SIMD8<Int16>](repeating: .zero, count: stripeCount),
-            count: m
-        )
+        let zero = SIMD8<Int16>(repeating: 0)
 
+        // Single allocation for all DP arrays:
+        // profile: m * stripeCount, H: stripeCount, E: stripeCount
+        let totalVecs = m * stripeCount + stripeCount + stripeCount
+        let mem = UnsafeMutablePointer<SIMD8<Int16>>.allocate(capacity: totalVecs)
+        mem.initialize(repeating: zero, count: totalVecs)
+        defer { mem.deallocate() }
+
+        let profile = mem                                        // [0 ..< m*stripeCount]
+        let H = mem.advanced(by: m * stripeCount)                // [m*stripeCount ..< m*stripeCount + stripeCount]
+        let E = mem.advanced(by: m * stripeCount + stripeCount)  // [... + stripeCount ..< totalVecs]
+
+        // Build striped query profile
         for k in 0..<m {
+            let profK = profile.advanced(by: k * stripeCount)
             for s in 0..<stripeCount {
                 var vec = SIMD8<Int16>(repeating: 0)
                 for lane in 0..<lanes {
@@ -46,15 +55,11 @@ public struct BandedSW16: Sendable {
                         vec[lane] = Int16(mat[k * m + Int(query[j])])
                     }
                 }
-                profile[k][s] = vec
+                profK[s] = vec
             }
         }
 
         // Initialize H: H[position p] = max(0, h0 - oIns - eIns*(p+1)) for p+1 <= w
-        // These serve as diagonals for the first target row and as H_prev for E.
-        var H = [SIMD8<Int16>](repeating: .zero, count: stripeCount)
-        var E = [SIMD8<Int16>](repeating: .zero, count: stripeCount)
-
         for s in 0..<stripeCount {
             var vec = SIMD8<Int16>(repeating: 0)
             for lane in 0..<lanes {
@@ -71,7 +76,6 @@ public struct BandedSW16: Sendable {
         let eInsVec = SIMD8<Int16>(repeating: Int16(eIns))
         let oDelVec = SIMD8<Int16>(repeating: Int16(oDel))
         let eDelVec = SIMD8<Int16>(repeating: Int16(eDel))
-        let zero = SIMD8<Int16>(repeating: 0)
 
         var maxScore: Int32 = h0
         var maxI: Int32 = -1
@@ -83,7 +87,7 @@ public struct BandedSW16: Sendable {
 
         for i in 0..<tlen {
             let targetBase = Int(target[i])
-            let prof = profile[targetBase]
+            let prof = profile.advanced(by: targetBase * stripeCount)
 
             // Diagonal: shifted H from previous row's last stripe
             var vH = shiftLanesRight(H[stripeCount - 1])
