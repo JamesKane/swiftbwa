@@ -145,16 +145,33 @@ public struct SAMOutputBuilder: Sendable {
         var seqStr: String
         var qualStr: String
 
-        let fullSeq = read.bases.map { b -> Character in
-            switch b {
-            case 0: return "A"
-            case 1: return "C"
-            case 2: return "G"
-            case 3: return "T"
-            default: return "N"
+        // SAM spec: when FLAG 0x10, SEQ = reverse complement, QUAL = reversed
+        let isReverse = flag.contains(.reverse)
+        let fullSeq: [Character]
+        let fullQual: [Character]
+        if isReverse {
+            fullSeq = read.bases.reversed().map { b -> Character in
+                switch b {
+                case 0: return "T"  // complement of A
+                case 1: return "G"  // complement of C
+                case 2: return "C"  // complement of G
+                case 3: return "A"  // complement of T
+                default: return "N"
+                }
             }
+            fullQual = read.qualities.reversed().map { Character(UnicodeScalar($0 + 33)) }
+        } else {
+            fullSeq = read.bases.map { b -> Character in
+                switch b {
+                case 0: return "A"
+                case 1: return "C"
+                case 2: return "G"
+                case 3: return "T"
+                default: return "N"
+                }
+            }
+            fullQual = read.qualities.map { Character(UnicodeScalar($0 + 33)) }
         }
-        let fullQual = read.qualities.map { Character(UnicodeScalar($0 + 33)) }
 
         if isSupplementary && (scoring.flag & ScoringParameters.flagSoftClip) == 0 {
             let (hardCigar, trimLeft, trimRight) = convertToHardClip(cigar: cigar)
