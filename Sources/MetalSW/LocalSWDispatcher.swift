@@ -32,7 +32,7 @@ public struct LocalSWDispatcher: Sendable {
     public static func dispatchBatch(
         tasks: [LocalSWTask],
         engine: MetalSWEngine
-    ) -> [LocalSWResult?] {
+    ) async -> [LocalSWResult?] {
         guard !tasks.isEmpty else {
             return Array(repeating: nil, count: tasks.count)
         }
@@ -51,9 +51,9 @@ public struct LocalSWDispatcher: Sendable {
         // Forward pass
         let fwdResults: [LocalSWPassResult?]
         if useWavefront {
-            fwdResults = dispatchPassWavefront(tasks: tasks, pipeline: pipeline, engine: engine)
+            fwdResults = await dispatchPassWavefront(tasks: tasks, pipeline: pipeline, engine: engine)
         } else {
-            fwdResults = dispatchPass(tasks: tasks, pipeline: pipeline, engine: engine)
+            fwdResults = await dispatchPass(tasks: tasks, pipeline: pipeline, engine: engine)
         }
 
         // Build reverse tasks for start position recovery
@@ -87,9 +87,9 @@ public struct LocalSWDispatcher: Sendable {
         let revResults: [LocalSWPassResult?]
         if !revBatch.isEmpty {
             if useWavefront {
-                revResults = dispatchPassWavefront(tasks: revBatch, pipeline: pipeline, engine: engine)
+                revResults = await dispatchPassWavefront(tasks: revBatch, pipeline: pipeline, engine: engine)
             } else {
-                revResults = dispatchPass(tasks: revBatch, pipeline: pipeline, engine: engine)
+                revResults = await dispatchPass(tasks: revBatch, pipeline: pipeline, engine: engine)
             }
         } else {
             revResults = []
@@ -121,7 +121,7 @@ public struct LocalSWDispatcher: Sendable {
         tasks: [LocalSWTask],
         pipeline: MTLComputePipelineState,
         engine: MetalSWEngine
-    ) -> [LocalSWPassResult?] {
+    ) async -> [LocalSWPassResult?] {
         let taskCount = tasks.count
 
         var allQueries: [UInt8] = []
@@ -208,8 +208,12 @@ public struct LocalSWDispatcher: Sendable {
         )
         encoder.endEncoding()
 
-        cmdBuf.commit()
-        cmdBuf.waitUntilCompleted()
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            cmdBuf.addCompletedHandler { _ in
+                continuation.resume()
+            }
+            cmdBuf.commit()
+        }
 
         var results: [LocalSWPassResult?] = []
         results.reserveCapacity(taskCount)
@@ -238,7 +242,7 @@ public struct LocalSWDispatcher: Sendable {
         tasks: [LocalSWTask],
         pipeline: MTLComputePipelineState,
         engine: MetalSWEngine
-    ) -> [LocalSWPassResult?] {
+    ) async -> [LocalSWPassResult?] {
         let taskCount = tasks.count
 
         var allQueries: [UInt8] = []
@@ -331,8 +335,12 @@ public struct LocalSWDispatcher: Sendable {
         encoder.dispatchThreads(gridSize, threadsPerThreadgroup: tgSize)
         encoder.endEncoding()
 
-        cmdBuf.commit()
-        cmdBuf.waitUntilCompleted()
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            cmdBuf.addCompletedHandler { _ in
+                continuation.resume()
+            }
+            cmdBuf.commit()
+        }
 
         var results: [LocalSWPassResult?] = []
         results.reserveCapacity(taskCount)

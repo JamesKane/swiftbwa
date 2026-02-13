@@ -688,7 +688,7 @@ public actor BWAMemAligner {
             ) {
                 let batchEnd = min(batchStart + batchSize, pairCount)
                 group.addTask { [self] in
-                    self.processRescueCIGARBatch(
+                    await self.processRescueCIGARBatch(
                         batchStart: batchStart, batchEnd: batchEnd,
                         reads1: capturedReads1, reads2: capturedReads2,
                         regs1: capturedRegs1, regs2: capturedRegs2,
@@ -1137,7 +1137,7 @@ public actor BWAMemAligner {
         doRescue: Bool, dist: InsertSizeDistribution,
         scoring: ScoringParameters,
         gpuEngine: Any?
-    ) -> [(Int, [MemAlnReg], [MemAlnReg], [CIGARInfo], [CIGARInfo], Int, Int)] {
+    ) async -> [(Int, [MemAlnReg], [MemAlnReg], [CIGARInfo], [CIGARInfo], Int, Int)] {
         let mat = scoring.scoringMatrix()
         let count = batchEnd - batchStart
         var finalRegs1 = (batchStart..<batchEnd).map { regs1[$0] }
@@ -1201,7 +1201,7 @@ public actor BWAMemAligner {
                     let tasks = allCands.map {
                         LocalSWTask(query: $0.mateSeq, target: $0.refBases, scoring: scoring)
                     }
-                    let gpuResults = LocalSWDispatcher.dispatchBatch(tasks: tasks, engine: engine)
+                    let gpuResults = await LocalSWDispatcher.dispatchBatch(tasks: tasks, engine: engine)
 
                     // Apply direction 1 results: rescue R2
                     for li in 0..<count {
