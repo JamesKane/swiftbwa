@@ -309,29 +309,34 @@ struct Mem: AsyncParsableCommand {
             var totalPairs = 0
             var totalBases = 0
             if v >= 3 { fputs("Aligning interleaved paired-end...\n", stderr) }
-            while true {
-                let (chunk1, chunk2) = readInterleavedChunk(
-                    from: iter, maxBases: chunkBases,
-                    preserveComments: appendComment
-                )
-                if chunk1.isEmpty { break }
-                guard chunk1.count == chunk2.count else {
+            var (currentChunk1, currentChunk2) = readInterleavedChunk(
+                from: iter, maxBases: chunkBases,
+                preserveComments: appendComment
+            )
+            while !currentChunk1.isEmpty {
+                guard currentChunk1.count == currentChunk2.count else {
                     throw BWAError.fileIOError(
                         "Interleaved FASTQ has odd number of records"
                     )
                 }
-                totalPairs += chunk1.count
-                totalBases += chunk1.reduce(0) { $0 + $1.length }
-                    + chunk2.reduce(0) { $0 + $1.length }
+                totalPairs += currentChunk1.count
+                totalBases += currentChunk1.reduce(0) { $0 + $1.length }
+                    + currentChunk2.reduce(0) { $0 + $1.length }
                 if v >= 3 {
                     fputs("[M::main] Processed \(totalPairs) pairs "
                         + "(\(String(format: "%.1f", Double(totalBases) / 1_000_000))M bases)\n",
                         stderr)
                 }
+                nonisolated(unsafe) let prefetchIter = iter
+                async let nextChunks = readInterleavedChunk(
+                    from: prefetchIter, maxBases: chunkBases,
+                    preserveComments: appendComment
+                )
                 try await aligner.alignPairedBatch(
-                    reads1: chunk1, reads2: chunk2,
+                    reads1: currentChunk1, reads2: currentChunk2,
                     outputFile: outFile, header: header
                 )
+                (currentChunk1, currentChunk2) = await nextChunks
             }
         } else if options.isPairedEnd {
             // Two-file paired-end mode: stream from both files
@@ -344,33 +349,35 @@ struct Mem: AsyncParsableCommand {
             var totalPairs = 0
             var totalBases = 0
             if v >= 3 { fputs("Aligning paired-end...\n", stderr) }
-            while true {
-                let chunk1 = readChunk(
-                    from: iter1, maxBases: chunkBases,
-                    preserveComments: appendComment
-                )
-                if chunk1.isEmpty { break }
-                let chunk2 = readExactCount(
-                    from: iter2, count: chunk1.count,
-                    preserveComments: appendComment
-                )
-                guard chunk2.count == chunk1.count else {
+            var (currentChunk1, currentChunk2) = readPEChunks(
+                from: iter1, and: iter2,
+                maxBases: chunkBases, preserveComments: appendComment
+            )
+            while !currentChunk1.isEmpty {
+                guard currentChunk2.count == currentChunk1.count else {
                     throw BWAError.fileIOError(
                         "R1 and R2 have different read counts"
                     )
                 }
-                totalPairs += chunk1.count
-                totalBases += chunk1.reduce(0) { $0 + $1.length }
-                    + chunk2.reduce(0) { $0 + $1.length }
+                totalPairs += currentChunk1.count
+                totalBases += currentChunk1.reduce(0) { $0 + $1.length }
+                    + currentChunk2.reduce(0) { $0 + $1.length }
                 if v >= 3 {
                     fputs("[M::main] Processed \(totalPairs) pairs "
                         + "(\(String(format: "%.1f", Double(totalBases) / 1_000_000))M bases)\n",
                         stderr)
                 }
+                nonisolated(unsafe) let prefetchIter1 = iter1
+                nonisolated(unsafe) let prefetchIter2 = iter2
+                async let nextChunks = readPEChunks(
+                    from: prefetchIter1, and: prefetchIter2,
+                    maxBases: chunkBases, preserveComments: appendComment
+                )
                 try await aligner.alignPairedBatch(
-                    reads1: chunk1, reads2: chunk2,
+                    reads1: currentChunk1, reads2: currentChunk2,
                     outputFile: outFile, header: header
                 )
+                (currentChunk1, currentChunk2) = await nextChunks
             }
         } else {
             // Single-end mode: stream from one file
@@ -380,22 +387,27 @@ struct Mem: AsyncParsableCommand {
             var totalReads = 0
             var totalBases = 0
             if v >= 3 { fputs("Aligning...\n", stderr) }
-            while true {
-                let chunk = readChunk(
-                    from: iter, maxBases: chunkBases,
-                    preserveComments: appendComment
-                )
-                if chunk.isEmpty { break }
-                totalReads += chunk.count
-                totalBases += chunk.reduce(0) { $0 + $1.length }
+            var currentChunk = readChunk(
+                from: iter, maxBases: chunkBases,
+                preserveComments: appendComment
+            )
+            while !currentChunk.isEmpty {
+                totalReads += currentChunk.count
+                totalBases += currentChunk.reduce(0) { $0 + $1.length }
                 if v >= 3 {
                     fputs("[M::main] Processed \(totalReads) reads "
                         + "(\(String(format: "%.1f", Double(totalBases) / 1_000_000))M bases)\n",
                         stderr)
                 }
-                try await aligner.alignBatch(
-                    reads: chunk, outputFile: outFile, header: header
+                nonisolated(unsafe) let prefetchIter = iter
+                async let nextChunk = readChunk(
+                    from: prefetchIter, maxBases: chunkBases,
+                    preserveComments: appendComment
                 )
+                try await aligner.alignBatch(
+                    reads: currentChunk, outputFile: outFile, header: header
+                )
+                currentChunk = await nextChunk
             }
         }
 
@@ -459,6 +471,17 @@ func readExactCount(
         reads.append(parseBAMRecord(record, preserveComments: preserveComments))
     }
     return reads
+}
+
+/// Read a paired-end chunk from two files atomically (R1 by bases, R2 by exact count).
+func readPEChunks(
+    from iter1: SAMRecordIterator, and iter2: SAMRecordIterator,
+    maxBases: Int, preserveComments: Bool
+) -> ([ReadSequence], [ReadSequence]) {
+    let c1 = readChunk(from: iter1, maxBases: maxBases, preserveComments: preserveComments)
+    if c1.isEmpty { return ([], []) }
+    let c2 = readExactCount(from: iter2, count: c1.count, preserveComments: preserveComments)
+    return (c1, c2)
 }
 
 /// Read interleaved pairs (R1, R2, R1, R2, ...) up to `maxBases` bases (counted from R1).
