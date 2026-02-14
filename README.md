@@ -112,4 +112,4 @@ swift test --filter "FMIndexTests/testSMEM"   # Single test
 
 ## License
 
-BSD 3-Clause
+[BSD 3-Clause](LICENSE.md)
