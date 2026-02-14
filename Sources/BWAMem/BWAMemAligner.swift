@@ -235,13 +235,15 @@ public actor BWAMemAligner {
 
     /// Phase 1.5-3: Re-seeding (if needed) + chaining + filtering from pre-computed SMEMs.
     /// Used by GPU seeding path where phase 1 (SMEM finding) was done on GPU.
-    nonisolated func alignReadPhase1_5to3(_ read: ReadSequence, gpuSMEMs: [SMEM]) -> [MemChain] {
+    nonisolated func alignReadPhase1_5to3(_ read: ReadSequence, gpuSMEMs: [SMEM], internalReseedDone: Bool = false) -> [MemChain] {
         let scoring = options.scoring
         var smems = gpuSMEMs
         guard !smems.isEmpty else { return [] }
 
-        // Internal seeding for GPU-computed SMEMs
-        internalReseed(smems: &smems, read: read, scoring: scoring)
+        // Internal seeding for GPU-computed SMEMs (skip if already done on GPU)
+        if !internalReseedDone {
+            internalReseed(smems: &smems, read: read, scoring: scoring)
+        }
 
         // Phase 1.5: Re-seeding (-y) — runs on CPU for high-occ seeds
         if scoring.reseedLength > 0 {
@@ -812,11 +814,23 @@ public actor BWAMemAligner {
                 queries: queries,
                 engine: engine
             )
-            let gpuSMEMs = SMEMDispatcher.extractSMEMs(
+            var gpuSMEMs = SMEMDispatcher.extractSMEMs(
                 from: fwdResults,
                 queries: queries,
                 minSeedLen: scoring.minSeedLength
             )
+
+            // GPU internal reseeding
+            let reseedTasks0 = InternalReseedDispatcher.buildTasks(
+                allSMEMs: gpuSMEMs, scoring: scoring)
+            if !reseedTasks0.isEmpty,
+               let reseedHandle0 = InternalReseedDispatcher.dispatchBatchAsync(
+                   tasks: reseedTasks0, reads: batchReads,
+                   scoring: scoring, engine: engine)
+            {
+                InternalReseedDispatcher.collectAndMerge(
+                    handle: reseedHandle0, allSMEMs: &gpuSMEMs)
+            }
 
             // Phases 1.5-5 + CIGAR + classify: parallel per-read on CPU
             let batchResults = await withTaskGroup(
@@ -833,7 +847,7 @@ public actor BWAMemAligner {
                     let smems = gpuSMEMs[idx]
                     let gi = capturedBatchStart + idx
                     group.addTask { [self] in
-                        let chains = self.alignReadPhase1_5to3(read, gpuSMEMs: smems)
+                        let chains = self.alignReadPhase1_5to3(read, gpuSMEMs: smems, internalReseedDone: true)
                         guard !chains.isEmpty else {
                             let specs = self.classifyAlignments(
                                 read: read, regions: [], readIsRead1: true,
@@ -1439,7 +1453,6 @@ public actor BWAMemAligner {
             if let engine = gpuEngine as? MetalSWEngine {
                 // GPU per-batch rescue: collect candidates, dispatch, apply
                 let genomeLen = index.genomeLength
-
                 // --- Collect ALL rescue candidates (both directions) upfront ---
                 var allCands: [MateRescue.RescueCandidate] = []
                 var candRanges2 = [(start: Int, count: Int)](repeating: (0, 0), count: count)
@@ -1867,11 +1880,19 @@ public actor BWAMemAligner {
                     )
                 }
             }
-            let gpuSMEMs = SMEMDispatcher.extractSMEMs(
+            var gpuSMEMs = SMEMDispatcher.extractSMEMs(
                 from: fwdResults,
                 queries: queries,
                 minSeedLen: scoring.minSeedLength
             )
+
+            // GPU internal reseeding: dispatch async, collect after next batch is queued
+            let reseedTasks1 = InternalReseedDispatcher.buildTasks(
+                allSMEMs: gpuSMEMs, scoring: scoring)
+            let reseedHandle1: InternalReseedHandle? = reseedTasks1.isEmpty ? nil :
+                InternalReseedDispatcher.dispatchBatchAsync(
+                    tasks: reseedTasks1, reads: batchReads,
+                    scoring: scoring, engine: engine)
 
             // Immediately dispatch NEXT batch to GPU (non-blocking) so it runs
             // concurrently with the CPU extension of the current batch below.
@@ -1885,6 +1906,12 @@ public actor BWAMemAligner {
                 nextQueries = nextBatchReads.map { $0.bases }
                 nextHandle = SMEMDispatcher.dispatchBatchAsync(
                     queries: nextQueries, engine: engine)
+            }
+
+            // Now collect internal reseed results
+            if let rh = reseedHandle1 {
+                InternalReseedDispatcher.collectAndMerge(
+                    handle: rh, allSMEMs: &gpuSMEMs)
             }
 
             // Phases 1.5-5: parallel per-read on CPU (overlaps with GPU running next batch)
@@ -1904,7 +1931,7 @@ public actor BWAMemAligner {
                     let gi = capturedBatchStart + idx
                     let readId = idShift ? (UInt64(gi) &<< 1) | idBase : UInt64(gi)
                     group.addTask { [self] in
-                        let chains = self.alignReadPhase1_5to3(read, gpuSMEMs: smems)
+                        let chains = self.alignReadPhase1_5to3(read, gpuSMEMs: smems, internalReseedDone: true)
                         guard !chains.isEmpty else { return (idx, []) }
 
                         var regions: [MemAlnReg] = []
@@ -1934,7 +1961,7 @@ public actor BWAMemAligner {
                         let gi = capturedBatchStart + idx
                         let readId = idShift ? (UInt64(gi) &<< 1) | idBase : UInt64(gi)
                         group.addTask { [self] in
-                            let chains = self.alignReadPhase1_5to3(read, gpuSMEMs: smems)
+                            let chains = self.alignReadPhase1_5to3(read, gpuSMEMs: smems, internalReseedDone: true)
                             guard !chains.isEmpty else { return (idx, []) }
 
                             var regions: [MemAlnReg] = []
@@ -2137,13 +2164,22 @@ public actor BWAMemAligner {
                     )
                 }
             }
-            let gpuSMEMs = SMEMDispatcher.extractSMEMs(
+            var gpuSMEMs = SMEMDispatcher.extractSMEMs(
                 from: fwdResults,
                 queries: queries,
                 minSeedLen: scoring.minSeedLength
             )
 
-            // Immediately dispatch NEXT batch to GPU (non-blocking)
+            // GPU internal reseeding: dispatch async, collect after next batch is queued
+            let reseedTasks2 = InternalReseedDispatcher.buildTasks(
+                allSMEMs: gpuSMEMs, scoring: scoring)
+            let reseedHandle2: InternalReseedHandle? = reseedTasks2.isEmpty ? nil :
+                InternalReseedDispatcher.dispatchBatchAsync(
+                    tasks: reseedTasks2, reads: batchReads,
+                    scoring: scoring, engine: engine)
+
+            // Immediately dispatch NEXT batch to GPU (non-blocking).
+            // Queued after internal reseed so GPU processes: reseed → forward ext.
             let nextBatchStart = batchEnd
             let nextBatchEnd = min(nextBatchStart + gpuBatchSize, readCount)
             var nextHandle: SMEMDispatchHandle? = nil
@@ -2154,6 +2190,12 @@ public actor BWAMemAligner {
                 nextQueries = nextBatchReads.map { $0.bases }
                 nextHandle = SMEMDispatcher.dispatchBatchAsync(
                     queries: nextQueries, engine: engine)
+            }
+
+            // Now collect internal reseed results (GPU may already be done)
+            if let rh = reseedHandle2 {
+                InternalReseedDispatcher.collectAndMerge(
+                    handle: rh, allSMEMs: &gpuSMEMs)
             }
 
             // Phases 1.5-5: parallel per-read on CPU (overlaps with GPU running next batch)
@@ -2173,7 +2215,7 @@ public actor BWAMemAligner {
                     let gi = capturedBatchStart + idx
                     let readId = idShift ? (UInt64(gi) &<< 1) | idBase : UInt64(gi)
                     group.addTask { [self] in
-                        let chains = self.alignReadPhase1_5to3(read, gpuSMEMs: smems)
+                        let chains = self.alignReadPhase1_5to3(read, gpuSMEMs: smems, internalReseedDone: true)
                         guard !chains.isEmpty else { return (idx, []) }
 
                         var regions: [MemAlnReg] = []
@@ -2203,7 +2245,7 @@ public actor BWAMemAligner {
                         let gi = capturedBatchStart + idx
                         let readId = idShift ? (UInt64(gi) &<< 1) | idBase : UInt64(gi)
                         group.addTask { [self] in
-                            let chains = self.alignReadPhase1_5to3(read, gpuSMEMs: smems)
+                            let chains = self.alignReadPhase1_5to3(read, gpuSMEMs: smems, internalReseedDone: true)
                             guard !chains.isEmpty else { return (idx, []) }
 
                             var regions: [MemAlnReg] = []

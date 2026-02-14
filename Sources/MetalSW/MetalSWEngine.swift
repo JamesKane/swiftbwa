@@ -23,6 +23,7 @@ public final class MetalSWEngine: @unchecked Sendable {
     var localSWPipeline: MTLComputePipelineState?
     var localSWWavefrontPipeline: MTLComputePipelineState?
     public private(set) var smemForwardPipeline: MTLComputePipelineState?
+    public private(set) var internalReseedPipeline: MTLComputePipelineState?
     public let bufferPool: MetalBufferPool
 
     // Cached BWT buffers for GPU seeding (created once via setupBWT, reused)
@@ -56,7 +57,7 @@ public final class MetalSWEngine: @unchecked Sendable {
             // Compile from .metal source files bundled via SPM .process("Kernels")
             // SPM flattens the resource directory, so files are at bundle root
             var sources: [String] = []
-            for name in ["banded_sw8", "banded_sw16", "local_sw", "local_sw_wavefront", "smem_forward"] {
+            for name in ["banded_sw8", "banded_sw16", "local_sw", "local_sw_wavefront", "smem_forward", "internal_reseed"] {
                 if let url = Bundle.module.url(forResource: name, withExtension: "metal") {
                     sources.append(try String(contentsOf: url, encoding: .utf8))
                 }
@@ -85,6 +86,9 @@ public final class MetalSWEngine: @unchecked Sendable {
         }
         if let smemFn = library.makeFunction(name: "smem_forward") {
             self.smemForwardPipeline = try device.makeComputePipelineState(function: smemFn)
+        }
+        if let reseedFn = library.makeFunction(name: "internal_reseed") {
+            self.internalReseedPipeline = try device.makeComputePipelineState(function: reseedFn)
         }
     }
 

@@ -17,18 +17,16 @@ using namespace metal;
 #define SIMD_W 32
 #define KMER_K 12
 
+// --- Shared BWT helpers (used by smem_forward and internal_reseed kernels) ---
+// Guards prevent duplicate definitions when .metal sources are concatenated.
+#ifndef BWT_HELPERS_DEFINED
+#define BWT_HELPERS_DEFINED
+
 /// Checkpoint occurrence structure — must match Swift's CheckpointOCC layout exactly.
 /// 4 × int64 counts + 4 × uint64 bitstrings = 64 bytes.
 struct CheckpointOCC {
     int64_t counts[4];      // cumulative A, C, G, T counts at this checkpoint
     uint64_t bitstrings[4]; // one-hot encoded BWT characters for 64 positions
-};
-
-/// Pre-computed BWT interval for a 12-mer. 24 bytes per entry.
-struct KmerEntry {
-    int64_t k;  // forward SA interval start
-    int64_t l;  // reverse SA interval start
-    int64_t s;  // interval size
 };
 
 /// Compute one-hot mask for rank query at position y within a 64-char checkpoint.
@@ -106,6 +104,15 @@ inline bool forward_ext(
 
     return s > 0;
 }
+
+#endif // BWT_HELPERS_DEFINED
+
+/// Pre-computed BWT interval for a 12-mer. 24 bytes per entry.
+struct KmerEntry {
+    int64_t k;  // forward SA interval start
+    int64_t l;  // reverse SA interval start
+    int64_t s;  // interval size
+};
 
 kernel void smem_forward(
     device const uchar*          queries        [[buffer(0)]],
