@@ -13,8 +13,12 @@ public struct PairDecision: Sendable {
     public var idx1: Int
     /// Index into regions2
     public var idx2: Int
-    /// Combined pair score
+    /// Combined pair score (best pair)
     public var score: Int
+    /// Second-best pair score (0 if only one valid pairing)
+    public var secondBestScore: Int
+    /// Count of pairs within score threshold of second-best
+    public var nSub: Int
     /// Whether this pair is proper (concordant orientation + reasonable insert size)
     public var isProperPair: Bool
     /// Insert size between the pair
@@ -22,11 +26,14 @@ public struct PairDecision: Sendable {
     /// Pair orientation
     public var orientation: PairOrientation
 
-    public init(idx1: Int, idx2: Int, score: Int, isProperPair: Bool,
+    public init(idx1: Int, idx2: Int, score: Int, secondBestScore: Int = 0,
+                nSub: Int = 0, isProperPair: Bool,
                 insertSize: Int64, orientation: PairOrientation) {
         self.idx1 = idx1
         self.idx2 = idx2
         self.score = score
+        self.secondBestScore = secondBestScore
+        self.nSub = nSub
         self.isProperPair = isProperPair
         self.insertSize = insertSize
         self.orientation = orientation
@@ -68,8 +75,16 @@ public struct PairedEndResolver: Sendable {
         let candidates1 = topCandidates(from: regions1, scoring: scoring)
         let candidates2 = topCandidates(from: regions2, scoring: scoring)
 
-        var bestDecision: PairDecision?
-        var bestScore = Int.min
+        // Collect all valid pair scores (bwa-mem2 mem_pair u[] array)
+        struct PairHit {
+            var score: Int
+            var idx1: Int
+            var idx2: Int
+            var isProper: Bool
+            var insertSize: Int64
+            var orientation: PairOrientation
+        }
+        var hits: [PairHit] = []
 
         for (i, origIdx1) in candidates1 {
             let r1 = regions1[i]
@@ -84,7 +99,6 @@ public struct PairedEndResolver: Sendable {
                 let oriStats = dist.stats[result.orientation.rawValue]
 
                 // Only consider pairs within the proper-pair distance window
-                // (bwa-mem2 mem_pair lines 318-319: dist < low → skip, dist > high → break)
                 guard !oriStats.failed && oriStats.stddev > 0
                     && result.insertSize >= oriStats.properLow
                     && result.insertSize <= oriStats.properHigh else { continue }
@@ -95,21 +109,41 @@ public struct PairedEndResolver: Sendable {
                 let pairScore = baseScore - penalty
                 let isProper = (result.orientation == dist.primaryOrientation)
 
-                if pairScore > bestScore {
-                    bestScore = pairScore
-                    bestDecision = PairDecision(
-                        idx1: origIdx1,
-                        idx2: origIdx2,
-                        score: pairScore,
-                        isProperPair: isProper,
-                        insertSize: result.insertSize,
-                        orientation: result.orientation
-                    )
-                }
+                hits.append(PairHit(
+                    score: pairScore, idx1: origIdx1, idx2: origIdx2,
+                    isProper: isProper, insertSize: result.insertSize,
+                    orientation: result.orientation
+                ))
             }
         }
 
-        return bestDecision
+        guard !hits.isEmpty else { return nil }
+
+        // Sort descending by score to find best and second-best
+        hits.sort { $0.score > $1.score }
+
+        let best = hits[0]
+
+        // Second-best score and n_sub (bwa-mem2 mem_pair lines 337-342)
+        let subo = hits.count > 1 ? hits[1].score : 0
+        let tmp = Int(scoring.matchScore) + Int(scoring.mismatchPenalty)
+        var nSub = 0
+        for i in 1..<hits.count {
+            if subo - hits[i].score <= tmp {
+                nSub += 1
+            }
+        }
+
+        return PairDecision(
+            idx1: best.idx1,
+            idx2: best.idx2,
+            score: best.score,
+            secondBestScore: subo,
+            nSub: nSub,
+            isProperPair: best.isProper,
+            insertSize: best.insertSize,
+            orientation: best.orientation
+        )
     }
 
     /// Compute TLEN values for a read pair per SAM spec.
@@ -142,36 +176,74 @@ public struct PairedEndResolver: Sendable {
         }
     }
 
-    /// Adjust MAPQ for paired-end reads.
+    /// Adjust per-end MAPQ using paired-end evidence.
     ///
-    /// From bwa-mem2 `mem_sam_pe()`: for proper pairs, MAPQ is boosted if the
-    /// pair score gap implies high confidence.
+    /// Reimplements bwa-mem2's PE MAPQ logic from `mem_sam_pe()` (bwamem_pair.cpp:441-467).
     ///
     /// - Parameters:
-    ///   - mapq: Original single-end MAPQ
-    ///   - pairScore: Score of the best pair
-    ///   - secondBestPairScore: Score of the second-best pair (nil if only one pairing)
-    ///   - isProperPair: Whether the best pair is proper
-    /// - Returns: Adjusted MAPQ
+    ///   - seMAPQ1: Single-end MAPQ for read 1
+    ///   - seMAPQ2: Single-end MAPQ for read 2
+    ///   - region1: Best alignment region for read 1 (after pair promotion)
+    ///   - region2: Best alignment region for read 2 (after pair promotion)
+    ///   - decision: Pair resolution result (best pair score, subo, n_sub)
+    ///   - scoring: Scoring parameters
+    /// - Returns: Adjusted (mapq1, mapq2)
     public static func adjustMAPQ(
-        mapq: UInt8,
-        pairScore: Int,
-        secondBestPairScore: Int?,
-        isProperPair: Bool
-    ) -> UInt8 {
-        guard isProperPair else { return mapq }
+        seMAPQ1: UInt8,
+        seMAPQ2: UInt8,
+        region1: MemAlnReg,
+        region2: MemAlnReg,
+        decision: PairDecision,
+        scoring: ScoringParameters
+    ) -> (UInt8, UInt8) {
+        let o = decision.score
+        var subo = decision.secondBestScore
 
-        if let secondBest = secondBestPairScore {
-            let gap = pairScore - secondBest
-            if gap > 0 {
-                let pairMAPQ = min(60, Int(4.343 * log(Double(gap)) + 0.5))
-                return UInt8(min(60, max(Int(mapq), pairMAPQ)))
-            }
-        } else {
-            // No second-best pair: boost to at least 30 for proper pairs
-            return UInt8(min(60, max(Int(mapq), 30)))
+        // bwa-mem2 line 441-443: compare against unpaired SE score
+        let scoreUn = Int(region1.score) + Int(region2.score) - Int(scoring.unpairedPenalty)
+        if subo < scoreUn { subo = scoreUn }
+
+        // bwa-mem2 line 444: q_pe = raw_mapq(o - subo, a)
+        let a = Double(scoring.matchScore)
+        var qPe = Int(6.02 * Double(o - subo) / a + 0.499)
+
+        // bwa-mem2 line 445-446: n_sub penalty
+        if decision.nSub > 0 {
+            qPe -= Int(4.343 * log(Double(decision.nSub + 1)) + 0.499)
         }
-        return mapq
+
+        // Clamp q_pe
+        if qPe < 0 { qPe = 0 }
+        if qPe > 60 { qPe = 60 }
+
+        // frac_rep not implemented (would be: qPe *= (1 - 0.5*(frac_rep1 + frac_rep2)))
+
+        var q1 = Int(seMAPQ1)
+        var q2 = Int(seMAPQ2)
+
+        if o > scoreUn {
+            // bwa-mem2 lines 461-462: paired alignment preferred — boost SE MAPQ with pair evidence
+            // q_se = max(q_se, min(q_pe, q_se + 40))
+            q1 = q1 > qPe ? q1 : (qPe < q1 + 40 ? qPe : q1 + 40)
+            q2 = q2 > qPe ? q2 : (qPe < q2 + 40 ? qPe : q2 + 40)
+
+            // bwa-mem2 lines 466-467: cap at tandem repeat score (csub)
+            if region1.csub > 0 {
+                let csubCap = Int(6.02 * Double(Int(region1.score) - Int(region1.csub)) / a + 0.499)
+                if q1 > csubCap { q1 = csubCap }
+            }
+            if region2.csub > 0 {
+                let csubCap = Int(6.02 * Double(Int(region2.score) - Int(region2.csub)) / a + 0.499)
+                if q2 > csubCap { q2 = csubCap }
+            }
+        }
+        // else: unpaired preferred — keep SE MAPQ as-is (bwa-mem2 lines 469-472)
+
+        // Final clamp
+        q1 = max(0, min(60, q1))
+        q2 = max(0, min(60, q2))
+
+        return (UInt8(q1), UInt8(q2))
     }
 
     // MARK: - Private Helpers

@@ -33,7 +33,8 @@ public struct MappingQuality: Sendable {
 
         // bwa-mem2 line 1472: default sub = minSeedLen * matchScore when sub==0
         var sub = region.sub > 0 ? region.sub : scoring.minSeedLength * scoring.matchScore
-        // csub not yet implemented; bwa-mem2 line 1474: sub = max(sub, csub)
+        // bwa-mem2 line 1474: tandem repeat detection — csub from mate rescue score2
+        if region.csub > sub { sub = region.csub }
 
         // bwa-mem2 line 1475
         if sub >= region.score { return 0 }

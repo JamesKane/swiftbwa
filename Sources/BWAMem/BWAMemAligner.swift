@@ -48,7 +48,7 @@ struct RecordSpec: Sendable {
     let readIsRead1: Bool
     let regionIndex: Int       // -1 for unmapped
     let cigarInfo: CIGARInfo?  // nil for unmapped
-    let mapq: UInt8
+    var mapq: UInt8
     let isPrimary: Bool
     let isSupplementary: Bool
     let isSecondary: Bool
@@ -1047,6 +1047,15 @@ public actor BWAMemAligner {
     nonisolated private func promotePairedRegion(regions: inout [MemAlnReg], pairedIdx: Int) {
         guard pairedIdx > 0 && pairedIdx < regions.count else { return }
 
+        // bwa-mem2 mem_sam_pe line 456-457: when promoting a secondary, set its sub
+        // to the parent primary's score (the region it was originally secondary to).
+        // This ensures SE MAPQ reflects the existence of a better-scoring alignment.
+        let promoted = regions[pairedIdx]
+        if promoted.secondary >= 0 && promoted.secondary < Int32(regions.count) {
+            let parentScore = regions[Int(promoted.secondary)].score
+            regions[pairedIdx].sub = parentScore
+        }
+
         // Swap the paired region to position 0
         regions.swapAt(0, pairedIdx)
 
@@ -1060,6 +1069,7 @@ public actor BWAMemAligner {
         }
 
         // Ensure the promoted region is marked as primary
+        // Use -2 (not -1) to indicate this was a promoted secondary (bwa-mem2 convention)
         regions[0].secondary = -1
     }
 
@@ -1106,7 +1116,13 @@ public actor BWAMemAligner {
             dist: dist, genomeLength: genomeLen, scoring: options.scoring
         )
 
-        if let decision = decision {
+        // bwa-mem2 lines 434-438: check if either read has multiple independent
+        // (non-secondary) hits. If so, skip PE pairing and use no_pairing path
+        // which outputs supplementary alignments via mem_reg2sam.
+        let isMulti1 = Self.hasMultipleNonSecondary(regions1, scoring: options.scoring)
+        let isMulti2 = Self.hasMultipleNonSecondary(regions2, scoring: options.scoring)
+
+        if let decision = decision, !isMulti1, !isMulti2 {
             // Both mapped and paired — promote paired regions to primary
             var pairedRegions1 = regions1
             var pairedRegions2 = regions2
@@ -1114,6 +1130,21 @@ public actor BWAMemAligner {
             var pairedCigars2 = cigars2
             promotePairedRegion(regions: &pairedRegions1, pairedIdx: decision.idx1)
             promotePairedRegion(regions: &pairedRegions2, pairedIdx: decision.idx2)
+
+            // Suppress supplementaries: bwa-mem2's PE paired path (lines 489-503)
+            // only outputs the paired primary, not supplementary alignments.
+            // Mark displaced non-secondary regions as secondary to the promoted primary.
+            for i in 1..<pairedRegions1.count {
+                if pairedRegions1[i].secondary < 0 {
+                    pairedRegions1[i].secondary = 0
+                }
+            }
+            for i in 1..<pairedRegions2.count {
+                if pairedRegions2[i].secondary < 0 {
+                    pairedRegions2[i].secondary = 0
+                }
+            }
+
             if decision.idx1 > 0 && decision.idx1 < pairedCigars1.count {
                 pairedCigars1.swapAt(0, decision.idx1)
             }
@@ -1160,6 +1191,39 @@ public actor BWAMemAligner {
                 read: read2, regions: pairedRegions2, readIsRead1: false,
                 pairedEnd: pe2, cigarCache: pairedCigars2, scoringMat: scoringMat
             ))
+
+            // Apply PE MAPQ adjustment (bwa-mem2 mem_sam_pe lines 441-467)
+            // Find primaries for each read and adjust their MAPQ using pair evidence
+            var pri1Idx: Int?
+            var pri2Idx: Int?
+            for (i, r) in records.enumerated() {
+                if r.isPrimary && r.readIsRead1 && pri1Idx == nil { pri1Idx = i }
+                if r.isPrimary && !r.readIsRead1 && pri2Idx == nil { pri2Idx = i }
+            }
+            if let i1 = pri1Idx, let i2 = pri2Idx {
+                let (adj1, adj2) = PairedEndResolver.adjustMAPQ(
+                    seMAPQ1: records[i1].mapq,
+                    seMAPQ2: records[i2].mapq,
+                    region1: pairedRegions1[0],
+                    region2: pairedRegions2[0],
+                    decision: decision,
+                    scoring: options.scoring
+                )
+                records[i1].mapq = adj1
+                records[i2].mapq = adj2
+
+                // Cap supplementary MAPQ at adjusted primary MAPQ
+                for i in 0..<records.count {
+                    if records[i].isSupplementary {
+                        if records[i].readIsRead1 {
+                            records[i].mapq = min(records[i].mapq, adj1)
+                        } else {
+                            records[i].mapq = min(records[i].mapq, adj2)
+                        }
+                    }
+                }
+            }
+
             return PairOutputPlan(
                 regions1: pairedRegions1, regions2: pairedRegions2, records: records
             )
@@ -1368,25 +1432,30 @@ public actor BWAMemAligner {
                     }
                     let gpuResults = await LocalSWDispatcher.dispatchBatch(tasks: tasks, engine: engine)
 
+                    let minSubScore = UInt8(clamping: scoring.minSeedLength &* scoring.matchScore)
+
                     // Apply direction 1 results: rescue R2
                     for li in 0..<count {
                         let r = candRanges2[li]
                         for j in 0..<r.count {
                             let ci = r.start + j
                             let cand = allCands[ci]
-                            let sw: (score: Int32, qb: Int32, qe: Int32, tb: Int32, te: Int32)?
+                            let sw: (score: Int32, qb: Int32, qe: Int32, tb: Int32, te: Int32, sc2: Int32)?
                             if let g = gpuResults[ci] {
-                                sw = (g.score, g.queryBegin, g.queryEnd, g.targetBegin, g.targetEnd)
+                                // GPU path doesn't compute score2 yet
+                                sw = (g.score, g.queryBegin, g.queryEnd, g.targetBegin, g.targetEnd, 0)
                             } else if let c = LocalSWAligner.align(
                                 query: cand.mateSeq, target: cand.refBases,
-                                scoring: scoring, scoringMatrix: mat
+                                scoring: scoring, scoringMatrix: mat,
+                                minSubScore: minSubScore
                             ) {
-                                sw = (c.score, c.queryBegin, c.queryEnd, c.targetBegin, c.targetEnd)
+                                sw = (c.score, c.queryBegin, c.queryEnd, c.targetBegin, c.targetEnd, c.score2)
                             } else { sw = nil }
                             if let sw = sw, let reg = MateRescue.applyResult(
                                 candidate: cand, score: sw.score,
                                 queryBegin: sw.qb, queryEnd: sw.qe,
                                 targetBegin: sw.tb, targetEnd: sw.te,
+                                score2: sw.sc2,
                                 genomeLength: genomeLen, scoring: scoring
                             ) {
                                 finalRegs2[li].append(reg)
@@ -1401,19 +1470,21 @@ public actor BWAMemAligner {
                         for j in 0..<r.count {
                             let ci = r.start + j
                             let cand = allCands[ci]
-                            let sw: (score: Int32, qb: Int32, qe: Int32, tb: Int32, te: Int32)?
+                            let sw: (score: Int32, qb: Int32, qe: Int32, tb: Int32, te: Int32, sc2: Int32)?
                             if let g = gpuResults[ci] {
-                                sw = (g.score, g.queryBegin, g.queryEnd, g.targetBegin, g.targetEnd)
+                                sw = (g.score, g.queryBegin, g.queryEnd, g.targetBegin, g.targetEnd, 0)
                             } else if let c = LocalSWAligner.align(
                                 query: cand.mateSeq, target: cand.refBases,
-                                scoring: scoring, scoringMatrix: mat
+                                scoring: scoring, scoringMatrix: mat,
+                                minSubScore: minSubScore
                             ) {
-                                sw = (c.score, c.queryBegin, c.queryEnd, c.targetBegin, c.targetEnd)
+                                sw = (c.score, c.queryBegin, c.queryEnd, c.targetBegin, c.targetEnd, c.score2)
                             } else { sw = nil }
                             if let sw = sw, let reg = MateRescue.applyResult(
                                 candidate: cand, score: sw.score,
                                 queryBegin: sw.qb, queryEnd: sw.qe,
                                 targetBegin: sw.tb, targetEnd: sw.te,
+                                score2: sw.sc2,
                                 genomeLength: genomeLen, scoring: scoring
                             ) {
                                 finalRegs1[li].append(reg)
@@ -1544,6 +1615,19 @@ public actor BWAMemAligner {
         }
 
         return (idx, regs1, regs2, rescued1.count, rescued2.count)
+    }
+
+    /// Check if regions have multiple independent (non-secondary) hits above score threshold.
+    /// Matches bwa-mem2's is_multi check (bwamem_pair.cpp lines 434-438).
+    private static func hasMultipleNonSecondary(
+        _ regions: [MemAlnReg], scoring: ScoringParameters
+    ) -> Bool {
+        var count = 0
+        for r in regions where r.secondary < 0 && r.score >= scoring.minOutputScore {
+            count += 1
+            if count > 1 { return true }
+        }
+        return false
     }
 
     /// Select rescue candidate regions: primary regions with score >= bestScore - unpairedPenalty,

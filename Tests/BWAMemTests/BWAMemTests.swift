@@ -535,27 +535,48 @@ struct PairedEndResolverTests {
         #expect(tlen2 == 250)
     }
 
-    @Test("adjustMAPQ boosts proper pair MAPQ")
+    @Test("adjustMAPQ boosts proper pair with unique pairing")
     func testAdjustMAPQ() {
-        let adjusted = PairedEndResolver.adjustMAPQ(
-            mapq: 10,
-            pairScore: 200,
-            secondBestPairScore: nil,
-            isProperPair: true
+        let reg1 = MemAlnReg(rb: 1000, re: 1150, qb: 0, qe: 150,
+                              score: 150, trueScore: 150, sub: 0, w: 10, seedCov: 50)
+        let reg2 = MemAlnReg(rb: 1200, re: 1350, qb: 0, qe: 150,
+                              score: 150, trueScore: 150, sub: 0, w: 10, seedCov: 50)
+        let decision = PairDecision(
+            idx1: 0, idx2: 0, score: 300, secondBestScore: 0, nSub: 0,
+            isProperPair: true, insertSize: 350, orientation: .fr
         )
-        // No second best: boost to at least 30
-        #expect(adjusted >= 30)
+        let scoring = ScoringParameters()
+        let (adj1, adj2) = PairedEndResolver.adjustMAPQ(
+            seMAPQ1: 10, seMAPQ2: 10, region1: reg1, region2: reg2,
+            decision: decision, scoring: scoring
+        )
+        // Unique pairing (subo=0, score_un = 300-17 = 283) → o > score_un
+        // q_pe = raw_mapq(300 - 283, 1) = 6.02 * 17 ≈ 102 → clamped to 60
+        // q_se boosted: max(10, min(60, 50)) = 50
+        #expect(adj1 > 10)
+        #expect(adj2 > 10)
     }
 
-    @Test("adjustMAPQ does not boost improper pair")
-    func testAdjustMAPQImproper() {
-        let adjusted = PairedEndResolver.adjustMAPQ(
-            mapq: 10,
-            pairScore: 200,
-            secondBestPairScore: nil,
-            isProperPair: false
+    @Test("adjustMAPQ reduces MAPQ when unpaired is better")
+    func testAdjustMAPQUnpairedBetter() {
+        // score_un > pair score → unpaired preferred → SE MAPQ unchanged
+        let reg1 = MemAlnReg(rb: 1000, re: 1150, qb: 0, qe: 150,
+                              score: 150, trueScore: 150, sub: 0, w: 10, seedCov: 50)
+        let reg2 = MemAlnReg(rb: 1200, re: 1350, qb: 0, qe: 150,
+                              score: 150, trueScore: 150, sub: 0, w: 10, seedCov: 50)
+        // Low pair score (e.g. large z-penalty) with high SE scores
+        let decision = PairDecision(
+            idx1: 0, idx2: 0, score: 200, secondBestScore: 190, nSub: 3,
+            isProperPair: true, insertSize: 350, orientation: .fr
         )
-        #expect(adjusted == 10)
+        let scoring = ScoringParameters()
+        let (adj1, adj2) = PairedEndResolver.adjustMAPQ(
+            seMAPQ1: 40, seMAPQ2: 40, region1: reg1, region2: reg2,
+            decision: decision, scoring: scoring
+        )
+        // score_un = 150+150-17 = 283 > 200=o → unpaired better → keep SE MAPQ
+        #expect(adj1 == 40)
+        #expect(adj2 == 40)
     }
 
     @Test("Resolve returns nil when regions are empty")

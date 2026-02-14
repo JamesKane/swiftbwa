@@ -121,10 +121,11 @@ public struct MateRescue: Sendable {
                     mateSeq = mateRead.bases
                 }
 
-                // Run local SW
+                // Run local SW with score2 tracking for tandem repeat detection
+                let minSubScore = UInt8(clamping: minScore)
                 guard let swResult = LocalSWAligner.align(
                     query: mateSeq, target: refBases, scoring: scoring,
-                    scoringMatrix: scoringMatrix
+                    scoringMatrix: scoringMatrix, minSubScore: minSubScore
                 ) else { continue }
 
                 // Filter by minimum score
@@ -134,6 +135,7 @@ public struct MateRescue: Sendable {
                 var reg = MemAlnReg()
                 reg.score = swResult.score
                 reg.trueScore = swResult.score
+                reg.csub = swResult.score2
                 reg.rid = a.rid
                 reg.secondary = -1
 
@@ -278,6 +280,7 @@ public struct MateRescue: Sendable {
         queryEnd: Int32,
         targetBegin: Int32,
         targetEnd: Int32,
+        score2: Int32 = 0,
         genomeLength: Int64,
         scoring: ScoringParameters
     ) -> MemAlnReg? {
@@ -287,6 +290,7 @@ public struct MateRescue: Sendable {
         var reg = MemAlnReg()
         reg.score = score
         reg.trueScore = score
+        reg.csub = score2
         reg.rid = candidate.rid
         reg.secondary = -1
 

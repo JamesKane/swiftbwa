@@ -33,6 +33,8 @@ public struct MemAlnReg: Sendable {
     public var trueScore: Int32
     /// Best sub-optimal score
     public var sub: Int32
+    /// SW score of a tandem hit (second-best local SW from mate rescue)
+    public var csub: Int32 = 0
     /// Number of sub-optimal hits
     public var subN: Int32 = 0
     /// Alignment band width used

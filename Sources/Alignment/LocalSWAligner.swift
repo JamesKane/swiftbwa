@@ -7,14 +7,18 @@ public struct LocalSWResult: Sendable {
     public var queryEnd: Int32      // inclusive
     public var targetBegin: Int32
     public var targetEnd: Int32     // inclusive
+    /// Second-best alignment score from a peak outside the primary alignment zone.
+    /// Used as csub for tandem repeat detection. 0 if no second peak found.
+    public var score2: Int32
 
     public init(score: Int32, queryBegin: Int32, queryEnd: Int32,
-                targetBegin: Int32, targetEnd: Int32) {
+                targetBegin: Int32, targetEnd: Int32, score2: Int32 = 0) {
         self.score = score
         self.queryBegin = queryBegin
         self.queryEnd = queryEnd
         self.targetBegin = targetBegin
         self.targetEnd = targetEnd
+        self.score2 = score2
     }
 }
 
@@ -30,9 +34,14 @@ public struct LocalSWResult: Sendable {
 public struct LocalSWAligner: Sendable {
 
     /// Perform local Smith-Waterman alignment.
+    ///
+    /// - Parameters:
+    ///   - minSubScore: Minimum score threshold for tracking second-best peaks (score2/csub).
+    ///     When > 0, enables tandem repeat detection matching bwa-mem2's KSW_XSUBO.
+    ///     Typically `minSeedLength * matchScore`.
     public static func align(
         query: [UInt8], target: [UInt8], scoring: ScoringParameters,
-        scoringMatrix: [Int8]? = nil
+        scoringMatrix: [Int8]? = nil, minSubScore: UInt8 = 0
     ) -> LocalSWResult? {
         let qLen = query.count
         let tLen = target.count
@@ -53,7 +62,7 @@ public struct LocalSWAligner: Sendable {
                             query: qBuf.baseAddress!, qLen: qLen,
                             target: tBuf.baseAddress!, tLen: tLen,
                             mat: matBuf.baseAddress!, gapOE: gapOE, gapE: gapE,
-                            bias: bias
+                            bias: bias, minSubScore: minSubScore
                         )
                     }
                 }
@@ -64,7 +73,8 @@ public struct LocalSWAligner: Sendable {
         // Scalar fallback
         return scalarAlign(
             query: query, target: target,
-            mat: mat, gapOE: gapOE, gapE: gapE
+            mat: mat, gapOE: gapOE, gapE: gapE,
+            minSubScore: minSubScore
         )
     }
 
@@ -76,17 +86,18 @@ public struct LocalSWAligner: Sendable {
         query: UnsafePointer<UInt8>, qLen: Int,
         target: UnsafePointer<UInt8>, tLen: Int,
         mat: UnsafePointer<Int8>, gapOE: Int32, gapE: Int32,
-        bias: UInt8
+        bias: UInt8, minSubScore: UInt8
     ) -> LocalSWResult? {
-        // Forward pass: find best score and end positions
+        // Forward pass: find best score and end positions + score2
         guard let fwd = simdSWPass(
             query: query, qLen: qLen, target: target, tLen: tLen,
-            mat: mat, gapOE: gapOE, gapE: gapE, bias: bias
+            mat: mat, gapOE: gapOE, gapE: gapE, bias: bias,
+            minSubScore: minSubScore
         ) else { return nil }
 
         guard fwd.score > 0 else { return nil }
 
-        // Reverse pass: find start positions
+        // Reverse pass: find start positions (no score2 needed)
         let revQLen = Int(fwd.qEnd) &+ 1
         let revTLen = Int(fwd.tEnd) &+ 1
 
@@ -99,7 +110,8 @@ public struct LocalSWAligner: Sendable {
 
         guard let rev = simdSWPass(
             query: revQ, qLen: revQLen, target: revT, tLen: revTLen,
-            mat: mat, gapOE: gapOE, gapE: gapE, bias: bias
+            mat: mat, gapOE: gapOE, gapE: gapE, bias: bias,
+            minSubScore: 0
         ) else { return nil }
 
         return LocalSWResult(
@@ -107,18 +119,23 @@ public struct LocalSWAligner: Sendable {
             queryBegin: fwd.qEnd &- rev.qEnd,
             queryEnd: fwd.qEnd,
             targetBegin: fwd.tEnd &- rev.tEnd,
-            targetEnd: fwd.tEnd
+            targetEnd: fwd.tEnd,
+            score2: fwd.score2
         )
     }
 
     /// Single-direction SIMD SW pass using Farrar's striped algorithm.
     /// Returns nil if 8-bit overflow detected.
+    ///
+    /// When `minSubScore > 0`, tracks per-column peak scores to compute `score2`:
+    /// the best alignment score from a peak outside the primary alignment zone.
+    /// Matches bwa-mem2's KSW_XSUBO logic in ksw.cpp.
     private static func simdSWPass(
         query: UnsafePointer<UInt8>, qLen: Int,
         target: UnsafePointer<UInt8>, tLen: Int,
         mat: UnsafePointer<Int8>, gapOE: Int32, gapE: Int32,
-        bias: UInt8
-    ) -> (score: Int32, qEnd: Int32, tEnd: Int32)? {
+        bias: UInt8, minSubScore: UInt8
+    ) -> (score: Int32, qEnd: Int32, tEnd: Int32, score2: Int32)? {
         let lanes = 16
         let sn = (qLen &+ lanes &- 1) / lanes
 
@@ -163,6 +180,24 @@ public struct LocalSWAligner: Sendable {
         var maxI: Int32 = -1
         var maxJ: Int32 = -1
 
+        // Peak tracking for score2 (matches bwa-mem2's b[] array in ksw_u8)
+        // Each entry: (score << 32) | column. Consecutive columns merged.
+        var nPeaks = 0
+        var mPeaks = 0
+        var peaks: UnsafeMutablePointer<UInt64>? = nil
+        let trackPeaks = minSubScore > 0
+        defer { peaks?.deallocate() }
+
+        // Find max base score for exclusion zone calculation
+        var maxBaseScore: UInt8 = 0
+        if trackPeaks {
+            for k in 0..<25 {
+                let v = UInt8(clamping: Int(mat[k]) &+ Int(bias))
+                if v > maxBaseScore { maxBaseScore = v }
+            }
+            maxBaseScore = maxBaseScore > bias ? maxBaseScore &- bias : 0
+        }
+
         for i in 0..<tLen {
             let tBase = Int(min(target[i], 4))
             let prof = profile + tBase &* sn
@@ -206,10 +241,12 @@ public struct LocalSWAligner: Sendable {
                 corrF = pmax(corrF, gapEVec) &- gapEVec
             }
 
-            // Track max score and position
+            // Compute column max and track best position
+            var colMax: UInt8 = 0
             for s in 0..<sn {
                 let localMax = hArr[s].max()
                 if localMax > 250 { return nil }  // overflow
+                if localMax > colMax { colMax = localMax }
                 if localMax > maxScore {
                     maxScore = localMax
                     maxI = Int32(i)
@@ -224,9 +261,48 @@ public struct LocalSWAligner: Sendable {
                     }
                 }
             }
+
+            // Record peaks for score2 (bwa-mem2 ksw.cpp lines 197-205)
+            if trackPeaks && colMax >= minSubScore {
+                let colMaxU64 = UInt64(colMax)
+                if nPeaks == 0 || Int32(peaks![nPeaks &- 1] & 0xFFFF_FFFF) &+ 1 != Int32(i) {
+                    // New peak (non-consecutive column)
+                    if nPeaks == mPeaks {
+                        let newCap = mPeaks == 0 ? 8 : mPeaks &<< 1
+                        let newBuf = UnsafeMutablePointer<UInt64>.allocate(capacity: newCap)
+                        if let old = peaks {
+                            newBuf.update(from: old, count: nPeaks)
+                            old.deallocate()
+                        }
+                        peaks = newBuf
+                        mPeaks = newCap
+                    }
+                    peaks![nPeaks] = (colMaxU64 &<< 32) | UInt64(UInt32(bitPattern: Int32(i)))
+                    nPeaks &+= 1
+                } else if peaks![nPeaks &- 1] >> 32 < colMaxU64 {
+                    // Update last peak (consecutive column, higher score)
+                    peaks![nPeaks &- 1] = (colMaxU64 &<< 32) | UInt64(UInt32(bitPattern: Int32(i)))
+                }
+            }
         }
 
-        return (Int32(maxScore), maxJ, maxI)
+        // Compute score2: best peak outside the exclusion zone around the primary hit
+        var score2: Int32 = 0
+        if trackPeaks, let peakBuf = peaks, maxScore > 0, maxBaseScore > 0 {
+            let exclusionRadius = (Int32(maxScore) &+ Int32(maxBaseScore) &- 1) / Int32(maxBaseScore)
+            let low = maxI &- exclusionRadius
+            let high = maxI &+ exclusionRadius
+            for p in 0..<nPeaks {
+                let entry = peakBuf[p]
+                let col = Int32(bitPattern: UInt32(entry & 0xFFFF_FFFF))
+                let sc = Int32(entry >> 32)
+                if (col < low || col > high) && sc > score2 {
+                    score2 = sc
+                }
+            }
+        }
+
+        return (Int32(maxScore), maxJ, maxI, score2)
     }
 
     @inline(__always)
@@ -250,7 +326,8 @@ public struct LocalSWAligner: Sendable {
 
     private static func scalarAlign(
         query: [UInt8], target: [UInt8],
-        mat: [Int8], gapOE: Int32, gapE: Int32
+        mat: [Int8], gapOE: Int32, gapE: Int32,
+        minSubScore: UInt8
     ) -> LocalSWResult? {
         let qLen = query.count
         let tLen = target.count
@@ -261,7 +338,8 @@ public struct LocalSWAligner: Sendable {
                     scalarSWPass(
                         query: qBuf.baseAddress!, qLen: qLen,
                         target: tBuf.baseAddress!, tLen: tLen,
-                        mat: matBuf.baseAddress!, gapOE: gapOE, gapE: gapE
+                        mat: matBuf.baseAddress!, gapOE: gapOE, gapE: gapE,
+                        minSubScore: Int32(minSubScore)
                     )
                 }
             }
@@ -287,7 +365,8 @@ public struct LocalSWAligner: Sendable {
         let reverseResult = mat.withUnsafeBufferPointer { matBuf in
             scalarSWPass(
                 query: revQ, qLen: revQLen, target: revT, tLen: revTLen,
-                mat: matBuf.baseAddress!, gapOE: gapOE, gapE: gapE
+                mat: matBuf.baseAddress!, gapOE: gapOE, gapE: gapE,
+                minSubScore: 0
             )
         }
 
@@ -296,15 +375,19 @@ public struct LocalSWAligner: Sendable {
             queryBegin: bestQEnd &- reverseResult.qEnd,
             queryEnd: bestQEnd,
             targetBegin: bestTEnd &- reverseResult.tEnd,
-            targetEnd: bestTEnd
+            targetEnd: bestTEnd,
+            score2: forwardResult.score2
         )
     }
 
     private static func scalarSWPass(
         query: UnsafePointer<UInt8>, qLen: Int,
         target: UnsafePointer<UInt8>, tLen: Int,
-        mat: UnsafePointer<Int8>, gapOE: Int32, gapE: Int32
-    ) -> (score: Int32, qEnd: Int32, tEnd: Int32) {
+        mat: UnsafePointer<Int8>, gapOE: Int32, gapE: Int32,
+        minSubScore: Int32
+    ) -> (score: Int32, qEnd: Int32, tEnd: Int32, score2: Int32) {
+        // Note: scalar path uses query as outer loop (transposed vs bwa-mem2).
+        // Peak tracking uses query-row index for exclusion zone.
         let h = UnsafeMutablePointer<Int32>.allocate(capacity: tLen &+ 1)
         let e = UnsafeMutablePointer<Int32>.allocate(capacity: tLen &+ 1)
         defer { h.deallocate(); e.deallocate() }
@@ -315,11 +398,26 @@ public struct LocalSWAligner: Sendable {
         var bestQEnd: Int32 = -1
         var bestTEnd: Int32 = -1
 
+        // Peak tracking for score2
+        let trackPeaks = minSubScore > 0
+        var nPeaks = 0
+        var mPeaks = 0
+        var peaks: UnsafeMutablePointer<UInt64>? = nil
+        var maxBaseScore: Int32 = 0
+        if trackPeaks {
+            for k in 0..<25 {
+                let v = Int32(mat[k])
+                if v > maxBaseScore { maxBaseScore = v }
+            }
+        }
+        defer { peaks?.deallocate() }
+
         for i in 0..<qLen {
             let qBase = Int(min(query[i], 4))
             let matRow = mat + qBase &* 5
             var f: Int32 = 0
             var hPrev: Int32 = 0
+            var rowMax: Int32 = 0
 
             for j in 0..<tLen {
                 let j1 = j &+ 1
@@ -342,14 +440,54 @@ public struct LocalSWAligner: Sendable {
                 hPrev = h[j1]
                 h[j1] = hCur
 
+                if hCur > rowMax { rowMax = hCur }
                 if hCur > bestScore {
                     bestScore = hCur
                     bestQEnd = Int32(i)
                     bestTEnd = Int32(j)
                 }
             }
+
+            // Record peaks (using query row as the axis, analogous to target column in SIMD path)
+            if trackPeaks && rowMax >= minSubScore {
+                let rmU64 = UInt64(UInt32(bitPattern: rowMax))
+                let iU64 = UInt64(UInt32(bitPattern: Int32(i)))
+                if nPeaks == 0 || Int32(peaks![nPeaks &- 1] & 0xFFFF_FFFF) &+ 1 != Int32(i) {
+                    if nPeaks == mPeaks {
+                        let newCap = mPeaks == 0 ? 8 : mPeaks &<< 1
+                        let newBuf = UnsafeMutablePointer<UInt64>.allocate(capacity: newCap)
+                        if let old = peaks {
+                            newBuf.update(from: old, count: nPeaks)
+                            old.deallocate()
+                        }
+                        peaks = newBuf
+                        mPeaks = newCap
+                    }
+                    peaks![nPeaks] = (rmU64 &<< 32) | iU64
+                    nPeaks &+= 1
+                } else if peaks![nPeaks &- 1] >> 32 < rmU64 {
+                    peaks![nPeaks &- 1] = (rmU64 &<< 32) | iU64
+                }
+            }
         }
 
-        return (bestScore, bestQEnd, bestTEnd)
+        // Compute score2
+        var score2: Int32 = 0
+        if trackPeaks, let peakBuf = peaks, bestScore > 0, maxBaseScore > 0 {
+            let exclusionRadius = (bestScore &+ maxBaseScore &- 1) / maxBaseScore
+            let bestAxis = bestQEnd  // scalar uses query as outer loop
+            let low = bestAxis &- exclusionRadius
+            let high = bestAxis &+ exclusionRadius
+            for p in 0..<nPeaks {
+                let entry = peakBuf[p]
+                let col = Int32(bitPattern: UInt32(entry & 0xFFFF_FFFF))
+                let sc = Int32(entry >> 32)
+                if (col < low || col > high) && sc > score2 {
+                    score2 = sc
+                }
+            }
+        }
+
+        return (bestScore, bestQEnd, bestTEnd, score2)
     }
 }
