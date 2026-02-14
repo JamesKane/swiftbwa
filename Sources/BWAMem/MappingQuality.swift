@@ -7,8 +7,10 @@ import Glibc
 import Musl
 #endif
 
-/// MEM_MAPQ_COEF from bwa-mem2's bwamem.h line 56
-private let memMapqCoef: Double = 30.0
+/// bwa-mem2 defaults: mapQ_coef_len = 50, mapQ_coef_fac = (int)log(50) = 3
+/// Note: bwa-mem2 declares mapQ_coef_fac as int, truncating log(50)=3.912 to 3.
+private let mapQCoefLen: Double = 50.0
+private let mapQCoefFac: Double = 3.0
 
 /// Computes mapping quality (MAPQ) from alignment scores.
 /// Reimplements bwa-mem2's `mem_approx_mapq_se()` (bwamem.cpp lines 1470-1494).
@@ -52,17 +54,14 @@ public struct MappingQuality: Sendable {
         if region.score == 0 {
             mapq = 0
         } else {
-            // bwa-mem2 line 1486 (default branch, mapQ_coef_len == 0):
-            // mapq = (int)(MEM_MAPQ_COEF * (1. - (double)sub / a->score) * log(a->seedcov) + .499)
-            let seedcov = max(region.seedCov, 1) // guard against log(0)
-            mapq = Int32(
-                memMapqCoef * (1.0 - Double(sub) / Double(region.score))
-                    * log(Double(seedcov)) + 0.499
-            )
-            // bwa-mem2 line 1487: identity penalty when identity < 0.95
-            if identity < 0.95 {
-                mapq = Int32(Double(mapq) * identity * identity + 0.499)
-            }
+            // bwa-mem2 line 1480-1484 (mapQ_coef_len=50 > 0, default branch):
+            // tmp = l < mapQ_coef_len ? 1. : mapQ_coef_fac / log(l);
+            // tmp *= identity * identity;
+            // mapq = (int)(6.02 * (score - sub) / a * tmp * tmp + .499);
+            let dl = Double(l)
+            var tmp = dl < mapQCoefLen ? 1.0 : mapQCoefFac / log(dl)
+            tmp *= identity * identity
+            mapq = Int32(6.02 * Double(region.score - sub) / a * tmp * tmp + 0.499)
         }
 
         // bwa-mem2 line 1489: sub_n penalty
@@ -74,8 +73,8 @@ public struct MappingQuality: Sendable {
         if mapq > 60 { mapq = 60 }
         if mapq < 0 { mapq = 0 }
 
-        // bwa-mem2 line 1492: frac_rep scaling (not yet implemented, frac_rep = 0)
-        // mapq = Int32(Double(mapq) * (1.0 - Double(region.fracRep)) + 0.499)
+        // bwa-mem2 line 1492: frac_rep scaling
+        mapq = Int32(Double(mapq) * (1.0 - Double(region.fracRep)) + 0.499)
 
         return UInt8(clamping: mapq)
     }

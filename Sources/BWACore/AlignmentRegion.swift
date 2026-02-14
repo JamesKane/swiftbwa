@@ -57,6 +57,8 @@ public struct MemAlnReg: Sendable {
     public var altSc: Int32 = 0
     /// Secondary index from Phase 1 (all-hits) marking, before primary-only re-ranking
     public var secondaryAll: Int32 = -1
+    /// Fraction of read bases in highly repetitive seeds (count > maxOcc)
+    public var fracRep: Float = 0.0
 
     public init(rb: Int64 = 0, re: Int64 = 0, qb: Int32 = 0, qe: Int32 = 0,
                 rid: Int32 = -1, score: Int32 = 0, trueScore: Int32 = 0,

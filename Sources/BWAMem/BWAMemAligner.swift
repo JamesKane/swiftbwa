@@ -154,6 +154,10 @@ public actor BWAMemAligner {
             return $0.length > $1.length
         }
 
+        // Compute frac_rep: fraction of query covered by high-occurrence SMEMs
+        // Matches bwa-mem2 bwamem.cpp lines 849-861
+        let fracRep = Self.computeFracRep(smems: smems, readLength: read.length, maxOcc: scoring.maxOccurrences)
+
         // Phase 2: Chain seeds
         var chains = SeedChainer.chain(
             smems: smems,
@@ -165,10 +169,38 @@ public actor BWAMemAligner {
             readLength: Int32(read.length)
         )
 
+        // Set frac_rep on all chains (matches bwa-mem2 bwamem.cpp line 966)
+        for i in 0..<chains.count {
+            chains[i].fracRep = fracRep
+        }
+
         // Phase 3: Filter chains
         ChainFilter.filter(chains: &chains, scoring: scoring)
 
         return chains
+    }
+
+    /// Compute fraction of read bases covered by high-occurrence SMEMs.
+    /// Matches bwa-mem2's frac_rep computation (bwamem.cpp lines 849-861).
+    nonisolated static func computeFracRep(smems: [SMEM], readLength: Int, maxOcc: Int32) -> Float {
+        let maxOccThreshold = Int64(maxOcc)
+        var lRep: Int32 = 0
+        var repB: Int32 = 0
+        var repE: Int32 = 0
+        for smem in smems {
+            guard smem.count > maxOccThreshold else { continue }
+            let sb = smem.queryBegin
+            let se = smem.queryEnd
+            if sb > repE {
+                lRep += repE - repB
+                repB = sb
+                repE = se
+            } else if se > repE {
+                repE = se
+            }
+        }
+        lRep += repE - repB
+        return readLength > 0 ? Float(lRep) / Float(readLength) : 0.0
     }
 
     /// Internal seeding: for long SMEMs with low occurrence, search from the
@@ -242,6 +274,9 @@ public actor BWAMemAligner {
             return $0.length > $1.length
         }
 
+        // Compute frac_rep: fraction of query covered by high-occurrence SMEMs
+        let fracRep = Self.computeFracRep(smems: smems, readLength: read.length, maxOcc: scoring.maxOccurrences)
+
         // Phase 2: Chain seeds
         var chains = SeedChainer.chain(
             smems: smems,
@@ -252,6 +287,11 @@ public actor BWAMemAligner {
             scoring: scoring,
             readLength: Int32(read.length)
         )
+
+        // Set frac_rep on all chains (matches bwa-mem2 bwamem.cpp line 966)
+        for i in 0..<chains.count {
+            chains[i].fracRep = fracRep
+        }
 
         // Phase 3: Filter chains
         ChainFilter.filter(chains: &chains, scoring: scoring)
@@ -296,7 +336,7 @@ public actor BWAMemAligner {
             )
         } else {
             ChainFilter.markSecondary(regions: &regions, maskLevel: scoring.maskLevel,
-                                      readId: readId)
+                                      scoring: scoring, readId: readId)
         }
 
         return regions
@@ -1510,12 +1550,14 @@ public actor BWAMemAligner {
                     let peId2 = (UInt64(gi) &<< 1) | 1
                     if finalRegs1[li].count > 1 {
                         ChainFilter.markSecondary(
-                            regions: &finalRegs1[li], maskLevel: scoring.maskLevel, readId: peId1
+                            regions: &finalRegs1[li], maskLevel: scoring.maskLevel,
+                            scoring: scoring, readId: peId1
                         )
                     }
                     if finalRegs2[li].count > 1 {
                         ChainFilter.markSecondary(
-                            regions: &finalRegs2[li], maskLevel: scoring.maskLevel, readId: peId2
+                            regions: &finalRegs2[li], maskLevel: scoring.maskLevel,
+                            scoring: scoring, readId: peId2
                         )
                     }
                 }
@@ -1613,12 +1655,14 @@ public actor BWAMemAligner {
         let peId2 = (UInt64(idx) &<< 1) | 1
         if regs1.count > 1 {
             ChainFilter.markSecondary(
-                regions: &regs1, maskLevel: scoring.maskLevel, readId: peId1
+                regions: &regs1, maskLevel: scoring.maskLevel,
+                scoring: scoring, readId: peId1
             )
         }
         if regs2.count > 1 {
             ChainFilter.markSecondary(
-                regions: &regs2, maskLevel: scoring.maskLevel, readId: peId2
+                regions: &regs2, maskLevel: scoring.maskLevel,
+                scoring: scoring, readId: peId2
             )
         }
 

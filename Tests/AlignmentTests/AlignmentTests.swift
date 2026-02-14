@@ -879,7 +879,7 @@ struct AlignmentTests {
                 weight: 30, rid: 0, kept: 3, isAlt: true
             ),
             MemChain(
-                seeds: [MemSeed(rbeg: 100, qbeg: 5, len: 20, score: 20)],
+                seeds: [MemSeed(rbeg: 100, qbeg: 5, len: 10, score: 10)],
                 weight: 10, rid: 1, kept: 3, isAlt: true  // low weight, will be removed by min weight filter
             ),
         ]

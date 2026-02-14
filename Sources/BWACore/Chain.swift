@@ -16,6 +16,8 @@ public struct MemChain: Sendable {
     public var pos: Int64
     /// Whether this chain maps to an ALT contig
     public var isAlt: Bool
+    /// Fraction of read bases in highly repetitive seeds
+    public var fracRep: Float = 0.0
 
     public init(seeds: [MemSeed] = [], weight: Int32 = 0, rid: Int32 = -1,
                 kept: Int32 = 0, first: Int32 = -1, pos: Int64 = 0,

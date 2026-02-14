@@ -5,6 +5,48 @@ import BWACore
 public struct ChainFilter: Sendable {
 
     /// Filter chains: remove low-weight chains and those significantly overlapping heavier chains.
+    /// Matches bwa-mem2's `mem_chain_flt()` (bwamem.cpp:506-624), including:
+    /// - Symmetric overlap formula: `overlap >= min(len_i, len_j) * mask_level`
+    /// - Absolute weight difference check: `weight_diff >= minSeedLen * 2`
+    /// - First-shadowed-chain recovery: one suppressed chain per kept chain is
+    ///   recovered (kept=1) so it produces a region for accurate MAPQ/sub computation.
+    /// Compute chain weight as min(non-overlapping query coverage, non-overlapping reference coverage).
+    /// Matches bwa-mem2's `mem_chain_weight()` (bwamem.cpp:429-448).
+    /// Seeds must already be sorted by reference position.
+    private static func chainWeight(_ chain: MemChain) -> Int32 {
+        // Pass 1: non-overlapping query coverage
+        var w: Int32 = 0
+        var end: Int64 = 0
+        for seed in chain.seeds {
+            let sb = Int64(seed.qbeg)
+            let se = sb + Int64(seed.len)
+            if sb >= end {
+                w += seed.len
+            } else if se > end {
+                w += Int32(se - end)
+            }
+            if se > end { end = se }
+        }
+        let tmp = w
+
+        // Pass 2: non-overlapping reference coverage
+        w = 0
+        end = 0
+        for seed in chain.seeds {
+            let sb = seed.rbeg
+            let se = sb + Int64(seed.len)
+            if sb >= end {
+                w += seed.len
+            } else if se > end {
+                w += Int32(se - end)
+            }
+            if se > end { end = se }
+        }
+
+        w = min(w, tmp)
+        return w < (1 << 30) ? w : (1 << 30) - 1
+    }
+
     public static func filter(
         chains: inout [MemChain],
         scoring: ScoringParameters
@@ -12,7 +54,13 @@ public struct ChainFilter: Sendable {
         guard !chains.isEmpty else { return }
 
         let dropRatio = scoring.chainDropRatio
+        let maskLevel = scoring.maskLevel
         let minWeight = scoring.minChainWeight > 0 ? scoring.minChainWeight : scoring.minSeedLength
+
+        // Recompute chain weight properly (bwa-mem2 line 515: c->w = mem_chain_weight(c))
+        for i in 0..<chains.count {
+            chains[i].weight = chainWeight(chains[i])
+        }
 
         // Remove chains below minimum weight
         chains.removeAll { $0.weight < minWeight }
@@ -21,51 +69,96 @@ public struct ChainFilter: Sendable {
         // Sort by weight descending
         chains.sort { $0.weight > $1.weight }
 
-        // Mark kept/removed based on overlap with heavier chains
+        // Initialize kept/first for all chains
         for i in 0..<chains.count {
-            if chains[i].kept == 0 { continue }
+            chains[i].kept = 0
+            chains[i].first = -1
+        }
 
+        // Heaviest chain is always kept
+        chains[0].kept = 3
+        var keptIndices: [Int] = [0]
+
+        // Process chains from second-heaviest to lightest (bwa-mem2 lines 565-589)
+        for i in 1..<chains.count {
             let iBegin = chains[i].seeds.first?.qbeg ?? 0
             let iEnd = chains[i].seeds.last.map { $0.qbeg + $0.len } ?? 0
+            let iLen = iEnd - iBegin
 
-            for j in (i + 1)..<chains.count {
-                if chains[j].kept == 0 { continue }
+            var largeOvlp = false
+            var suppressed = false
 
-                let jBegin = chains[j].seeds.first?.qbeg ?? 0
-                let jEnd = chains[j].seeds.last.map { $0.qbeg + $0.len } ?? 0
+            for ki in keptIndices {
+                let kBegin = chains[ki].seeds.first?.qbeg ?? 0
+                let kEnd = chains[ki].seeds.last.map { $0.qbeg + $0.len } ?? 0
+                let kLen = kEnd - kBegin
 
-                // Calculate overlap
-                let overlapBegin = max(iBegin, jBegin)
-                let overlapEnd = min(iEnd, jEnd)
+                let overlapBegin = max(iBegin, kBegin)
+                let overlapEnd = min(iEnd, kEnd)
 
-                // Don't suppress primary chain (j) when overlapping ALT chain (i)
+                // Don't let ALT kept chain suppress primary candidate
                 if overlapBegin < overlapEnd
-                    && (!chains[i].isAlt || chains[j].isAlt) {
+                    && (!chains[ki].isAlt || chains[i].isAlt)
+                {
                     let overlap = overlapEnd - overlapBegin
-                    let jLen = jEnd - jBegin
+                    let minLen = min(iLen, kLen)
 
-                    if jLen > 0 && Float(overlap) / Float(jLen) > dropRatio &&
-                       Float(chains[j].weight) < Float(chains[i].weight) * dropRatio {
-                        chains[j].kept = 0
+                    // Significant overlap: overlap >= min_l * mask_level
+                    // Use float comparison to match C's int * float promotion
+                    if minLen > 0
+                        && Float(overlap) >= Float(minLen) * maskLevel
+                        && minLen < scoring.maxChainGap
+                    {
+                        largeOvlp = true
+                        // Record first shadowed chain for this kept chain
+                        if chains[ki].first < 0 {
+                            chains[ki].first = Int32(i)
+                        }
+                        // Suppress if weight ratio AND absolute difference both exceeded
+                        if Float(chains[i].weight) < Float(chains[ki].weight) * dropRatio
+                            && chains[ki].weight - chains[i].weight >= scoring.minSeedLength << 1
+                        {
+                            suppressed = true
+                            break
+                        }
                     }
                 }
             }
+
+            if !suppressed {
+                keptIndices.append(i)
+                chains[i].kept = largeOvlp ? 2 : 3
+            }
+            // else chains[i].kept stays 0 (will be removed)
         }
 
-        // Remove unkept chains
+        // Recover first-shadowed chains for MAPQ (bwa-mem2 lines 591-595)
+        for ki in keptIndices {
+            let firstIdx = Int(chains[ki].first)
+            if firstIdx >= 0 && firstIdx < chains.count {
+                chains[firstIdx].kept = 1
+            }
+        }
+
+        // Remove unkept chains (max_chain_extend is effectively unlimited)
         chains.removeAll { $0.kept == 0 }
     }
 
     /// Mark secondary alignment regions based on overlap with primary regions.
+    /// Delegates to `markSecondaryCore` so that `sub` and `subN` are populated
+    /// (critical for correct MAPQ computation).
     public static func markSecondary(
         regions: inout [MemAlnReg],
         maskLevel: Float,
+        scoring: ScoringParameters = ScoringParameters(),
         readId: UInt64 = 0
     ) {
         guard regions.count > 1 else { return }
 
-        // Assign hashes for deterministic tiebreaking (matches bwa-mem2's mem_mark_primary_se)
         for i in 0..<regions.count {
+            regions[i].sub = 0
+            regions[i].subN = 0
+            regions[i].secondary = -1
             regions[i].hash = hash64(readId &+ UInt64(i))
         }
 
@@ -75,26 +168,10 @@ public struct ChainFilter: Sendable {
             return a.hash < b.hash
         }
 
-        for i in 0..<regions.count {
-            if regions[i].secondary >= 0 { continue }
-
-            for j in (i + 1)..<regions.count {
-                if regions[j].secondary >= 0 { continue }
-
-                // Check overlap on query
-                let qOverlapBegin = max(regions[i].qb, regions[j].qb)
-                let qOverlapEnd = min(regions[i].qe, regions[j].qe)
-
-                if qOverlapBegin < qOverlapEnd {
-                    let overlap = Float(qOverlapEnd - qOverlapBegin)
-                    let minLen = Float(min(regions[i].qe - regions[i].qb, regions[j].qe - regions[j].qb))
-
-                    if minLen > 0 && overlap / minLen > maskLevel {
-                        regions[j].secondary = Int32(i)
-                    }
-                }
-            }
-        }
+        markSecondaryCore(
+            regions: &regions, count: regions.count,
+            maskLevel: maskLevel, scoring: scoring
+        )
     }
 
     // MARK: - ALT-Aware Two-Phase Secondary Marking

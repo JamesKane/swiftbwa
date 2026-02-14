@@ -222,7 +222,7 @@ public struct SAMOutputBuilder: Sendable {
         // Add auxiliary tags
         let aux = record.mutableAuxiliaryData
         try aux.updateInt(tag: "AS", value: Int64(region.score))
-        try aux.updateInt(tag: "XS", value: Int64(region.sub))
+        try aux.updateInt(tag: "XS", value: Int64(max(region.sub, region.csub)))
         try aux.updateInt(tag: "NM", value: Int64(nm))
         if let md = md {
             try aux.updateString(tag: "MD", value: md)

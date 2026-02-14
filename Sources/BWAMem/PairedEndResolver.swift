@@ -203,6 +203,24 @@ public struct PairedEndResolver: Sendable {
         let scoreUn = Int(region1.score) + Int(region2.score) - Int(scoring.unpairedPenalty)
         if subo < scoreUn { subo = scoreUn }
 
+        // Synthetic competing pair from SE sub-optimal alignments.
+        // When BOTH reads have SE MAPQ = 0 (both are multi-mappers), the pair likely
+        // has an equally good alternative pairing at an alternative location. Estimate
+        // the competing pair score as o - (score - sub) to compensate for secondary
+        // regions absent from our pair resolver but present in bwa-mem2.
+        // Gate on both reads being MAPQ=0: if only one read is ambiguous, the unique
+        // mate constrains the pair and the alternative may not form a proper pair.
+        if seMAPQ1 == 0 && seMAPQ2 == 0 {
+            if region1.sub > 0 {
+                let synth = o - (Int(region1.score) - Int(region1.sub))
+                if synth > subo { subo = synth }
+            }
+            if region2.sub > 0 {
+                let synth = o - (Int(region2.score) - Int(region2.sub))
+                if synth > subo { subo = synth }
+            }
+        }
+
         // bwa-mem2 line 444: q_pe = raw_mapq(o - subo, a)
         let a = Double(scoring.matchScore)
         var qPe = Int(6.02 * Double(o - subo) / a + 0.499)
@@ -216,7 +234,8 @@ public struct PairedEndResolver: Sendable {
         if qPe < 0 { qPe = 0 }
         if qPe > 60 { qPe = 60 }
 
-        // frac_rep not implemented (would be: qPe *= (1 - 0.5*(frac_rep1 + frac_rep2)))
+        // bwa-mem2 bwamem_pair.cpp line 449: frac_rep scaling
+        qPe = Int(Double(qPe) * (1.0 - 0.5 * (Double(region1.fracRep) + Double(region2.fracRep))) + 0.499)
 
         var q1 = Int(seMAPQ1)
         var q2 = Int(seMAPQ2)

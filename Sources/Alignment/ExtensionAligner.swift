@@ -11,6 +11,7 @@ public struct SeedExtensionPlan: Sendable {
     public let readLen: Int32
     public let chainRid: Int32
     public let chainIsAlt: Bool
+    public let chainFracRep: Float
     public let chainSeedCount: Int
     /// All seeds in the parent chain (for seedCov computation).
     public let chainSeeds: [MemSeed]
@@ -91,6 +92,7 @@ public struct ExtensionAligner: Sendable {
             reg.w = bandWidth
             reg.rid = chain.rid
             reg.isAlt = chain.isAlt
+            reg.fracRep = chain.fracRep
             reg.seedCov = seed.len
             reg.seedLen0 = seed.len
 
@@ -367,6 +369,7 @@ public struct ExtensionAligner: Sendable {
                     readLen: readLen,
                     chainRid: chain.rid,
                     chainIsAlt: chain.isAlt,
+                    chainFracRep: chain.fracRep,
                     chainSeedCount: seeds.count,
                     chainSeeds: seeds,
                     leftQuery: leftQuery,
@@ -442,6 +445,7 @@ public struct ExtensionAligner: Sendable {
             reg.w = bandWidth
             reg.rid = plan.chainRid
             reg.isAlt = plan.chainIsAlt
+            reg.fracRep = plan.chainFracRep
             reg.seedCov = seed.len
             reg.seedLen0 = seed.len
 
