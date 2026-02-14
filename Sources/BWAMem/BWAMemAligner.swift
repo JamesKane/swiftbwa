@@ -1612,25 +1612,51 @@ public actor BWAMemAligner {
         let readCount = reads.count
         var allResults = Array(repeating: [MemAlnReg](), count: readCount)
 
+        // Double-buffered loop: overlap GPU SMEM of batch N+1 with CPU extension of batch N.
+        // Prime the pipeline by dispatching the first batch to GPU (non-blocking).
         var batchStart = 0
+        var batchEnd = min(batchStart + gpuBatchSize, readCount)
+        var batchReads = Array(reads[batchStart..<batchEnd])
+        var queries = batchReads.map { $0.bases }
+        var handle = SMEMDispatcher.dispatchBatchAsync(queries: queries, engine: engine)
+
         while batchStart < readCount {
-            let batchEnd = min(batchStart + gpuBatchSize, readCount)
-            let batchReads = Array(reads[batchStart..<batchEnd])
             let batchCount = batchEnd - batchStart
 
-            // GPU Phase 1: Forward extension for all reads in batch
-            let queries = batchReads.map { $0.bases }
-            let fwdResults = SMEMDispatcher.dispatchBatch(
-                queries: queries,
-                engine: engine
-            )
+            // Wait for GPU results of current batch
+            let fwdResults: [ForwardExtResult]
+            if let h = handle {
+                fwdResults = SMEMDispatcher.collectResults(handle: h)
+            } else {
+                fwdResults = queries.map { q in
+                    ForwardExtResult(
+                        rightEnds: [Int32](repeating: 0, count: q.count),
+                        kValues: [Int64](repeating: 0, count: q.count),
+                        sValues: [Int64](repeating: 0, count: q.count)
+                    )
+                }
+            }
             let gpuSMEMs = SMEMDispatcher.extractSMEMs(
                 from: fwdResults,
                 queries: queries,
                 minSeedLen: scoring.minSeedLength
             )
 
-            // Phases 1.5-5: parallel per-read on CPU
+            // Immediately dispatch NEXT batch to GPU (non-blocking) so it runs
+            // concurrently with the CPU extension of the current batch below.
+            let nextBatchStart = batchEnd
+            let nextBatchEnd = min(nextBatchStart + gpuBatchSize, readCount)
+            var nextHandle: SMEMDispatchHandle? = nil
+            var nextBatchReads: [ReadSequence] = []
+            var nextQueries: [[UInt8]] = []
+            if nextBatchStart < readCount {
+                nextBatchReads = Array(reads[nextBatchStart..<nextBatchEnd])
+                nextQueries = nextBatchReads.map { $0.bases }
+                nextHandle = SMEMDispatcher.dispatchBatchAsync(
+                    queries: nextQueries, engine: engine)
+            }
+
+            // Phases 1.5-5: parallel per-read on CPU (overlaps with GPU running next batch)
             let capturedBatchStart = batchStart
             let batchResults = await withTaskGroup(
                 of: (Int, [MemAlnReg]).self,
@@ -1706,7 +1732,12 @@ public actor BWAMemAligner {
                 allResults[capturedBatchStart + idx] = regions
             }
 
-            batchStart = batchEnd
+            // Advance to next batch
+            batchStart = nextBatchStart
+            batchEnd = nextBatchEnd
+            batchReads = nextBatchReads
+            queries = nextQueries
+            handle = nextHandle
         }
 
         return allResults

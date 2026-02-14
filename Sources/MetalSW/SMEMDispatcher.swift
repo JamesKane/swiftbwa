@@ -8,6 +8,27 @@ public struct ForwardExtResult: Sendable {
     public let rightEnds: [Int32]    // length = query length
     public let kValues: [Int64]
     public let sValues: [Int64]
+
+    public init(rightEnds: [Int32], kValues: [Int64], sValues: [Int64]) {
+        self.rightEnds = rightEnds
+        self.kValues = kValues
+        self.sValues = sValues
+    }
+}
+
+/// Handle for an in-flight GPU SMEM dispatch. Holds the command buffer and
+/// result buffers so the caller can overlap CPU work before collecting results.
+public struct SMEMDispatchHandle: @unchecked Sendable {
+    let cmdBuf: MTLCommandBuffer
+    let rightEndsBuf: MTLBuffer
+    let kValuesBuf: MTLBuffer
+    let sValuesBuf: MTLBuffer
+    let poolBuffers: [MTLBuffer]
+    let queryLengths: [UInt16]
+    let resultOffsets: [UInt32]
+    let totalPositions: Int
+    let taskCount: Int
+    let pool: MetalBufferPool
 }
 
 /// Batch dispatcher for GPU-accelerated SMEM forward extension.
@@ -20,13 +41,7 @@ public struct SMEMDispatcher: Sendable {
         queries: [[UInt8]],
         engine: MetalSWEngine
     ) -> [ForwardExtResult] {
-        guard let pipeline = engine.smemForwardPipeline,
-              let bwtBuf = engine.bwtCheckpointBuffer,
-              let countsBuf = engine.bwtCountsBuffer,
-              let sentBuf = engine.bwtSentinelBuffer,
-              let kmerBuf = engine.kmerHashBuffer,
-              !queries.isEmpty
-        else {
+        guard let handle = dispatchBatchAsync(queries: queries, engine: engine) else {
             return queries.map { q in
                 ForwardExtResult(
                     rightEnds: [Int32](repeating: 0, count: q.count),
@@ -34,6 +49,25 @@ public struct SMEMDispatcher: Sendable {
                     sValues: [Int64](repeating: 0, count: q.count)
                 )
             }
+        }
+        return collectResults(handle: handle)
+    }
+
+    /// Dispatch GPU forward extension without waiting for completion.
+    /// Returns a handle that must be passed to `collectResults` to retrieve data.
+    /// Returns nil if the dispatch could not be set up (missing pipeline, empty queries, etc).
+    public static func dispatchBatchAsync(
+        queries: [[UInt8]],
+        engine: MetalSWEngine
+    ) -> SMEMDispatchHandle? {
+        guard let pipeline = engine.smemForwardPipeline,
+              let bwtBuf = engine.bwtCheckpointBuffer,
+              let countsBuf = engine.bwtCountsBuffer,
+              let sentBuf = engine.bwtSentinelBuffer,
+              let kmerBuf = engine.kmerHashBuffer,
+              !queries.isEmpty
+        else {
+            return nil
         }
 
         let taskCount = queries.count
@@ -67,13 +101,7 @@ public struct SMEMDispatcher: Sendable {
               let resultOffsetsBuf = pool.acquire(minSize: taskCount * 4),
               let numTasksBuf = pool.acquire(minSize: 4)
         else {
-            return queries.map { q in
-                ForwardExtResult(
-                    rightEnds: [Int32](repeating: 0, count: q.count),
-                    kValues: [Int64](repeating: 0, count: q.count),
-                    sValues: [Int64](repeating: 0, count: q.count)
-                )
-            }
+            return nil
         }
 
         let poolBuffers = [queriesBuf, queryOffsetsBuf, queryLengthsBuf,
@@ -94,13 +122,7 @@ public struct SMEMDispatcher: Sendable {
               let encoder = cmdBuf.makeComputeCommandEncoder()
         else {
             pool.release(poolBuffers)
-            return queries.map { q in
-                ForwardExtResult(
-                    rightEnds: [Int32](repeating: 0, count: q.count),
-                    kValues: [Int64](repeating: 0, count: q.count),
-                    sValues: [Int64](repeating: 0, count: q.count)
-                )
-            }
+            return nil
         }
 
         encoder.setComputePipelineState(pipeline)
@@ -129,19 +151,38 @@ public struct SMEMDispatcher: Sendable {
         encoder.endEncoding()
 
         cmdBuf.commit()
-        cmdBuf.waitUntilCompleted()
 
-        // Read back results
-        let rightEndPtr = rightEndsBuf.contents().bindMemory(to: Int32.self, capacity: totalPositions)
-        let kPtr = kValuesBuf.contents().bindMemory(to: Int64.self, capacity: totalPositions)
-        let sPtr = sValuesBuf.contents().bindMemory(to: Int64.self, capacity: totalPositions)
+        return SMEMDispatchHandle(
+            cmdBuf: cmdBuf,
+            rightEndsBuf: rightEndsBuf,
+            kValuesBuf: kValuesBuf,
+            sValuesBuf: sValuesBuf,
+            poolBuffers: poolBuffers,
+            queryLengths: queryLengths,
+            resultOffsets: resultOffsets,
+            totalPositions: totalPositions,
+            taskCount: taskCount,
+            pool: pool
+        )
+    }
+
+    /// Wait for an in-flight GPU dispatch to complete and read back results.
+    public static func collectResults(handle: SMEMDispatchHandle) -> [ForwardExtResult] {
+        handle.cmdBuf.waitUntilCompleted()
+
+        let rightEndPtr = handle.rightEndsBuf.contents().bindMemory(
+            to: Int32.self, capacity: handle.totalPositions)
+        let kPtr = handle.kValuesBuf.contents().bindMemory(
+            to: Int64.self, capacity: handle.totalPositions)
+        let sPtr = handle.sValuesBuf.contents().bindMemory(
+            to: Int64.self, capacity: handle.totalPositions)
 
         var results: [ForwardExtResult] = []
-        results.reserveCapacity(taskCount)
+        results.reserveCapacity(handle.taskCount)
 
-        for i in 0..<taskCount {
-            let offset = Int(resultOffsets[i])
-            let len = Int(queryLengths[i])
+        for i in 0..<handle.taskCount {
+            let offset = Int(handle.resultOffsets[i])
+            let len = Int(handle.queryLengths[i])
 
             let rightEnds = Array(UnsafeBufferPointer(start: rightEndPtr + offset, count: len))
             let kVals = Array(UnsafeBufferPointer(start: kPtr + offset, count: len))
@@ -154,7 +195,7 @@ public struct SMEMDispatcher: Sendable {
             ))
         }
 
-        pool.release(poolBuffers)
+        handle.pool.release(handle.poolBuffers)
         return results
     }
 
