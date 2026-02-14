@@ -20,6 +20,33 @@ public final class FMIndex: @unchecked Sendable {
     /// Genome length (one strand only, = referenceSeqLen / 2)
     public var genomeLength: Int64 { bwt.length / 2 }
 
+    /// Fetch reference bases into a pre-allocated buffer, handling both strands.
+    /// Returns the number of bases written.
+    public func getReference(at pos: Int64, length: Int, into buffer: UnsafeMutablePointer<UInt8>) -> Int {
+        let gl = genomeLength
+        if pos >= gl {
+            let fwdEnd = 2 * gl - pos
+            let fwdStart = fwdEnd - Int64(length)
+            let safeStart = max(0, fwdStart)
+            let safeEnd = min(fwdEnd, gl)
+            let safeLen = Int(safeEnd - safeStart)
+            guard safeLen > 0 else { return 0 }
+            packedRef.subsequence(from: safeStart, length: safeLen, into: buffer)
+            var lo = 0; var hi = safeLen - 1
+            while lo < hi {
+                let tmp = buffer[lo]; buffer[lo] = buffer[hi]; buffer[hi] = tmp
+                lo += 1; hi -= 1
+            }
+            for i in 0..<safeLen { buffer[i] = 3 - buffer[i] }
+            return safeLen
+        } else {
+            let safeLen = min(length, Int(gl - pos))
+            guard safeLen > 0 && pos >= 0 else { return 0 }
+            packedRef.subsequence(from: pos, length: safeLen, into: buffer)
+            return safeLen
+        }
+    }
+
     /// Fetch reference bases at a BWT-space position, handling both strands.
     ///
     /// The packed reference (.pac) stores only the forward strand. Positions in

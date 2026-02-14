@@ -232,6 +232,198 @@ public struct ExtensionAligner: Sendable {
         return regions
     }
 
+    /// Extend a chain using pre-allocated workspace buffers to avoid per-seed heap allocations.
+    ///
+    /// - Parameters:
+    ///   - chain: The seed chain to extend
+    ///   - read: The read sequence (2-bit encoded)
+    ///   - getReference: Closure that writes reference bases into a buffer and returns count written
+    ///   - scoring: Scoring parameters
+    ///   - scoringMatrix: Pre-computed 25-element scoring matrix
+    ///   - queryBuf: Pre-allocated buffer of at least `read.length` bytes
+    ///   - targetBuf: Pre-allocated buffer of at least 10200 bytes
+    public static func extend(
+        chain: MemChain,
+        read: ReadSequence,
+        getReference: (Int64, Int, UnsafeMutablePointer<UInt8>) -> Int,
+        scoring: ScoringParameters,
+        scoringMatrix: [Int8],
+        queryBuf: UnsafeMutablePointer<UInt8>,
+        targetBuf: UnsafeMutablePointer<UInt8>
+    ) -> [MemAlnReg] {
+        var regions: [MemAlnReg] = []
+        let seeds = chain.seeds
+        guard !seeds.isEmpty else { return regions }
+
+        let readLen = Int32(read.length)
+        let bandWidth = scoring.bandWidth
+        let mat = scoringMatrix
+
+        let tmp = max(
+            scoring.matchScore + scoring.mismatchPenalty,
+            max(scoring.gapOpenPenalty + scoring.gapExtendPenalty,
+                scoring.gapOpenPenaltyDeletion + scoring.gapExtendPenaltyDeletion)
+        )
+
+        var coveredRegions: [(qb: Int32, qe: Int32)] = []
+
+        for seedIdx in 0..<seeds.count {
+            let seed = seeds[seedIdx]
+
+            let seedQEnd = seed.qbeg + seed.len
+            let seedREnd = seed.rbeg + Int64(seed.len)
+
+            var coveringRegIdx = -1
+            for (idx, cov) in coveredRegions.enumerated() {
+                if seed.qbeg >= cov.qb && seedQEnd <= cov.qe {
+                    coveringRegIdx = idx
+                    break
+                }
+            }
+
+            if coveringRegIdx >= 0 {
+                let seedAlnScore = seed.len * scoring.matchScore
+                if seedAlnScore > regions[coveringRegIdx].sub {
+                    regions[coveringRegIdx].sub = seedAlnScore
+                }
+                if seedAlnScore >= regions[coveringRegIdx].score - tmp {
+                    regions[coveringRegIdx].subN += 1
+                }
+                continue
+            }
+
+            var reg = MemAlnReg()
+            reg.w = bandWidth
+            reg.rid = chain.rid
+            reg.isAlt = chain.isAlt
+            reg.fracRep = chain.fracRep
+            reg.seedCov = seed.len
+            reg.seedLen0 = seed.len
+
+            var accumulatedH0 = seed.score
+
+            // --- Left extension ---
+            var leftScore: Int32 = 0
+            var leftQLen: Int32 = 0
+            var leftTLen: Int32 = 0
+
+            if seed.qbeg > 0 {
+                let queryLeftLen = Int(seed.qbeg)
+                // Write reversed query into queryBuf
+                for i in 0..<queryLeftLen {
+                    queryBuf[i] = read.bases[queryLeftLen - 1 - i]
+                }
+
+                let targetLeftLen = min(queryLeftLen + Int(bandWidth), Int(seed.rbeg))
+                if targetLeftLen > 0 {
+                    let targetStart = seed.rbeg - Int64(targetLeftLen)
+                    let actualTargetLen = getReference(targetStart, targetLeftLen, targetBuf)
+
+                    // Reverse targetBuf in-place
+                    var lo = 0; var hi = actualTargetLen - 1
+                    while lo < hi {
+                        let t = targetBuf[lo]; targetBuf[lo] = targetBuf[hi]; targetBuf[hi] = t
+                        lo += 1; hi -= 1
+                    }
+
+                    let qBuf = UnsafeBufferPointer(start: queryBuf, count: queryLeftLen)
+                    let tBuf = UnsafeBufferPointer(start: targetBuf, count: actualTargetLen)
+                    let result = bandedSWExtend(
+                        query: qBuf, target: tBuf,
+                        scoring: scoring, w: bandWidth,
+                        h0: seed.score, scoringMatrix: mat
+                    )
+
+                    accumulatedH0 = result.score
+
+                    if result.globalScore <= 0
+                        || result.globalScore <= result.score - scoring.penClip5 {
+                        leftQLen = result.queryEnd
+                        leftTLen = result.targetEnd
+                        leftScore = result.score
+                    } else {
+                        leftQLen = seed.qbeg
+                        leftTLen = result.globalTargetEnd
+                        leftScore = result.globalScore
+                    }
+                }
+            }
+
+            // --- Right extension ---
+            var rightScore: Int32 = 0
+            var rightQLen: Int32 = 0
+            var rightTLen: Int32 = 0
+
+            if seedQEnd < readLen {
+                let queryRightLen = read.length - Int(seedQEnd)
+                // Write forward query into queryBuf
+                for i in 0..<queryRightLen {
+                    queryBuf[i] = read.bases[Int(seedQEnd) + i]
+                }
+
+                let targetRightLen = min(Int(readLen - seedQEnd) + Int(bandWidth), 10000)
+                if targetRightLen > 0 {
+                    let actualTargetLen = getReference(seedREnd, targetRightLen, targetBuf)
+
+                    let qBuf = UnsafeBufferPointer(start: queryBuf, count: queryRightLen)
+                    let tBuf = UnsafeBufferPointer(start: targetBuf, count: actualTargetLen)
+                    let result = bandedSWExtend(
+                        query: qBuf, target: tBuf,
+                        scoring: scoring, w: bandWidth,
+                        h0: accumulatedH0, scoringMatrix: mat
+                    )
+
+                    if result.globalScore <= 0
+                        || result.globalScore <= result.score - scoring.penClip3 {
+                        rightQLen = result.queryEnd
+                        rightTLen = result.targetEnd
+                        rightScore = result.score
+                    } else {
+                        rightQLen = readLen - seedQEnd
+                        rightTLen = result.globalTargetEnd
+                        rightScore = result.globalScore
+                    }
+                }
+            }
+
+            reg.qb = seed.qbeg - leftQLen
+            reg.qe = seedQEnd + rightQLen
+            reg.rb = seed.rbeg - Int64(leftTLen)
+            reg.re = seedREnd + Int64(rightTLen)
+
+            var trueScore = Int32(seed.len) * scoring.matchScore
+            if leftScore > 0 {
+                trueScore = leftScore
+            }
+            if rightScore > 0 {
+                trueScore += rightScore - accumulatedH0
+            }
+            reg.score = trueScore
+            reg.trueScore = trueScore
+
+            var seedCov: Int32 = 0
+            for s in seeds {
+                if s.qbeg >= reg.qb && s.qbeg + s.len <= reg.qe
+                    && s.rbeg >= reg.rb && s.rbeg + Int64(s.len) <= reg.re {
+                    seedCov += s.len
+                }
+            }
+            reg.seedCov = seedCov
+
+            coveredRegions.append((qb: reg.qb, qe: reg.qe))
+            regions.append(reg)
+        }
+
+        let subThreshold = scoring.minSeedLength * scoring.matchScore
+        for i in 0..<regions.count {
+            if regions[i].sub > 0 && regions[i].sub < subThreshold {
+                regions[i].sub = 0
+            }
+        }
+
+        return regions
+    }
+
     // MARK: - Cross-Chain Coverage Helpers
 
     /// Maximum gap length at a given query length.

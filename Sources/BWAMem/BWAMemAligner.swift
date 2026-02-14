@@ -84,6 +84,32 @@ public actor BWAMemAligner {
         self.options = options
     }
 
+    /// Extend all chains for a read using pre-allocated workspace buffers.
+    nonisolated func extendChains(
+        _ chains: [MemChain], read: ReadSequence, scoring: ScoringParameters, scoringMatrix mat: [Int8]
+    ) -> [MemAlnReg] {
+        let queryBuf = UnsafeMutablePointer<UInt8>.allocate(capacity: read.length)
+        let targetBuf = UnsafeMutablePointer<UInt8>.allocate(capacity: 10200)
+        defer { queryBuf.deallocate(); targetBuf.deallocate() }
+
+        var regions: [MemAlnReg] = []
+        for chain in chains {
+            let chainRegions = ExtensionAligner.extend(
+                chain: chain,
+                read: read,
+                getReference: { [index] pos, length, buf in
+                    index.getReference(at: pos, length: length, into: buf)
+                },
+                scoring: scoring,
+                scoringMatrix: mat,
+                queryBuf: queryBuf,
+                targetBuf: targetBuf
+            )
+            regions.append(contentsOf: chainRegions)
+        }
+        return regions
+    }
+
     /// Align a single read against the reference (CPU path).
     /// Calls phase1to3, CPU extension, then phase4to5.
     nonisolated public func alignRead(_ read: ReadSequence, readId: UInt64 = 0) -> [MemAlnReg] {
@@ -91,18 +117,8 @@ public actor BWAMemAligner {
         guard !chains.isEmpty else { return [] }
 
         let scoring = options.scoring
-        var regions: [MemAlnReg] = []
-        for chain in chains {
-            let chainRegions = ExtensionAligner.extend(
-                chain: chain,
-                read: read,
-                getReference: { [index] pos, length in
-                    index.getReference(at: pos, length: length)
-                },
-                scoring: scoring
-            )
-            regions.append(contentsOf: chainRegions)
-        }
+        let mat = scoring.scoringMatrix()
+        let regions = extendChains(chains, read: read, scoring: scoring, scoringMatrix: mat)
 
         return alignReadPhase4to5(read, readId: readId, regions: regions)
     }
@@ -856,23 +872,12 @@ public actor BWAMemAligner {
                             return (gi, [], specs)
                         }
 
-                        var regions: [MemAlnReg] = []
-                        for chain in chains {
-                            let chainRegions = ExtensionAligner.extend(
-                                chain: chain,
-                                read: read,
-                                getReference: { [index] pos, length in
-                                    index.getReference(at: pos, length: length)
-                                },
-                                scoring: scoring
-                            )
-                            regions.append(contentsOf: chainRegions)
-                        }
+                        let mat = scoring.scoringMatrix()
+                        let regions = self.extendChains(chains, read: read, scoring: scoring, scoringMatrix: mat)
 
                         let finalRegions = self.alignReadPhase4to5(
                             read, readId: UInt64(gi), regions: regions
                         )
-                        let mat = scoring.scoringMatrix()
                         let cigars = self.generateFilteredCIGARs(
                             read: read, regions: finalRegions, scoringMatrix: mat
                         )
@@ -1934,18 +1939,8 @@ public actor BWAMemAligner {
                         let chains = self.alignReadPhase1_5to3(read, gpuSMEMs: smems, internalReseedDone: true)
                         guard !chains.isEmpty else { return (idx, []) }
 
-                        var regions: [MemAlnReg] = []
-                        for chain in chains {
-                            let chainRegions = ExtensionAligner.extend(
-                                chain: chain,
-                                read: read,
-                                getReference: { [index] pos, length in
-                                    index.getReference(at: pos, length: length)
-                                },
-                                scoring: scoring
-                            )
-                            regions.append(contentsOf: chainRegions)
-                        }
+                        let mat = scoring.scoringMatrix()
+                        let regions = self.extendChains(chains, read: read, scoring: scoring, scoringMatrix: mat)
 
                         return (idx, self.alignReadPhase4to5(read, readId: readId, regions: regions))
                     }
@@ -1964,18 +1959,8 @@ public actor BWAMemAligner {
                             let chains = self.alignReadPhase1_5to3(read, gpuSMEMs: smems, internalReseedDone: true)
                             guard !chains.isEmpty else { return (idx, []) }
 
-                            var regions: [MemAlnReg] = []
-                            for chain in chains {
-                                let chainRegions = ExtensionAligner.extend(
-                                    chain: chain,
-                                    read: read,
-                                    getReference: { [index] pos, length in
-                                        index.getReference(at: pos, length: length)
-                                    },
-                                    scoring: scoring
-                                )
-                                regions.append(contentsOf: chainRegions)
-                            }
+                            let mat = scoring.scoringMatrix()
+                            let regions = self.extendChains(chains, read: read, scoring: scoring, scoringMatrix: mat)
 
                             return (idx, self.alignReadPhase4to5(read, readId: readId, regions: regions))
                         }
@@ -2218,18 +2203,8 @@ public actor BWAMemAligner {
                         let chains = self.alignReadPhase1_5to3(read, gpuSMEMs: smems, internalReseedDone: true)
                         guard !chains.isEmpty else { return (idx, []) }
 
-                        var regions: [MemAlnReg] = []
-                        for chain in chains {
-                            let chainRegions = ExtensionAligner.extend(
-                                chain: chain,
-                                read: read,
-                                getReference: { [index] pos, length in
-                                    index.getReference(at: pos, length: length)
-                                },
-                                scoring: scoring
-                            )
-                            regions.append(contentsOf: chainRegions)
-                        }
+                        let mat = scoring.scoringMatrix()
+                        let regions = self.extendChains(chains, read: read, scoring: scoring, scoringMatrix: mat)
 
                         return (idx, self.alignReadPhase4to5(read, readId: readId, regions: regions))
                     }
@@ -2248,18 +2223,8 @@ public actor BWAMemAligner {
                             let chains = self.alignReadPhase1_5to3(read, gpuSMEMs: smems, internalReseedDone: true)
                             guard !chains.isEmpty else { return (idx, []) }
 
-                            var regions: [MemAlnReg] = []
-                            for chain in chains {
-                                let chainRegions = ExtensionAligner.extend(
-                                    chain: chain,
-                                    read: read,
-                                    getReference: { [index] pos, length in
-                                        index.getReference(at: pos, length: length)
-                                    },
-                                    scoring: scoring
-                                )
-                                regions.append(contentsOf: chainRegions)
-                            }
+                            let mat = scoring.scoringMatrix()
+                            let regions = self.extendChains(chains, read: read, scoring: scoring, scoringMatrix: mat)
 
                             return (idx, self.alignReadPhase4to5(read, readId: readId, regions: regions))
                         }

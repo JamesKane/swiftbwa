@@ -37,6 +37,14 @@ public final class PackedReference: @unchecked Sendable {
         return (data[byteIdx] >> shift) & 3
     }
 
+    /// Write subsequence into pre-allocated buffer.
+    @inlinable
+    public func subsequence(from start: Int64, length: Int, into buffer: UnsafeMutablePointer<UInt8>) {
+        for i in 0..<length {
+            buffer[i] = base(at: start + Int64(i))
+        }
+    }
+
     /// Extract a subsequence as an array of 2-bit encoded bases.
     public func subsequence(from start: Int64, length: Int) -> [UInt8] {
         var result = [UInt8](repeating: 0, count: length)
