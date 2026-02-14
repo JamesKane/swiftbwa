@@ -50,9 +50,6 @@ public struct ExtensionAligner: Sendable {
         let bandWidth = scoring.bandWidth
         let mat = scoring.scoringMatrix()
 
-        // Process each seed as potential extension anchor
-        var coveredRegions: [(qb: Int32, qe: Int32, rb: Int64, re: Int64)] = []
-
         // tmp = max single-event penalty (for subN threshold, matches markSecondaryCore)
         let tmp = max(
             scoring.matchScore + scoring.mismatchPenalty,
@@ -60,25 +57,26 @@ public struct ExtensionAligner: Sendable {
                 scoring.gapOpenPenaltyDeletion + scoring.gapExtendPenaltyDeletion)
         )
 
+        // Within-chain coverage: track query ranges of already-extended regions
+        var coveredRegions: [(qb: Int32, qe: Int32)] = []
+
         for seedIdx in 0..<seeds.count {
             let seed = seeds[seedIdx]
 
-            // Skip if this seed region is already covered by a previous extension
             let seedQEnd = seed.qbeg + seed.len
             let seedREnd = seed.rbeg + Int64(seed.len)
 
-            var alreadyCovered = false
+            // Within-chain coverage check: simple query containment
             var coveringRegIdx = -1
-            for (idx, covered) in coveredRegions.enumerated() {
-                if seed.qbeg >= covered.qb && seedQEnd <= covered.qe {
-                    alreadyCovered = true
+            for (idx, cov) in coveredRegions.enumerated() {
+                if seed.qbeg >= cov.qb && seedQEnd <= cov.qe {
                     coveringRegIdx = idx
                     break
                 }
             }
-            if alreadyCovered {
-                // Track sub-optimal score from covered seed (matches bwa-mem2's csub logic).
-                // The seed's alignment score estimate is seed.len * matchScore.
+
+            if coveringRegIdx >= 0 {
+                // Seed is covered within this chain — update sub/subN
                 let seedAlnScore = seed.len * scoring.matchScore
                 if seedAlnScore > regions[coveringRegIdx].sub {
                     regions[coveringRegIdx].sub = seedAlnScore
@@ -94,7 +92,7 @@ public struct ExtensionAligner: Sendable {
             reg.rid = chain.rid
             reg.isAlt = chain.isAlt
             reg.seedCov = seed.len
-            reg.seedLen0 = Int32(seeds.count)
+            reg.seedLen0 = seed.len
 
             // Accumulated h0 chains through extensions (matches bwa-mem2's sc0 pattern).
             // Left extension starts from seed.score; right extension starts from left's
@@ -217,7 +215,7 @@ public struct ExtensionAligner: Sendable {
             }
             reg.seedCov = seedCov
 
-            coveredRegions.append((reg.qb, reg.qe, reg.rb, reg.re))
+            coveredRegions.append((qb: reg.qb, qe: reg.qe))
             regions.append(reg)
         }
 
@@ -230,6 +228,89 @@ public struct ExtensionAligner: Sendable {
         }
 
         return regions
+    }
+
+    // MARK: - Cross-Chain Coverage Helpers
+
+    /// Maximum gap length at a given query length.
+    /// Matches bwa-mem2's `cal_max_gap` (bwamem.cpp:66-76).
+    private static func calMaxGap(queryLen: Int, scoring: ScoringParameters) -> Int {
+        let a = Int(scoring.matchScore)
+        let oDel = Int(scoring.gapOpenPenaltyDeletion)
+        let eDel = Int(scoring.gapExtendPenaltyDeletion)
+        let oIns = Int(scoring.gapOpenPenalty)
+        let eIns = Int(scoring.gapExtendPenalty)
+        let lDel = eDel > 0 ? (queryLen * a - oDel) / eDel + 1 : 1
+        let lIns = eIns > 0 ? (queryLen * a - oIns) / eIns + 1 : 1
+        var l = max(lDel, lIns)
+        l = max(l, 1)
+        return min(l, Int(scoring.bandWidth) << 1)
+    }
+
+    /// Check if a seed is covered by an existing alignment region using
+    /// query+reference containment and diagonal proximity.
+    /// Matches bwa-mem2's check in mem_chain2aln_across_reads_V2 (lines 2930-2955).
+    private static func isSeedCoveredByRegion(
+        seed: MemSeed,
+        seedQEnd: Int32,
+        seedREnd: Int64,
+        region: MemAlnReg,
+        readLength: Int32,
+        scoring: ScoringParameters
+    ) -> Bool {
+        // 1. Seed must be fully contained on both query AND reference
+        guard seed.qbeg >= region.qb && seedQEnd <= region.qe
+           && seed.rbeg >= region.rb && seedREnd <= region.re else { return false }
+
+        // 2. Seed length vs region's original seed length (bwa-mem2 line 2944)
+        if seed.len - region.seedLen0 > Int32(Float(readLength) * 0.1) { return false }
+
+        // 3. Diagonal proximity check from the front
+        let qd = Int(seed.qbeg - region.qb)
+        let rd = Int(seed.rbeg - region.rb)
+        let minDist = min(qd, rd)
+        var maxGap = calMaxGap(queryLen: minDist, scoring: scoring)
+        var w = min(maxGap, Int(region.w))
+        if abs(qd - rd) < w { return true }
+
+        // 4. Diagonal proximity check from the back
+        let qd2 = Int(region.qe - seedQEnd)
+        let rd2 = Int(region.re - seedREnd)
+        let minDist2 = min(qd2, rd2)
+        maxGap = calMaxGap(queryLen: minDist2, scoring: scoring)
+        w = min(maxGap, Int(region.w))
+        if abs(qd2 - rd2) < w { return true }
+
+        return false
+    }
+
+    /// Check if any other seed in the chain overlaps with the given seed on query
+    /// coordinates but maps to a different reference diagonal, suggesting a genuinely
+    /// different alignment. Matches bwa-mem2 lines 2965-2978.
+    private static func hasOverlappingSeedEvidence(
+        seedIdx: Int,
+        seeds: [MemSeed],
+        currentSeed: MemSeed
+    ) -> Bool {
+        for otherIdx in 0..<seeds.count {
+            if otherIdx == seedIdx { continue }
+            let t = seeds[otherIdx]
+            // Only check seeds of similar length
+            if t.len < Int32(Float(currentSeed.len) * 0.95) { continue }
+            // Check overlap from current seed's perspective
+            if currentSeed.qbeg <= t.qbeg
+                && currentSeed.qbeg + currentSeed.len - t.qbeg >= currentSeed.len >> 2
+                && t.qbeg - currentSeed.qbeg != Int32(truncatingIfNeeded: t.rbeg - currentSeed.rbeg) {
+                return true
+            }
+            // Check overlap from other seed's perspective
+            if t.qbeg <= currentSeed.qbeg
+                && t.qbeg + t.len - currentSeed.qbeg >= currentSeed.len >> 2
+                && currentSeed.qbeg - t.qbeg != Int32(truncatingIfNeeded: currentSeed.rbeg - t.rbeg) {
+                return true
+            }
+        }
+        return false
     }
 
     // MARK: - GPU Batch Extension Support
@@ -321,41 +402,40 @@ public struct ExtensionAligner: Sendable {
         )
 
         var regions: [MemAlnReg] = []
-        // Per-chain covered regions for filtering
-        var currentChainIndex = -1
-        var coveredRegions: [(qb: Int32, qe: Int32, rb: Int64, re: Int64)] = []
-        // Map from coveredRegions index to regions index
-        var coveredToRegionIdx: [Int] = []
 
         for (planIdx, plan) in plans.enumerated() {
-            // Reset covered regions when we enter a new chain
-            if plan.chainIndex != currentChainIndex {
-                currentChainIndex = plan.chainIndex
-                coveredRegions.removeAll(keepingCapacity: true)
-                coveredToRegionIdx.removeAll(keepingCapacity: true)
-            }
-
             let seed = plan.seed
+            let readLen = plan.readLen
 
-            // Covered-region check (post-hoc)
-            var alreadyCovered = false
+            // Cross-chain coverage check (matches CPU path)
             var coveringRegIdx = -1
-            for (idx, covered) in coveredRegions.enumerated() {
-                if seed.qbeg >= covered.qb && plan.seedQEnd <= covered.qe {
-                    alreadyCovered = true
-                    coveringRegIdx = coveredToRegionIdx[idx]
+            for (idx, reg) in regions.enumerated() {
+                if isSeedCoveredByRegion(
+                    seed: seed, seedQEnd: plan.seedQEnd, seedREnd: plan.seedREnd,
+                    region: reg, readLength: readLen, scoring: scoring
+                ) {
+                    coveringRegIdx = idx
                     break
                 }
             }
-            if alreadyCovered {
-                let seedAlnScore = seed.len * scoring.matchScore
-                if seedAlnScore > regions[coveringRegIdx].sub {
-                    regions[coveringRegIdx].sub = seedAlnScore
+
+            if coveringRegIdx >= 0 {
+                // Check for overlapping-seed evidence of different alignment
+                if hasOverlappingSeedEvidence(
+                    seedIdx: plan.seedIndexInChain, seeds: plan.chainSeeds,
+                    currentSeed: seed
+                ) {
+                    // Evidence found — keep this extension
+                } else {
+                    let seedAlnScore = seed.len * scoring.matchScore
+                    if seedAlnScore > regions[coveringRegIdx].sub {
+                        regions[coveringRegIdx].sub = seedAlnScore
+                    }
+                    if seedAlnScore >= regions[coveringRegIdx].score - tmp {
+                        regions[coveringRegIdx].subN += 1
+                    }
+                    continue
                 }
-                if seedAlnScore >= regions[coveringRegIdx].score - tmp {
-                    regions[coveringRegIdx].subN += 1
-                }
-                continue
             }
 
             var reg = MemAlnReg()
@@ -363,7 +443,7 @@ public struct ExtensionAligner: Sendable {
             reg.rid = plan.chainRid
             reg.isAlt = plan.chainIsAlt
             reg.seedCov = seed.len
-            reg.seedLen0 = Int32(plan.chainSeedCount)
+            reg.seedLen0 = seed.len
 
             var accumulatedH0 = seed.score
 
@@ -434,8 +514,6 @@ public struct ExtensionAligner: Sendable {
             }
             reg.seedCov = seedCov
 
-            coveredRegions.append((reg.qb, reg.qe, reg.rb, reg.re))
-            coveredToRegionIdx.append(regions.count)
             regions.append(reg)
         }
 

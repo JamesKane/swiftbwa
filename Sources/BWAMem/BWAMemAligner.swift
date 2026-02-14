@@ -120,6 +120,9 @@ public actor BWAMemAligner {
 
         guard !smems.isEmpty else { return [] }
 
+        // Phase 1.25: Internal seeding — split long low-occ SMEMs to find alternative loci
+        internalReseed(smems: &smems, read: read, scoring: scoring)
+
         // Phase 1.5: Re-seeding (-y)
         if scoring.reseedLength > 0 {
             let maxOcc = Int64(scoring.maxOccurrences)
@@ -166,12 +169,45 @@ public actor BWAMemAligner {
         return chains
     }
 
+    /// Internal seeding: for long SMEMs with low occurrence, search from the
+    /// midpoint with higher min_intv to find shorter seeds at alternative loci.
+    /// Matches bwa-mem2's split_factor/split_width logic (bwamem.cpp:695-753).
+    nonisolated func internalReseed(
+        smems: inout [SMEM], read: ReadSequence, scoring: ScoringParameters
+    ) {
+        let splitLen = Int(Float(scoring.minSeedLength) * scoring.seedSplitRatio + 0.499)
+        var newSMEMs: [SMEM] = []
+
+        for smem in smems {
+            let len = Int(smem.queryEnd - smem.queryBegin)
+            if len < splitLen || smem.count > Int64(scoring.splitWidth) { continue }
+
+            let midpoint = Int(smem.queryBegin + smem.queryEnd) / 2
+            let (internalSMEMs, _) = SMEMFinder.findSMEMsAtPosition(
+                query: read.bases, bwt: index.bwt,
+                startPos: midpoint, minSeedLen: scoring.minSeedLength,
+                minIntv: smem.count + 1
+            )
+            newSMEMs.append(contentsOf: internalSMEMs)
+        }
+
+        guard !newSMEMs.isEmpty else { return }
+        smems.append(contentsOf: newSMEMs)
+        smems.sort {
+            if $0.queryBegin != $1.queryBegin { return $0.queryBegin < $1.queryBegin }
+            return $0.length > $1.length
+        }
+    }
+
     /// Phase 1.5-3: Re-seeding (if needed) + chaining + filtering from pre-computed SMEMs.
     /// Used by GPU seeding path where phase 1 (SMEM finding) was done on GPU.
     nonisolated func alignReadPhase1_5to3(_ read: ReadSequence, gpuSMEMs: [SMEM]) -> [MemChain] {
         let scoring = options.scoring
         var smems = gpuSMEMs
         guard !smems.isEmpty else { return [] }
+
+        // Internal seeding for GPU-computed SMEMs
+        internalReseed(smems: &smems, read: read, scoring: scoring)
 
         // Phase 1.5: Re-seeding (-y) — runs on CPU for high-occ seeds
         if scoring.reseedLength > 0 {
