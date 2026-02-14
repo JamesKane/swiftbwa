@@ -423,6 +423,15 @@ public actor BWAMemAligner {
             rb = fwdRb
             re = fwdRe
         }
+
+        // Clamp re to chromosome boundary so CIGAR doesn't extend past reference end
+        let rid = index.metadata.sequenceID(for: rb)
+        if rid >= 0 && rid < index.metadata.numSequences {
+            let ann = index.metadata.annotations[Int(rid)]
+            let chrEnd = ann.offset + Int64(ann.length)
+            if re > chrEnd { re = chrEnd }
+        }
+
         let refLen = Int(re - rb)
         let safeRefLen = min(refLen, Int(index.packedRef.length - rb))
         let refSegment: [UInt8]

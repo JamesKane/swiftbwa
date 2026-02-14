@@ -283,9 +283,16 @@ struct Mem: AsyncParsableCommand {
             #endif
         }
 
-        // Output
-        let outputMode = output != nil ? "wb" : "w"
+        // Output — detect format from file extension (.sam → text, .bam or default → BAM)
         let outputPath = output ?? "-"
+        let outputMode: String
+        if let output = output, output.hasSuffix(".sam") {
+            outputMode = "w"
+        } else if output != nil {
+            outputMode = "wb"
+        } else {
+            outputMode = "w"  // stdout defaults to SAM text
+        }
 
         let aligner = BWAMemAligner(index: index, options: options)
         let header = try SAMOutputBuilder.buildHeader(
