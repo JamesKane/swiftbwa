@@ -8,10 +8,12 @@ import Musl
 #endif
 
 /// Orientation of a read pair.
+/// Raw values match bwa-mem2's direction encoding used in mem_matesw/mem_infer_dir:
+/// bit 0 = same/diff strand, XOR 3 if mate upstream → FF=0, FR=1, RF=2, RR=3.
 public enum PairOrientation: Int, Sendable, CaseIterable {
-    case fr = 0  // Forward-Reverse (standard Illumina)
-    case rf = 1  // Reverse-Forward
-    case ff = 2  // Forward-Forward
+    case ff = 0  // Forward-Forward
+    case fr = 1  // Forward-Reverse (standard Illumina)
+    case rf = 2  // Reverse-Forward
     case rr = 3  // Reverse-Reverse
 }
 
@@ -104,9 +106,8 @@ public struct InsertSizeEstimator: Sendable {
         // bwa direction encoding: same-strand→0, diff→1, XOR with 3 if p2<=b1
         let bwaDir = (sameStrand ? 0 : 1) ^ (p2 > r1.rb ? 0 : 3)
 
-        // Map bwa dir (FF=0, FR=1, RF=2, RR=3) to PairOrientation
-        let orientations: [PairOrientation] = [.ff, .fr, .rf, .rr]
-        let orientation = orientations[bwaDir]
+        // bwa dir encoding matches PairOrientation rawValues: FF=0, FR=1, RF=2, RR=3
+        let orientation = PairOrientation(rawValue: bwaDir)!
 
         return (orientation, dist)
     }

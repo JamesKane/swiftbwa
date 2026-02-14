@@ -145,11 +145,13 @@ public actor BWAMemAligner {
                         seen.insert(key)
                     }
                 }
-                smems.sort {
-                    if $0.queryBegin != $1.queryBegin { return $0.queryBegin < $1.queryBegin }
-                    return $0.length > $1.length
-                }
             }
+        }
+
+        // Sort all seeds by position before chaining (matches bwa-mem2 sortSMEMs after all phases)
+        smems.sort {
+            if $0.queryBegin != $1.queryBegin { return $0.queryBegin < $1.queryBegin }
+            return $0.length > $1.length
         }
 
         // Phase 2: Chain seeds
@@ -231,11 +233,13 @@ public actor BWAMemAligner {
                         seen.insert(key)
                     }
                 }
-                smems.sort {
-                    if $0.queryBegin != $1.queryBegin { return $0.queryBegin < $1.queryBegin }
-                    return $0.length > $1.length
-                }
             }
+        }
+
+        // Sort all seeds by position before chaining (matches bwa-mem2 sortSMEMs after all phases)
+        smems.sort {
+            if $0.queryBegin != $1.queryBegin { return $0.queryBegin < $1.queryBegin }
+            return $0.length > $1.length
         }
 
         // Phase 2: Chain seeds
@@ -977,7 +981,8 @@ public actor BWAMemAligner {
                             fputs("[PE] Insert size: mean=\(String(format: "%.1f", primaryStats.mean)), "
                                   + "stddev=\(String(format: "%.1f", primaryStats.stddev)), "
                                   + "orientation=\(dist.primaryOrientation), "
-                                  + "n=\(primaryStats.count)\n", stderr)
+                                  + "n=\(primaryStats.count)"
+                                  + " properLow=\(primaryStats.properLow) properHigh=\(primaryStats.properHigh)\n", stderr)
                         }
                     } else {
                         if options.verbosity >= 2 {
@@ -1045,7 +1050,7 @@ public actor BWAMemAligner {
     /// Matches bwa-mem2's mem_sam_pe() swap logic that ensures the paired region
     /// is emitted as primary. Fixes secondary references accordingly.
     nonisolated private func promotePairedRegion(regions: inout [MemAlnReg], pairedIdx: Int) {
-        guard pairedIdx > 0 && pairedIdx < regions.count else { return }
+        guard pairedIdx >= 0 && pairedIdx < regions.count else { return }
 
         // bwa-mem2 mem_sam_pe line 456-457: when promoting a secondary, set its sub
         // to the parent primary's score (the region it was originally secondary to).
@@ -1056,20 +1061,24 @@ public actor BWAMemAligner {
             regions[pairedIdx].sub = parentScore
         }
 
-        // Swap the paired region to position 0
-        regions.swapAt(0, pairedIdx)
+        // Mark the promoted region as primary
+        regions[pairedIdx].secondary = -1
 
-        // Fix secondary references that point to the swapped indices
-        for i in 0..<regions.count {
-            if regions[i].secondary == Int32(pairedIdx) {
-                regions[i].secondary = 0
-            } else if regions[i].secondary == 0 {
-                regions[i].secondary = Int32(pairedIdx)
+        if pairedIdx > 0 {
+            // Swap the paired region to position 0
+            regions.swapAt(0, pairedIdx)
+
+            // Fix secondary references that point to the swapped indices
+            for i in 0..<regions.count {
+                if regions[i].secondary == Int32(pairedIdx) {
+                    regions[i].secondary = 0
+                } else if regions[i].secondary == 0 {
+                    regions[i].secondary = Int32(pairedIdx)
+                }
             }
         }
 
-        // Ensure the promoted region is marked as primary
-        // Use -2 (not -1) to indicate this was a promoted secondary (bwa-mem2 convention)
+        // Ensure the promoted region at position 0 is marked as primary
         regions[0].secondary = -1
     }
 
@@ -1569,7 +1578,6 @@ public actor BWAMemAligner {
         let mat = scoring.scoringMatrix()
         var regs1 = regions1
         var regs2 = regions2
-
         // Rescue read2 using read1's alignments as templates
         let templates1 = Self.selectRescueCandidates(regs1, scoring: scoring)
         let rescued2 = MateRescue.rescue(

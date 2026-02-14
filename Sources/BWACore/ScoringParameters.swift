@@ -41,6 +41,8 @@ public struct ScoringParameters: Sendable {
     public var minChainWeight: Int32 = 0
     /// Re-seeding length threshold (-y): 0 = disabled, >0 = min seed length for re-seeding
     public var reseedLength: Int32 = 0
+    /// Maximum BWT interval for Phase 3 forward-strategy seeding (bwa-mem2 max_mem_intv, default 20)
+    public var maxMemIntv: Int32 = 20
 
     // MARK: - Flag constants
 
