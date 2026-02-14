@@ -1141,23 +1141,50 @@ public actor BWAMemAligner {
             )
 
         } else {
-            // Both mapped but no valid pairing
+            // Both mapped but no valid pairing — use default primaries
+            // bwa-mem2 no_pairing (lines 536-541): check if default primaries
+            // happen to form a proper pair (same rid, distance within range)
             let cigar1 = cigars1[0]
             let cigar2 = cigars2[0]
             let (rid1, localPos1) = index.metadata.decodePosition(cigar1.pos)
             let (rid2, localPos2) = index.metadata.decodePosition(cigar2.pos)
 
+            var isProper = false
+            var tlen1: Int64 = 0
+            var tlen2: Int64 = 0
+
+            if rid1 == rid2 && !regions1.isEmpty && !regions2.isEmpty {
+                // Check if default primaries form a proper pair
+                if let result = InsertSizeEstimator.inferOrientation(
+                    r1: regions1[0], r2: regions2[0], genomeLength: genomeLen
+                ) {
+                    let oriStats = dist.stats[result.orientation.rawValue]
+                    if !oriStats.failed
+                        && result.insertSize >= oriStats.properLow
+                        && result.insertSize <= oriStats.properHigh {
+                        isProper = true
+                    }
+                }
+                // Compute TLEN for same-chromosome pairs
+                let computed = PairedEndResolver.computeTLEN(
+                    pos1: localPos1, isReverse1: cigar1.isReverse, refLen1: cigar1.refConsumed,
+                    pos2: localPos2, isReverse2: cigar2.isReverse, refLen2: cigar2.refConsumed
+                )
+                tlen1 = computed.tlen1
+                tlen2 = computed.tlen2
+            }
+
             let pe1 = PairedEndInfo(
-                isRead1: true, isProperPair: false,
+                isRead1: true, isProperPair: isProper,
                 mateTid: rid2, matePos: localPos2,
                 mateIsReverse: cigar2.isReverse, mateIsUnmapped: false,
-                tlen: 0, mateCigarString: cigar2.cigarString
+                tlen: tlen1, mateCigarString: cigar2.cigarString
             )
             let pe2 = PairedEndInfo(
-                isRead1: false, isProperPair: false,
+                isRead1: false, isProperPair: isProper,
                 mateTid: rid1, matePos: localPos1,
                 mateIsReverse: cigar1.isReverse, mateIsUnmapped: false,
-                tlen: 0, mateCigarString: cigar1.cigarString
+                tlen: tlen2, mateCigarString: cigar1.cigarString
             )
 
             var records: [RecordSpec] = []

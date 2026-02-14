@@ -67,8 +67,8 @@ public struct InsertSizeEstimator: Sendable {
         stats.low = Int64(ov.min)
         stats.high = Int64(ov.max)
         stats.count = 1000  // synthetic count so it doesn't look failed
-        stats.properLow = Int64(Swift.max(ov.mean - 4.0 * ov.stddev, 1.0))
-        stats.properHigh = Int64(ov.mean + 4.0 * ov.stddev)
+        stats.properLow = Swift.max(1, Int64(ov.mean - 4.0 * ov.stddev + 0.5))
+        stats.properHigh = Int64(ov.mean + 4.0 * ov.stddev + 0.5)
         dist.stats[PairOrientation.fr.rawValue] = stats
         dist.primaryOrientation = .fr
         return dist
@@ -201,11 +201,12 @@ public struct InsertSizeEstimator: Sendable {
             dist.stats[idx].count = filtered.count
             dist.stats[idx].failed = false
 
-            // Proper-pair bounds for mate rescue (bwa-mem2 MAPPING_BOUND=3, MAX_STDDEV=4)
+            // Proper-pair bounds for mate rescue and pairing (bwa-mem2 MAPPING_BOUND=3, MAX_STDDEV=4)
+            // bwa-mem2 widens to the broader of IQR-based and stddev-based bounds
             let pLow = q25 - 3 * iqr
             let pHigh = q75 + 3 * iqr
-            dist.stats[idx].properLow = max(pLow, Int64(mean - 4.0 * stddev + 0.5))
-            dist.stats[idx].properHigh = min(pHigh, Int64(mean + 4.0 * stddev + 0.5))
+            dist.stats[idx].properLow = max(1, min(pLow, Int64(mean - 4.0 * stddev + 0.5)))
+            dist.stats[idx].properHigh = max(pHigh, Int64(mean + 4.0 * stddev + 0.5))
 
             if filtered.count > maxCount {
                 maxCount = filtered.count

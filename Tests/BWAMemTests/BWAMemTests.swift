@@ -462,6 +462,8 @@ struct PairedEndResolverTests {
         dist.stats[PairOrientation.fr.rawValue].stddev = 30
         dist.stats[PairOrientation.fr.rawValue].low = 200
         dist.stats[PairOrientation.fr.rawValue].high = 400
+        dist.stats[PairOrientation.fr.rawValue].properLow = 1
+        dist.stats[PairOrientation.fr.rawValue].properHigh = 500
         dist.stats[PairOrientation.fr.rawValue].count = 100
         dist.stats[PairOrientation.fr.rawValue].failed = false
         dist.primaryOrientation = .fr
@@ -480,17 +482,19 @@ struct PairedEndResolverTests {
         #expect(decision!.isProperPair == true)
     }
 
-    @Test("Discordant pair is not flagged as proper")
+    @Test("Discordant pair returns nil (no valid pairing)")
     func testDiscordantPair() {
         let genomeLen: Int64 = 100000
 
-        // Both on forward strand (FF orientation)
+        // Both on forward strand (FF orientation) — no FR stats for this orientation
         let r1 = MemAlnReg(rb: 1000, re: 1100, qb: 0, qe: 100, rid: 0, score: 80)
         let r2 = MemAlnReg(rb: 1200, re: 1300, qb: 0, qe: 100, rid: 0, score: 80)
 
         var dist = InsertSizeDistribution()
         dist.stats[PairOrientation.fr.rawValue].mean = 300
         dist.stats[PairOrientation.fr.rawValue].stddev = 30
+        dist.stats[PairOrientation.fr.rawValue].properLow = 1
+        dist.stats[PairOrientation.fr.rawValue].properHigh = 500
         dist.stats[PairOrientation.fr.rawValue].count = 100
         dist.stats[PairOrientation.fr.rawValue].failed = false
         dist.primaryOrientation = .fr
@@ -502,9 +506,8 @@ struct PairedEndResolverTests {
             scoring: ScoringParameters()
         )
 
-        #expect(decision != nil)
-        // FF orientation != FR primary → not proper
-        #expect(decision!.isProperPair == false)
+        // FF orientation has failed stats → resolve returns nil (no valid pairing)
+        #expect(decision == nil)
     }
 
     @Test("TLEN computation for standard FR pair")

@@ -82,26 +82,18 @@ public struct PairedEndResolver: Sendable {
                 ) else { continue }
 
                 let oriStats = dist.stats[result.orientation.rawValue]
+
+                // Only consider pairs within the proper-pair distance window
+                // (bwa-mem2 mem_pair lines 318-319: dist < low → skip, dist > high → break)
+                guard !oriStats.failed && oriStats.stddev > 0
+                    && result.insertSize >= oriStats.properLow
+                    && result.insertSize <= oriStats.properHigh else { continue }
+
                 let baseScore = Int(r1.score) + Int(r2.score)
-                let pairScore: Int
-                var isProper = false
-
-                if !oriStats.failed && oriStats.stddev > 0 {
-                    let z = abs(Double(result.insertSize) - oriStats.mean) / oriStats.stddev
-
-                    if z > Self.zThreshold {
-                        // Improper: apply unpaired penalty
-                        pairScore = baseScore - Int(scoring.unpairedPenalty)
-                    } else {
-                        // Proper: apply probability-based penalty
-                        let penalty = computeZPenalty(z: z, matchScore: scoring.matchScore)
-                        pairScore = baseScore - penalty
-                        isProper = (result.orientation == dist.primaryOrientation)
-                    }
-                } else {
-                    // Stats not available (unobserved orientation): treat as improper
-                    pairScore = baseScore - Int(scoring.unpairedPenalty)
-                }
+                let z = abs(Double(result.insertSize) - oriStats.mean) / oriStats.stddev
+                let penalty = computeZPenalty(z: z, matchScore: scoring.matchScore)
+                let pairScore = baseScore - penalty
+                let isProper = (result.orientation == dist.primaryOrientation)
 
                 if pairScore > bestScore {
                     bestScore = pairScore
@@ -206,7 +198,8 @@ public struct PairedEndResolver: Sendable {
     }
 
     /// Compute z-score-based penalty using bwa-mem2's exact formula:
-    /// `floor(0.721 * ln(2 * erfc(z / sqrt(2))) * matchScore / ln(10) + 0.499)`
+    /// `score1 + score2 + 0.721 * ln(2 * erfc(|z| / sqrt(2))) * matchScore + 0.499`
+    /// where 0.721 ≈ 1/ln(4). The log term is negative, reducing the pair score.
     private static func computeZPenalty(z: Double, matchScore: Int32) -> Int {
         let erfcVal = erfc(z / sqrt(2.0))
         guard erfcVal > 0 else {
@@ -214,7 +207,7 @@ public struct PairedEndResolver: Sendable {
             return Int(matchScore) * 10
         }
         let logVal = log(2.0 * erfcVal)
-        let penalty = 0.721 * logVal * Double(matchScore) / log(10.0) + 0.499
+        let penalty = 0.721 * logVal * Double(matchScore) + 0.499
         // Penalty should be non-positive (it reduces score); floor to int
         return max(0, Int(floor(-penalty)))
     }
