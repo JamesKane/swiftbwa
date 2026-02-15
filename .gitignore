@@ -5,3 +5,9 @@ xcuserdata/
 DerivedData/
 .DS_Store
 scale_test.sh
+
+# Local-only: require chm13v2.0 reference index
+Tests/BWAMemTests/HG002ComparisonTests.swift
+TestData/hg002_chm13_*.sam
+benchmarks/
+PERFORMANCE_FINDINGS.md
