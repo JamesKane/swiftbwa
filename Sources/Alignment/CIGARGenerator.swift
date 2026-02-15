@@ -172,10 +172,82 @@ public struct CIGARGenerator: Sendable {
         return CIGARResult(cigar: cigar, nm: nm, md: md, score: result.score, pos: pos)
     }
 
+    /// Post-process a GPU-produced CIGAR: squeeze leading/trailing deletions,
+    /// compute NM/MD, add soft-clips. Used by the GPU global SW path.
+    ///
+    /// The raw CIGAR comes from the GPU `global_sw` kernel (banded NW + traceback).
+    /// This applies the same post-processing as `generate()` lines 117-172.
+    public static func postProcess(
+        cigar rawCigar: [UInt32],
+        score: Int32,
+        querySegment: [UInt8],
+        refSegment: [UInt8],
+        qb: Int32,
+        qe: Int32,
+        readLength: Int,
+        isReverse: Bool,
+        refPos: Int64
+    ) -> CIGARResult {
+        var cigar = rawCigar
+        var pos = refPos
+        var refOffset = 0
+
+        // Squeeze leading deletions
+        while !cigar.isEmpty {
+            let op = cigar[0] & 0xF
+            if op == CIGAROp.deletion.rawValue {
+                let len = Int(cigar[0] >> 4)
+                pos += Int64(len)
+                refOffset += len
+                cigar.removeFirst()
+            } else {
+                break
+            }
+        }
+
+        // Squeeze trailing deletions
+        while !cigar.isEmpty {
+            let op = cigar[cigar.count - 1] & 0xF
+            if op == CIGAROp.deletion.rawValue {
+                cigar.removeLast()
+            } else {
+                break
+            }
+        }
+
+        let nm = computeNMFromCigar(cigar: cigar, query: querySegment,
+                                     target: refSegment, targetOffset: refOffset)
+        let md = generateMD(cigar: cigar, query: querySegment,
+                            target: refSegment, targetOffset: refOffset)
+
+        // Add soft-clips
+        let intQb = Int(qb)
+        let intQe = Int(qe)
+        if isReverse {
+            let clip5 = readLength - intQe
+            let clip3 = intQb
+            if clip5 > 0 {
+                cigar.insert(UInt32(clip5) << 4 | CIGAROp.softClip.rawValue, at: 0)
+            }
+            if clip3 > 0 {
+                cigar.append(UInt32(clip3) << 4 | CIGAROp.softClip.rawValue)
+            }
+        } else {
+            if intQb > 0 {
+                cigar.insert(UInt32(intQb) << 4 | CIGAROp.softClip.rawValue, at: 0)
+            }
+            if intQe < readLength {
+                cigar.append(UInt32(readLength - intQe) << 4 | CIGAROp.softClip.rawValue)
+            }
+        }
+
+        return CIGARResult(cigar: cigar, nm: nm, md: md, score: score, pos: pos)
+    }
+
     /// Infer band width from score difference and gap penalties.
     ///
     /// Matches the logic in bwa-mem2's `mem_reg2aln()` (bwamem.cpp:1742-1755).
-    static func inferBandWidth(
+    public static func inferBandWidth(
         queryLen: Int32,
         refLen: Int32,
         score: Int32,

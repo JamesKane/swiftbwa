@@ -473,6 +473,367 @@ public actor BWAMemAligner {
         }
     }
 
+    #if canImport(Metal)
+    /// GPU-batched CIGAR generation for multiple reads+regions.
+    /// Applies the same filtering as generateFilteredCIGARs(), handles fast-path
+    /// on CPU (~90% of regions), and dispatches remaining full NW tasks to GPU.
+    nonisolated func generateFilteredCIGARsBatchGPU(
+        reads: [ReadSequence],
+        allRegions: [[MemAlnReg]],
+        scoringMatrix: [Int8],
+        engine: MetalSWEngine
+    ) -> [[CIGARInfo]] {
+        let scoring = options.scoring
+        let minScore = scoring.minOutputScore
+        let outputAll = (scoring.flag & ScoringParameters.flagAll) != 0
+        let genomeLen = index.genomeLength
+
+        // Fast-path threshold
+        let minIndelCost = scoring.gapOpenPenalty + scoring.gapExtendPenalty
+            + scoring.gapOpenPenaltyDeletion + scoring.gapExtendPenaltyDeletion
+
+        // Pre-allocate result arrays with dummies
+        var allCigars: [[CIGARInfo]] = allRegions.map {
+            [CIGARInfo](repeating: Self.dummyCigar, count: $0.count)
+        }
+
+        // Track GPU tasks: store which (readIdx, regionIdx) each task maps to,
+        // plus the data needed for post-processing.
+        struct GPUTaskInfo {
+            let readIdx: Int
+            let regionIdx: Int
+            let querySegment: [UInt8]
+            let refSegment: [UInt8]
+            let qb: Int32
+            let qe: Int32
+            let readLength: Int
+            let isReverse: Bool
+            let refPos: Int64
+        }
+
+        var gpuTasks: [GlobalSWTask] = []
+        var gpuTaskInfos: [GPUTaskInfo] = []
+
+        for ri in 0..<reads.count {
+            let read = reads[ri]
+            let regions = allRegions[ri]
+
+            // Same skip-all-secondaries logic as generateFilteredCIGARs
+            let skipAllSecondaries: Bool
+            if outputAll {
+                skipAllSecondaries = false
+            } else {
+                var secondaryCount = 0
+                var hasAltSecondary = false
+                for (idx, reg) in regions.enumerated() {
+                    if idx > 0 && reg.score < minScore { continue }
+                    if reg.secondary >= 0 {
+                        let pi = Int(reg.secondary)
+                        if pi < regions.count && reg.score < regions[pi].score / 2 { continue }
+                        secondaryCount += 1
+                        if reg.isAlt { hasAltSecondary = true }
+                    }
+                }
+                let maxXA = hasAltSecondary ? Int(scoring.maxXAHitsAlt) : Int(scoring.maxXAHits)
+                skipAllSecondaries = secondaryCount > maxXA
+            }
+
+            for (idx, reg) in regions.enumerated() {
+                // Filter check (same as generateFilteredCIGARs)
+                if idx > 0 && reg.score < minScore { continue }
+                if reg.secondary >= 0 {
+                    let pi = Int(reg.secondary)
+                    if pi < regions.count && reg.score < regions[pi].score / 2 { continue }
+                    if idx > 0 && skipAllSecondaries { continue }
+                }
+
+                // Extract query/ref segments (same as generateCIGAR)
+                let isReverse = reg.rb >= genomeLen
+                let qb = Int(reg.qb)
+                let qe = Int(reg.qe)
+
+                let querySegment: [UInt8]
+                if isReverse {
+                    let rc = read.reverseComplement()
+                    let rcQb = read.length - qe
+                    let rcQe = read.length - qb
+                    querySegment = Array(rc[rcQb..<rcQe])
+                } else {
+                    querySegment = Array(read.bases[qb..<qe])
+                }
+
+                var rb = reg.rb
+                var re = reg.re
+                if isReverse {
+                    let fwdRb = 2 * genomeLen - re
+                    let fwdRe = 2 * genomeLen - rb
+                    rb = fwdRb
+                    re = fwdRe
+                }
+
+                let rid = index.metadata.sequenceID(for: rb)
+                if rid >= 0 && rid < index.metadata.numSequences {
+                    let ann = index.metadata.annotations[Int(rid)]
+                    let chrEnd = ann.offset + Int64(ann.length)
+                    if re > chrEnd { re = chrEnd }
+                }
+
+                let refLen = Int(re - rb)
+                let safeRefLen = min(refLen, Int(index.packedRef.length - rb))
+                let refSegment: [UInt8]
+                if safeRefLen > 0 && rb >= 0 {
+                    refSegment = index.packedRef.subsequence(from: rb, length: safeRefLen)
+                } else {
+                    refSegment = []
+                }
+
+                let queryLen = querySegment.count
+                let refSegLen = refSegment.count
+                guard queryLen > 0 && refSegLen > 0 else { continue }
+
+                // Fast-path check: pure M CIGAR when no indels possible
+                let deficit = Int32(queryLen) * scoring.matchScore - reg.trueScore
+                if queryLen == refSegLen && deficit < minIndelCost {
+                    // CPU fast path — call CIGARGenerator.generate directly (no DP)
+                    let cigarResult = CIGARGenerator.generate(
+                        querySegment: querySegment,
+                        refSegment: refSegment,
+                        qb: reg.qb, qe: reg.qe,
+                        readLength: read.length,
+                        isReverse: isReverse,
+                        trueScore: reg.trueScore,
+                        initialW: reg.w,
+                        scoring: scoring,
+                        refPos: rb,
+                        scoringMatrix: scoringMatrix
+                    )
+                    allCigars[ri][idx] = buildCIGARInfo(from: cigarResult, isReverse: isReverse)
+                } else {
+                    // Needs full NW — collect for GPU batch
+                    var w = CIGARGenerator.inferBandWidth(
+                        queryLen: reg.qe - reg.qb,
+                        refLen: Int32(refSegLen),
+                        score: reg.trueScore,
+                        scoring: scoring
+                    )
+                    w = max(w, reg.w)
+
+                    gpuTasks.append(GlobalSWTask(
+                        query: querySegment,
+                        target: refSegment,
+                        trueScore: reg.trueScore,
+                        initialW: w,
+                        scoring: scoring
+                    ))
+                    gpuTaskInfos.append(GPUTaskInfo(
+                        readIdx: ri, regionIdx: idx,
+                        querySegment: querySegment, refSegment: refSegment,
+                        qb: reg.qb, qe: reg.qe,
+                        readLength: read.length, isReverse: isReverse,
+                        refPos: rb
+                    ))
+                }
+            }
+        }
+
+        // Dispatch GPU batch
+        if !gpuTasks.isEmpty {
+            let gpuResults = GlobalSWDispatcher.dispatchBatch(tasks: gpuTasks, engine: engine)
+
+            for (i, info) in gpuTaskInfos.enumerated() {
+                guard i < gpuResults.count else { break }
+                let gpuResult = gpuResults[i]
+
+                // Post-process: deletion squeeze, NM/MD, soft-clips
+                let cigarResult = CIGARGenerator.postProcess(
+                    cigar: gpuResult.cigar,
+                    score: gpuResult.score,
+                    querySegment: info.querySegment,
+                    refSegment: info.refSegment,
+                    qb: info.qb, qe: info.qe,
+                    readLength: info.readLength,
+                    isReverse: info.isReverse,
+                    refPos: info.refPos
+                )
+                allCigars[info.readIdx][info.regionIdx] = buildCIGARInfo(
+                    from: cigarResult, isReverse: info.isReverse
+                )
+            }
+        }
+
+        return allCigars
+    }
+
+    /// Descriptor for a region needing GPU global SW + traceback.
+    /// Produced by per-read tasks, consumed by GPU batch dispatch.
+    struct GPUCIGARTaskDesc: Sendable {
+        let readLocalIdx: Int
+        let regionIdx: Int
+        let querySegment: [UInt8]
+        let refSegment: [UInt8]
+        let qb: Int32
+        let qe: Int32
+        let readLength: Int
+        let isReverse: Bool
+        let refPos: Int64
+        let trueScore: Int32
+        let initialW: Int32
+    }
+
+    /// Generate CIGARs for a single read, handling fast-path on CPU and collecting
+    /// non-fast-path regions as GPU task descriptors.
+    /// Returns (partialCigars, gpuDescs) where partialCigars has real CIGARInfo for
+    /// fast-path regions and dummyCigar placeholders for GPU-bound regions.
+    nonisolated func generateFilteredCIGARsPartialGPU(
+        read: ReadSequence,
+        regions: [MemAlnReg],
+        readLocalIdx: Int,
+        scoringMatrix: [Int8]
+    ) -> ([CIGARInfo], [GPUCIGARTaskDesc]) {
+        let scoring = options.scoring
+        let minScore = scoring.minOutputScore
+        let outputAll = (scoring.flag & ScoringParameters.flagAll) != 0
+        let genomeLen = index.genomeLength
+        let minIndelCost = scoring.gapOpenPenalty + scoring.gapExtendPenalty
+            + scoring.gapOpenPenaltyDeletion + scoring.gapExtendPenaltyDeletion
+
+        // Same skip-all-secondaries logic as generateFilteredCIGARs
+        let skipAllSecondaries: Bool
+        if outputAll {
+            skipAllSecondaries = false
+        } else {
+            var secondaryCount = 0
+            var hasAltSecondary = false
+            for (idx, reg) in regions.enumerated() {
+                if idx > 0 && reg.score < minScore { continue }
+                if reg.secondary >= 0 {
+                    let pi = Int(reg.secondary)
+                    if pi < regions.count && reg.score < regions[pi].score / 2 { continue }
+                    secondaryCount += 1
+                    if reg.isAlt { hasAltSecondary = true }
+                }
+            }
+            let maxXA = hasAltSecondary ? Int(scoring.maxXAHitsAlt) : Int(scoring.maxXAHits)
+            skipAllSecondaries = secondaryCount > maxXA
+        }
+
+        var cigars = [CIGARInfo](repeating: Self.dummyCigar, count: regions.count)
+        var gpuDescs: [GPUCIGARTaskDesc] = []
+
+        for (idx, reg) in regions.enumerated() {
+            // Filter check
+            if idx > 0 && reg.score < minScore { continue }
+            if reg.secondary >= 0 {
+                let pi = Int(reg.secondary)
+                if pi < regions.count && reg.score < regions[pi].score / 2 { continue }
+                if idx > 0 && skipAllSecondaries { continue }
+            }
+
+            // Extract query/ref segments (same as generateCIGAR)
+            let isReverse = reg.rb >= genomeLen
+            let qb = Int(reg.qb)
+            let qe = Int(reg.qe)
+
+            let querySegment: [UInt8]
+            if isReverse {
+                let rc = read.reverseComplement()
+                querySegment = Array(rc[(read.length - qe)..<(read.length - qb)])
+            } else {
+                querySegment = Array(read.bases[qb..<qe])
+            }
+
+            var rb = reg.rb
+            var re = reg.re
+            if isReverse {
+                let fwdRb = 2 * genomeLen - re
+                let fwdRe = 2 * genomeLen - rb
+                rb = fwdRb
+                re = fwdRe
+            }
+
+            let rid = index.metadata.sequenceID(for: rb)
+            if rid >= 0 && rid < index.metadata.numSequences {
+                let ann = index.metadata.annotations[Int(rid)]
+                let chrEnd = ann.offset + Int64(ann.length)
+                if re > chrEnd { re = chrEnd }
+            }
+
+            let refLen = Int(re - rb)
+            let safeRefLen = min(refLen, Int(index.packedRef.length - rb))
+            let refSegment: [UInt8]
+            if safeRefLen > 0 && rb >= 0 {
+                refSegment = index.packedRef.subsequence(from: rb, length: safeRefLen)
+            } else {
+                refSegment = []
+            }
+
+            let queryLen = querySegment.count
+            let refSegLen = refSegment.count
+            guard queryLen > 0 && refSegLen > 0 else { continue }
+
+            // Fast-path: pure M CIGAR
+            let deficit = Int32(queryLen) * scoring.matchScore - reg.trueScore
+            if queryLen == refSegLen && deficit < minIndelCost {
+                let cigarResult = CIGARGenerator.generate(
+                    querySegment: querySegment,
+                    refSegment: refSegment,
+                    qb: reg.qb, qe: reg.qe,
+                    readLength: read.length,
+                    isReverse: isReverse,
+                    trueScore: reg.trueScore,
+                    initialW: reg.w,
+                    scoring: scoring,
+                    refPos: rb,
+                    scoringMatrix: scoringMatrix
+                )
+                cigars[idx] = buildCIGARInfo(from: cigarResult, isReverse: isReverse)
+            } else {
+                // Needs full NW — collect descriptor for GPU batch
+                var w = CIGARGenerator.inferBandWidth(
+                    queryLen: reg.qe - reg.qb,
+                    refLen: Int32(refSegLen),
+                    score: reg.trueScore,
+                    scoring: scoring
+                )
+                w = max(w, reg.w)
+                gpuDescs.append(GPUCIGARTaskDesc(
+                    readLocalIdx: readLocalIdx, regionIdx: idx,
+                    querySegment: querySegment, refSegment: refSegment,
+                    qb: reg.qb, qe: reg.qe,
+                    readLength: read.length, isReverse: isReverse,
+                    refPos: rb, trueScore: reg.trueScore, initialW: w
+                ))
+            }
+        }
+
+        return (cigars, gpuDescs)
+    }
+    #endif
+
+    /// Build CIGARInfo from a CIGARResult (shared between CPU and GPU paths).
+    nonisolated private func buildCIGARInfo(from cigarResult: CIGARResult, isReverse: Bool) -> CIGARInfo {
+        var refConsumed: Int64 = 0
+        var cigarStr = ""
+        for packed in cigarResult.cigar {
+            let op = CIGAROperation(rawValue: packed)
+            let len = op.length
+            if op.consumesReference {
+                refConsumed += Int64(len)
+            }
+            cigarStr += "\(len)\(op.character)"
+        }
+
+        return CIGARInfo(
+            cigar: cigarResult.cigar,
+            nm: cigarResult.nm,
+            md: cigarResult.md,
+            pos: cigarResult.pos,
+            isReverse: isReverse,
+            refConsumed: refConsumed,
+            cigarString: cigarStr
+        )
+    }
+
     /// Generate CIGAR for a single alignment region.
     nonisolated func generateCIGAR(read: ReadSequence, region: MemAlnReg, scoringMatrix: [Int8]? = nil) -> CIGARInfo {
         let genomeLen = index.genomeLength
@@ -906,7 +1267,10 @@ public actor BWAMemAligner {
                     handle: reseedHandle0, allSMEMs: &gpuSMEMs)
             }
 
-            // Phases 1.5-5 + CIGAR + classify: parallel per-read on CPU
+            // SE path: per-read task group parallelism is more effective than GPU
+            // batching for CIGAR (~10% non-fast-path spread across 12 cores beats
+            // GPU dispatch overhead). GPU CIGAR is only used for the PE path where
+            // CIGAR generation is sequential within processFullBatch.
             let batchResults = await withTaskGroup(
                 of: (Int, [MemAlnReg], [RecordSpec]).self,
                 returning: [(Int, [MemAlnReg], [RecordSpec])].self
@@ -1672,16 +2036,50 @@ public actor BWAMemAligner {
         }
 
         // CIGAR generation + output preparation
+        #if canImport(Metal)
+        let allCigars1: [[CIGARInfo]]
+        let allCigars2: [[CIGARInfo]]
+        if let engine = gpuEngine as? MetalSWEngine, engine.globalSWPipeline != nil {
+            // GPU batch: combine R1+R2 into a single dispatch
+            let combinedReads = batchReads1 + batchReads2
+            let combinedRegs = finalRegs1 + finalRegs2
+            let combinedCigars = generateFilteredCIGARsBatchGPU(
+                reads: combinedReads, allRegions: combinedRegs,
+                scoringMatrix: mat, engine: engine
+            )
+            allCigars1 = Array(combinedCigars[0..<count])
+            allCigars2 = Array(combinedCigars[count..<2 * count])
+        } else {
+            var c1 = [[CIGARInfo]]()
+            var c2 = [[CIGARInfo]]()
+            c1.reserveCapacity(count)
+            c2.reserveCapacity(count)
+            for li in 0..<count {
+                c1.append(generateFilteredCIGARs(read: batchReads1[li], regions: finalRegs1[li], scoringMatrix: mat))
+                c2.append(generateFilteredCIGARs(read: batchReads2[li], regions: finalRegs2[li], scoringMatrix: mat))
+            }
+            allCigars1 = c1
+            allCigars2 = c2
+        }
+        #else
+        var allCigars1 = [[CIGARInfo]]()
+        var allCigars2 = [[CIGARInfo]]()
+        allCigars1.reserveCapacity(count)
+        allCigars2.reserveCapacity(count)
+        for li in 0..<count {
+            allCigars1.append(generateFilteredCIGARs(read: batchReads1[li], regions: finalRegs1[li], scoringMatrix: mat))
+            allCigars2.append(generateFilteredCIGARs(read: batchReads2[li], regions: finalRegs2[li], scoringMatrix: mat))
+        }
+        #endif
+
         var results: [(Int, PairOutputPlan, Int, Int)] = []
         results.reserveCapacity(count)
         for li in 0..<count {
             let gi = globalOffset + li
-            let cig1 = generateFilteredCIGARs(read: batchReads1[li], regions: finalRegs1[li], scoringMatrix: mat)
-            let cig2 = generateFilteredCIGARs(read: batchReads2[li], regions: finalRegs2[li], scoringMatrix: mat)
             let plan = preparePairOutput(
                 read1: batchReads1[li], read2: batchReads2[li],
                 regions1: finalRegs1[li], regions2: finalRegs2[li],
-                cigars1: cig1, cigars2: cig2,
+                cigars1: allCigars1[li], cigars2: allCigars2[li],
                 dist: dist, genomeLen: index.genomeLength,
                 skipPairing: skipPairing, scoringMat: scoringMat
             )
