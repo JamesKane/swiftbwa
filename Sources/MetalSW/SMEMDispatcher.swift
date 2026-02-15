@@ -29,10 +29,27 @@ public struct SMEMDispatchHandle: @unchecked Sendable {
     let totalPositions: Int
     let taskCount: Int
     let pool: MetalBufferPool
+    /// Maps GPU dispatch position to original read index: sortedOrder[gpuIdx] = originalIdx.
+    /// Nil when no reordering was applied.
+    let sortedOrder: [Int]?
 }
 
 /// Batch dispatcher for GPU-accelerated SMEM forward extension.
 public struct SMEMDispatcher: Sendable {
+
+    /// Pack first 20 bases of a read into a UInt64 sort key (2 bits per base, N→0).
+    /// Shorter reads are left-shifted so same-prefix reads sort together.
+    @inline(__always)
+    private static func sortKey(for query: [UInt8]) -> UInt64 {
+        var key: UInt64 = 0
+        let n = min(query.count, 20)
+        for i in 0..<n {
+            let base = query[i] < 4 ? UInt64(query[i]) : 0
+            key = (key << 2) | base
+        }
+        key <<= UInt64((20 - n) * 2)
+        return key
+    }
 
     /// Dispatch GPU forward extension for a batch of reads.
     public static func dispatchBatch(
@@ -66,13 +83,26 @@ public struct SMEMDispatcher: Sendable {
 
         let taskCount = queries.count
 
+        // Sort reads by prefix key for SIMD group cache coherence
+        let sortedOrder: [Int]?
+        let orderedQueries: [[UInt8]]
+        if taskCount > 1 {
+            let keys = queries.map { sortKey(for: $0) }
+            let order = (0..<taskCount).sorted { keys[$0] < keys[$1] }
+            sortedOrder = order
+            orderedQueries = order.map { queries[$0] }
+        } else {
+            sortedOrder = nil
+            orderedQueries = queries
+        }
+
         var allQueries: [UInt8] = []
         var queryOffsets: [UInt32] = []
         var queryLengths: [UInt16] = []
         var resultOffsets: [UInt32] = []
         var totalPositions: Int = 0
 
-        for query in queries {
+        for query in orderedQueries {
             queryOffsets.append(UInt32(allQueries.count))
             queryLengths.append(UInt16(query.count))
             resultOffsets.append(UInt32(totalPositions))
@@ -134,7 +164,8 @@ public struct SMEMDispatcher: Sendable {
             rightEndsBuf: bufs[3], kValuesBuf: bufs[4], sValuesBuf: bufs[5],
             poolBuffers: bufs,
             queryLengths: queryLengths, resultOffsets: resultOffsets,
-            totalPositions: totalPositions, taskCount: taskCount, pool: pool
+            totalPositions: totalPositions, taskCount: taskCount, pool: pool,
+            sortedOrder: sortedOrder
         )
     }
 
@@ -149,17 +180,37 @@ public struct SMEMDispatcher: Sendable {
         let sPtr = handle.sValuesBuf.contents().bindMemory(
             to: Int64.self, capacity: handle.totalPositions)
 
-        var results: [ForwardExtResult] = []
-        results.reserveCapacity(handle.taskCount)
+        let results: [ForwardExtResult]
 
-        for i in 0..<handle.taskCount {
-            let offset = Int(handle.resultOffsets[i])
-            let len = Int(handle.queryLengths[i])
-            results.append(ForwardExtResult(
-                rightEnds: Array(UnsafeBufferPointer(start: rightEndPtr + offset, count: len)),
-                kValues: Array(UnsafeBufferPointer(start: kPtr + offset, count: len)),
-                sValues: Array(UnsafeBufferPointer(start: sPtr + offset, count: len))
-            ))
+        if let sortedOrder = handle.sortedOrder {
+            // Build inverse permutation and gather results in original order
+            let count = handle.taskCount
+            results = [ForwardExtResult](unsafeUninitializedCapacity: count) { buf, initCount in
+                for gpuIdx in 0..<count {
+                    let origIdx = sortedOrder[gpuIdx]
+                    let offset = Int(handle.resultOffsets[gpuIdx])
+                    let len = Int(handle.queryLengths[gpuIdx])
+                    buf.initializeElement(at: origIdx, to: ForwardExtResult(
+                        rightEnds: Array(UnsafeBufferPointer(start: rightEndPtr + offset, count: len)),
+                        kValues: Array(UnsafeBufferPointer(start: kPtr + offset, count: len)),
+                        sValues: Array(UnsafeBufferPointer(start: sPtr + offset, count: len))
+                    ))
+                }
+                initCount = count
+            }
+        } else {
+            var r: [ForwardExtResult] = []
+            r.reserveCapacity(handle.taskCount)
+            for i in 0..<handle.taskCount {
+                let offset = Int(handle.resultOffsets[i])
+                let len = Int(handle.queryLengths[i])
+                r.append(ForwardExtResult(
+                    rightEnds: Array(UnsafeBufferPointer(start: rightEndPtr + offset, count: len)),
+                    kValues: Array(UnsafeBufferPointer(start: kPtr + offset, count: len)),
+                    sValues: Array(UnsafeBufferPointer(start: sPtr + offset, count: len))
+                ))
+            }
+            results = r
         }
 
         handle.pool.release(handle.poolBuffers)
