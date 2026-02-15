@@ -353,7 +353,7 @@ public struct SMEMFinder: Sendable {
                         queryBegin: interval.m,
                         queryEnd: interval.n + 1
                     )
-                    smemOutput.append(emitSmem)
+                    let _ = smemOutput.tryAppend(emitSmem)
                     break
                 }
 
@@ -397,7 +397,7 @@ public struct SMEMFinder: Sendable {
                     queryBegin: interval.m,
                     queryEnd: interval.n + 1
                 )
-                smemOutput.append(emitSmem)
+                let _ = smemOutput.tryAppend(emitSmem)
             }
         }
 

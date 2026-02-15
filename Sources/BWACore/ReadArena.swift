@@ -49,6 +49,18 @@ public struct ArenaBuffer<Element> {
         count &+= 1
     }
 
+    /// Append if capacity permits; returns false (and does nothing) when full.
+    @inline(__always)
+    public mutating func tryAppend(_ element: Element) -> Bool {
+        guard count < capacity else { return false }
+        storage[count] = element
+        count &+= 1
+        return true
+    }
+
+    @inline(__always)
+    public var isFull: Bool { count >= capacity }
+
     @inline(__always)
     public mutating func removeAll() { count = 0 }
 

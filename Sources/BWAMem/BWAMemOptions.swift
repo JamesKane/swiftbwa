@@ -34,6 +34,8 @@ public struct BWAMemOptions: Sendable {
     public var verbosity: Int = 3
     /// Use Metal GPU acceleration for Smith-Waterman kernels
     public var useGPU: Bool = false
+    /// Emit Z-prefix training tags for MAPQ model training
+    public var emitTrainingTags: Bool = false
 
     /// Extract the ID field from the read group line.
     public var readGroupID: String? {

@@ -160,6 +160,9 @@ struct Mem: AsyncParsableCommand {
     @Flag(name: .long, help: "Use Metal GPU acceleration for Smith-Waterman")
     var gpu: Bool = false
 
+    @Flag(name: .long, help: "Emit Z-prefix training tags for MAPQ model training")
+    var trainingTags: Bool = false
+
     @Argument(help: "Index prefix (reference genome)")
     var indexPrefix: String
 
@@ -235,6 +238,7 @@ struct Mem: AsyncParsableCommand {
         options.outputRefHeader = outputRefHeader
         options.verbosity = v
         options.useGPU = gpu
+        options.emitTrainingTags = trainingTags
         if let bs = batchSize { scoring.chunkSize = bs }
         scoring.reseedLength = y
 

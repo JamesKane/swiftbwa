@@ -265,9 +265,12 @@ public actor BWAMemAligner {
         let splitLen = Int(Float(scoring.minSeedLength) * scoring.seedSplitRatio + 0.499)
         let originalCount = smemBuf.count
 
-        // Allocate newSMEMs from arena — sized to smemBuf's remaining capacity
-        // since we can't append more than that back anyway
-        let newCapacity = smemBuf.capacity - originalCount
+        // Allocate newSMEMs from arena with full smemBuf capacity.
+        // Each findSMEMsAtPosition call can emit multiple SMEMs, and highly
+        // repetitive reads (centromeric/satellite DNA) may produce thousands.
+        // Using smemBuf.capacity (not remaining) prevents overflow in the
+        // reseeding loop; we only copy min(newCount, remaining) back afterward.
+        let newCapacity = smemBuf.capacity
         var newSMEMs = ArenaBuffer<SMEM>(
             base: arena.allocate(SMEM.self, count: newCapacity),
             capacity: newCapacity
@@ -1141,6 +1144,7 @@ public actor BWAMemAligner {
         let rgID = options.readGroupID
         let comment = options.appendComment
         let refHeader = options.outputRefHeader
+        let trainingTags = options.emitTrainingTags
 
         // Sequential record building + writing
         for idx in 0..<reads.count {
@@ -1164,7 +1168,8 @@ public actor BWAMemAligner {
                         mapqOverride: spec.mapq, adjustedPos: cigar.pos,
                         pairedEnd: nil, saTag: spec.saTag,
                         xaTag: spec.xaTag, readGroupID: rgID,
-                        outputRefHeader: refHeader, appendComment: comment
+                        outputRefHeader: refHeader, appendComment: comment,
+                        emitTrainingTags: trainingTags
                     )
                     try outputFile.write(record: record, header: header)
                 }
@@ -1381,6 +1386,7 @@ public actor BWAMemAligner {
         let rgID = options.readGroupID
         let comment = options.appendComment
         let refHeader = options.outputRefHeader
+        let trainingTags = options.emitTrainingTags
         let scoringMat = options.scoring.scoringMatrix()
         let maxConcurrencyOut = options.scoring.numThreads
 
@@ -1433,7 +1439,8 @@ public actor BWAMemAligner {
                                 mapqOverride: spec.mapq, adjustedPos: cigar.pos,
                                 pairedEnd: spec.pairedEnd, saTag: spec.saTag,
                                 xaTag: spec.xaTag, readGroupID: rgID,
-                                outputRefHeader: refHeader, appendComment: comment
+                                outputRefHeader: refHeader, appendComment: comment,
+                                emitTrainingTags: trainingTags
                             )
                             try outputFile.write(record: record, header: header)
                         }

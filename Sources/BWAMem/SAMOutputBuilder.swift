@@ -118,7 +118,8 @@ public struct SAMOutputBuilder: Sendable {
         xaTag: String? = nil,
         readGroupID: String? = nil,
         outputRefHeader: Bool = false,
-        appendComment: Bool = false
+        appendComment: Bool = false,
+        emitTrainingTags: Bool = false
     ) throws -> BAMRecord {
         let mapq = mapqOverride ?? MappingQuality.compute(
             region: region,
@@ -273,6 +274,18 @@ public struct SAMOutputBuilder: Sendable {
         }
         if appendComment && !read.comment.isEmpty {
             try aux.updateString(tag: "CO", value: read.comment)
+        }
+
+        // Training tags for MAPQ model training
+        if emitTrainingTags {
+            try aux.updateInt(tag: "Zs", value: Int64(region.sub))
+            try aux.updateInt(tag: "Zc", value: Int64(region.csub))
+            try aux.updateInt(tag: "Zn", value: Int64(region.subN))
+            try aux.updateFloat(tag: "Zf", value: region.fracRep)
+            try aux.updateInt(tag: "Zv", value: Int64(region.seedCov))
+            try aux.updateInt(tag: "Zw", value: Int64(region.w))
+            try aux.updateInt(tag: "Za", value: Int64(region.nAmb))
+            try aux.updateInt(tag: "Zl", value: Int64(region.seedLen0))
         }
 
         return record
