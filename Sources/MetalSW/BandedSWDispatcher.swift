@@ -166,8 +166,7 @@ public struct BandedSWDispatcher: Sendable {
                     queryEnd: resultPtr[base + 1],
                     targetEnd: resultPtr[base + 2],
                     globalTargetEnd: resultPtr[base + 3],
-                    globalScore: resultPtr[base + 4],
-                    maxOff: resultPtr[base + 5]
+                    globalScore: resultPtr[base + 4]
                 ))
             }
         }
@@ -305,8 +304,7 @@ public struct BandedSWDispatcher: Sendable {
                 queryEnd: resultPtr[base + 1],
                 targetEnd: resultPtr[base + 2],
                 globalTargetEnd: resultPtr[base + 3],
-                globalScore: resultPtr[base + 4],
-                maxOff: resultPtr[base + 5]
+                globalScore: resultPtr[base + 4]
             ))
         }
 

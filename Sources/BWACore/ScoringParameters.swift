@@ -19,7 +19,6 @@ public struct ScoringParameters: Sendable {
     public var unpairedPenalty: Int32 = 17
     public var maxMatesw: Int32 = 50
     public var splitWidth: Int32 = 10
-    public var maxInsert: Int32 = 10000
     /// Chunk size for batch processing
     public var chunkSize: Int = 10_000_000
     /// Number of threads
@@ -41,9 +40,6 @@ public struct ScoringParameters: Sendable {
     public var minChainWeight: Int32 = 0
     /// Re-seeding length threshold (-y): 0 = disabled, >0 = min seed length for re-seeding
     public var reseedLength: Int32 = 0
-    /// Maximum BWT interval for Phase 3 forward-strategy seeding (bwa-mem2 max_mem_intv, default 20)
-    public var maxMemIntv: Int32 = 20
-
     // MARK: - Flag constants
 
     /// -M: Mark shorter split hits as secondary instead of supplementary

@@ -94,7 +94,6 @@ public struct BandedSW8: Sendable {
         var maxIE: Int32 = -1
         var gScore: Int32 = -1
         var gTle: Int32 = -1
-        var maxOff: Int32 = 0
 
         for i in 0..<tlen {
             let targetBase = Int(target[i])
@@ -167,8 +166,6 @@ public struct BandedSW8: Sendable {
                             }
                         }
                     }
-                    let off = abs(maxI - maxJ)
-                    if off > maxOff { maxOff = off }
                 }
             }
 
@@ -193,8 +190,7 @@ public struct BandedSW8: Sendable {
             queryEnd: maxJ + 1,
             targetEnd: maxI + 1,
             globalTargetEnd: gTle + 1,
-            globalScore: gScore,
-            maxOff: maxOff
+            globalScore: gScore
         )
     }
 

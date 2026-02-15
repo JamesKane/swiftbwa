@@ -76,7 +76,6 @@ public struct FMIndexLoader: Sendable {
         return SuffixArray(
             msBytes: UnsafeBufferPointer(start: msStart, count: saCount),
             lsRawBase: lsRaw,
-            count: saCount,
             compressionShift: saCompX,
             mappedFile: mf
         )

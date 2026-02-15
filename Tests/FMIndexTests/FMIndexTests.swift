@@ -69,7 +69,6 @@ struct FMIndexTests {
         let sa = SuffixArray(
             msBytes: UnsafeBufferPointer(start: msBuffer, count: 2),
             lsWords: UnsafeBufferPointer(start: lsBuffer, count: 2),
-            count: 2,
             compressionShift: 0,
             ownedMSBase: UnsafeMutableRawPointer(msBuffer),
             ownedLSBase: UnsafeMutableRawPointer(lsBuffer)

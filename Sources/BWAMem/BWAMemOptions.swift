@@ -18,7 +18,6 @@ public struct InsertSizeOverride: Sendable {
 /// User-facing configuration for BWA-MEM alignment.
 public struct BWAMemOptions: Sendable {
     public var scoring: ScoringParameters
-    public var outputMode: OutputMode
     public var isPairedEnd: Bool
     public var readGroupLine: String?
     /// Extra header lines to insert (-H)
@@ -36,11 +35,6 @@ public struct BWAMemOptions: Sendable {
     /// Use Metal GPU acceleration for Smith-Waterman kernels
     public var useGPU: Bool = false
 
-    public enum OutputMode: Sendable {
-        case sam
-        case bam
-    }
-
     /// Extract the ID field from the read group line.
     public var readGroupID: String? {
         guard let line = readGroupLine else { return nil }
@@ -56,7 +50,6 @@ public struct BWAMemOptions: Sendable {
 
     public init() {
         self.scoring = ScoringParameters()
-        self.outputMode = .sam
         self.isPairedEnd = false
         self.readGroupLine = nil
     }

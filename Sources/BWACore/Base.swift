@@ -30,17 +30,6 @@ public enum Base: UInt8, Sendable {
         }
     }
 
-    /// 3-bit encoding used in BWA's .pac format (matches nst_nt4_table)
-    @inlinable
-    public static func from4bit(_ value: UInt8) -> Base {
-        switch value & 0x07 {
-        case 0: return .A
-        case 1: return .C
-        case 2: return .G
-        case 3: return .T
-        default: return .N
-        }
-    }
 }
 
 /// Lookup table for ASCII -> 2-bit encoding (matches bwa's nst_nt4_table)

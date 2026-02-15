@@ -67,7 +67,6 @@ public struct BandedSWScalar: Sendable {
         var maxIE: Int32 = -1  // max offset tracking
         var gScore: Int32 = -1
         var gTle: Int32 = -1
-        var maxOff: Int32 = 0
 
         // Main DP loop over target positions
         for i in 0..<tlen {
@@ -113,9 +112,6 @@ public struct BandedSWScalar: Sendable {
                     maxIE = Int32(i)
                 }
 
-                // Track max offset from diagonal
-                let off = abs(Int32(i) - Int32(j))
-                if off > maxOff { maxOff = off }
             }
 
             // Check for global alignment (reaching end of query)
@@ -138,8 +134,7 @@ public struct BandedSWScalar: Sendable {
             queryEnd: maxJ + 1,
             targetEnd: maxI + 1,
             globalTargetEnd: gTle + 1,
-            globalScore: gScore,
-            maxOff: maxOff
+            globalScore: gScore
         )
     }
 }

@@ -279,31 +279,6 @@ struct AlignmentTests {
         #expect(result!.targetEnd < 50)
     }
 
-    @Test("BandedSW16 maxOff tracks diagonal offset")
-    func testSIMD16MaxOff() {
-        let scoring = ScoringParameters()
-        // Query embedded in a longer target — best alignment is off-diagonal
-        let query: [UInt8] = [0, 1, 2, 3]  // ACGT
-        let target: [UInt8] = [3, 3, 3, 0, 1, 2, 3, 3, 3]  // TTTACGTTTT
-
-        let scalar = query.withUnsafeBufferPointer { qBuf in
-            target.withUnsafeBufferPointer { tBuf in
-                BandedSWScalar.align(query: qBuf, target: tBuf, scoring: scoring, w: 10, h0: 0)
-            }
-        }
-
-        let simd16 = query.withUnsafeBufferPointer { qBuf in
-            target.withUnsafeBufferPointer { tBuf in
-                BandedSW16.align(query: qBuf, target: tBuf, scoring: scoring, w: 10, h0: 0)
-            }
-        }
-
-        #expect(scalar.score == 4)
-        #expect(simd16.score == scalar.score)
-        // maxOff should be > 0 since the best alignment is off the main diagonal
-        #expect(simd16.maxOff > 0)
-    }
-
     @Test("ChainFilter removes low-weight chains")
     func testChainFilterWeight() {
         var chains = [

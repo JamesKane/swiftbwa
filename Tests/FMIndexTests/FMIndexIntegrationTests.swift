@@ -59,11 +59,11 @@ struct FMIndexIntegrationTests {
         let sa = try FMIndexLoader.loadSA(from: Self.indexPrefix, referenceSeqLen: 97005, mappedFile: bwtMF)
 
         // SA count: 97005 >> 3 + 1 = 12126
-        #expect(sa.count == 12126)
+        #expect(sa.msBytes.count == 12126)
         #expect(sa.compressionShift == 3)
 
         // All SA entries should be valid positions (>= 0)
-        for i in 0..<min(100, sa.count) {
+        for i in 0..<min(100, sa.msBytes.count) {
             let entry = sa.entry(at: Int64(i))
             #expect(entry >= 0, "SA entry \(i) = \(entry) should be >= 0")
         }
@@ -121,7 +121,7 @@ struct FMIndexIntegrationTests {
         #expect(index.referenceSeqLen == 97005)
         #expect(index.genomeLength == 48502)
         #expect(index.metadata.numSequences == 1)
-        #expect(index.suffixArray.count == 12126)
+        #expect(index.suffixArray.msBytes.count == 12126)
         #expect(index.packedRef.length == 48502)
     }
 
@@ -240,7 +240,7 @@ struct FMIndexIntegrationTests {
 
         // Verify a few SA entries are within valid range
         let maxPos = index.referenceSeqLen
-        for i in stride(from: 0, to: min(1000, index.suffixArray.count), by: 10) {
+        for i in stride(from: 0, to: min(1000, index.suffixArray.msBytes.count), by: 10) {
             let saVal = index.suffixArray.entry(at: Int64(i))
             #expect(saVal >= 0 && saVal < maxPos,
                     "SA[\(i)] = \(saVal) should be in [0, \(maxPos))")

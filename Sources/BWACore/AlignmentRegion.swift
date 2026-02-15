@@ -49,8 +49,6 @@ public struct MemAlnReg: Sendable {
     public var seedLen0: Int32 = 0
     /// Number of ambiguous bases
     public var nAmb: Int32 = 0
-    /// Flap length (clipping)
-    public var flapLen: Int32 = 0
     /// Whether this is an ALT hit
     public var isAlt: Bool = false
     /// Best ALT hit score (when this is a primary hit that has an ALT competitor)

@@ -7,7 +7,6 @@ public final class SuffixArray: @unchecked Sendable {
     public let msBytes: UnsafeBufferPointer<Int8>
     /// Raw pointer to ls_word array (UInt32 elements, possibly unaligned when mmap'd)
     @usableFromInline let lsBase: UnsafeRawPointer
-    public let count: Int
     /// SA compression factor (0 = uncompressed, 3 = every 8th position)
     public let compressionShift: Int
 
@@ -19,14 +18,12 @@ public final class SuffixArray: @unchecked Sendable {
 
     public init(msBytes: UnsafeBufferPointer<Int8>,
                 lsWords: UnsafeBufferPointer<UInt32>,
-                count: Int,
                 compressionShift: Int = 0,
                 ownedMSBase: UnsafeMutableRawPointer? = nil,
                 ownedLSBase: UnsafeMutableRawPointer? = nil,
                 mappedFile: MappedFile? = nil) {
         self.msBytes = msBytes
         self.lsBase = UnsafeRawPointer(lsWords.baseAddress!)
-        self.count = count
         self.compressionShift = compressionShift
         self.ownedMSBase = ownedMSBase
         self.ownedLSBase = ownedLSBase
@@ -36,12 +33,10 @@ public final class SuffixArray: @unchecked Sendable {
     /// Init for mmap path where ls_words may not be 4-byte aligned.
     init(msBytes: UnsafeBufferPointer<Int8>,
          lsRawBase: UnsafeRawPointer,
-         count: Int,
          compressionShift: Int,
          mappedFile: MappedFile) {
         self.msBytes = msBytes
         self.lsBase = lsRawBase
-        self.count = count
         self.compressionShift = compressionShift
         self.ownedMSBase = nil
         self.ownedLSBase = nil
