@@ -29,7 +29,7 @@ public struct SMEMFinder: Sendable {
         query: [UInt8],
         bwt: BWT,
         minSeedLen: Int32,
-        minIntv: Int64
+        minIntv: Int64 = 1
     ) -> [SMEM] {
         let readLength = query.count
         guard readLength > 0 else { return [] }
@@ -49,41 +49,6 @@ public struct SMEMFinder: Sendable {
             pos = nextPos
         }
 
-        allSMEMs.sort {
-            if $0.queryBegin != $1.queryBegin {
-                return $0.queryBegin < $1.queryBegin
-            }
-            return $0.length > $1.length
-        }
-
-        return allSMEMs
-    }
-
-    /// Find all SMEMs with default minIntv=1.
-    public static func findAllSMEMs(
-        query: [UInt8],
-        bwt: BWT,
-        minSeedLen: Int32
-    ) -> [SMEM] {
-        let readLength = query.count
-        guard readLength > 0 else { return [] }
-
-        var allSMEMs: [SMEM] = []
-        var pos: Int = 0
-
-        while pos < readLength {
-            let (smems, nextPos) = findSMEMsAtPosition(
-                query: query,
-                bwt: bwt,
-                startPos: pos,
-                minSeedLen: minSeedLen,
-                minIntv: 1
-            )
-            allSMEMs.append(contentsOf: smems)
-            pos = nextPos
-        }
-
-        // Sort by query begin position, then by length descending
         allSMEMs.sort {
             if $0.queryBegin != $1.queryBegin {
                 return $0.queryBegin < $1.queryBegin
@@ -477,34 +442,5 @@ public struct SMEMFinder: Sendable {
             return $0.length > $1.length
         }
         return smems
-    }
-}
-
-// MARK: - BWT helper for count access
-
-extension BWT {
-    /// Get cumulative count for base c (accessor for the count tuple).
-    @inlinable
-    public func count(for c: Int) -> Int64 {
-        switch c {
-        case 0: return count.0
-        case 1: return count.1
-        case 2: return count.2
-        case 3: return count.3
-        case 4: return count.4
-        default: return 0
-        }
-    }
-
-    /// Get cumulative count for base c+1 (next base boundary).
-    @inlinable
-    public func count(forNext c: Int) -> Int64 {
-        switch c {
-        case 0: return count.1
-        case 1: return count.2
-        case 2: return count.3
-        case 3: return count.4
-        default: return count.4
-        }
     }
 }

@@ -1668,17 +1668,11 @@ public actor BWAMemAligner {
                 pos2: localPos2, isReverse2: cigar2.isReverse, refLen2: cigar2.refConsumed
             )
 
-            let pe1 = PairedEndInfo(
-                isRead1: true, isProperPair: decision.isProperPair,
-                mateTid: rid2, matePos: localPos2,
-                mateIsReverse: cigar2.isReverse, mateIsUnmapped: false,
-                tlen: tlen1, mateCigarString: cigar2.cigarString
-            )
-            let pe2 = PairedEndInfo(
-                isRead1: false, isProperPair: decision.isProperPair,
-                mateTid: rid1, matePos: localPos1,
-                mateIsReverse: cigar1.isReverse, mateIsUnmapped: false,
-                tlen: tlen2, mateCigarString: cigar1.cigarString
+            let (pe1, pe2) = PairedEndInfo.makePair(
+                isProperPair: decision.isProperPair,
+                rid1: rid1, localPos1: localPos1, cigar1: cigar1,
+                rid2: rid2, localPos2: localPos2, cigar2: cigar2,
+                tlen1: tlen1, tlen2: tlen2
             )
 
             var records: [RecordSpec] = []
@@ -1773,17 +1767,11 @@ public actor BWAMemAligner {
                 tlen2 = computed.tlen2
             }
 
-            let pe1 = PairedEndInfo(
-                isRead1: true, isProperPair: isProper,
-                mateTid: rid2, matePos: localPos2,
-                mateIsReverse: cigar2.isReverse, mateIsUnmapped: false,
-                tlen: tlen1, mateCigarString: cigar2.cigarString
-            )
-            let pe2 = PairedEndInfo(
-                isRead1: false, isProperPair: isProper,
-                mateTid: rid1, matePos: localPos1,
-                mateIsReverse: cigar1.isReverse, mateIsUnmapped: false,
-                tlen: tlen2, mateCigarString: cigar1.cigarString
+            let (pe1, pe2) = PairedEndInfo.makePair(
+                isProperPair: isProper,
+                rid1: rid1, localPos1: localPos1, cigar1: cigar1,
+                rid2: rid2, localPos2: localPos2, cigar2: cigar2,
+                tlen1: tlen1, tlen2: tlen2
             )
 
             var records: [RecordSpec] = []
@@ -1932,64 +1920,42 @@ public actor BWAMemAligner {
 
                     let minSubScore = UInt8(clamping: scoring.minSeedLength &* scoring.matchScore)
 
-                    // Apply direction 1 results: rescue R2
-                    for li in 0..<count {
-                        let r = candRanges2[li]
-                        for j in 0..<r.count {
-                            let ci = r.start + j
-                            let cand = allCands[ci]
-                            let sw: (score: Int32, qb: Int32, qe: Int32, tb: Int32, te: Int32, sc2: Int32)?
-                            if let g = gpuResults[ci] {
-                                // GPU path doesn't compute score2 yet
-                                sw = (g.score, g.queryBegin, g.queryEnd, g.targetBegin, g.targetEnd, 0)
-                            } else if let c = LocalSWAligner.align(
-                                query: cand.mateSeq, target: cand.refBases,
-                                scoring: scoring, scoringMatrix: mat,
-                                minSubScore: minSubScore
-                            ) {
-                                sw = (c.score, c.queryBegin, c.queryEnd, c.targetBegin, c.targetEnd, c.score2)
-                            } else { sw = nil }
-                            if let sw = sw, let reg = MateRescue.applyResult(
-                                candidate: cand, score: sw.score,
-                                queryBegin: sw.qb, queryEnd: sw.qe,
-                                targetBegin: sw.tb, targetEnd: sw.te,
-                                score2: sw.sc2,
-                                genomeLength: genomeLen, scoring: scoring
-                            ) {
-                                finalRegs2[li].append(reg)
-                                rescueCounts2[li] += 1
+                    // Apply rescue results for one direction
+                    func applyRescueResults(
+                        candRanges: [(start: Int, count: Int)],
+                        regs: inout [[MemAlnReg]], counts: inout [Int]
+                    ) {
+                        for li in 0..<count {
+                            let r = candRanges[li]
+                            for j in 0..<r.count {
+                                let ci = r.start + j
+                                let cand = allCands[ci]
+                                let sw: (score: Int32, qb: Int32, qe: Int32, tb: Int32, te: Int32, sc2: Int32)?
+                                if let g = gpuResults[ci] {
+                                    sw = (g.score, g.queryBegin, g.queryEnd, g.targetBegin, g.targetEnd, 0)
+                                } else if let c = LocalSWAligner.align(
+                                    query: cand.mateSeq, target: cand.refBases,
+                                    scoring: scoring, scoringMatrix: mat,
+                                    minSubScore: minSubScore
+                                ) {
+                                    sw = (c.score, c.queryBegin, c.queryEnd, c.targetBegin, c.targetEnd, c.score2)
+                                } else { sw = nil }
+                                if let sw = sw, let reg = MateRescue.applyResult(
+                                    candidate: cand, score: sw.score,
+                                    queryBegin: sw.qb, queryEnd: sw.qe,
+                                    targetBegin: sw.tb, targetEnd: sw.te,
+                                    score2: sw.sc2,
+                                    genomeLength: genomeLen, scoring: scoring
+                                ) {
+                                    regs[li].append(reg)
+                                    counts[li] += 1
+                                }
                             }
                         }
                     }
 
-                    // Apply direction 2 results: rescue R1
-                    for li in 0..<count {
-                        let r = candRanges1[li]
-                        for j in 0..<r.count {
-                            let ci = r.start + j
-                            let cand = allCands[ci]
-                            let sw: (score: Int32, qb: Int32, qe: Int32, tb: Int32, te: Int32, sc2: Int32)?
-                            if let g = gpuResults[ci] {
-                                sw = (g.score, g.queryBegin, g.queryEnd, g.targetBegin, g.targetEnd, 0)
-                            } else if let c = LocalSWAligner.align(
-                                query: cand.mateSeq, target: cand.refBases,
-                                scoring: scoring, scoringMatrix: mat,
-                                minSubScore: minSubScore
-                            ) {
-                                sw = (c.score, c.queryBegin, c.queryEnd, c.targetBegin, c.targetEnd, c.score2)
-                            } else { sw = nil }
-                            if let sw = sw, let reg = MateRescue.applyResult(
-                                candidate: cand, score: sw.score,
-                                queryBegin: sw.qb, queryEnd: sw.qe,
-                                targetBegin: sw.tb, targetEnd: sw.te,
-                                score2: sw.sc2,
-                                genomeLength: genomeLen, scoring: scoring
-                            ) {
-                                finalRegs1[li].append(reg)
-                                rescueCounts1[li] += 1
-                            }
-                        }
-                    }
+                    applyRescueResults(candRanges: candRanges2, regs: &finalRegs2, counts: &rescueCounts2)
+                    applyRescueResults(candRanges: candRanges1, regs: &finalRegs1, counts: &rescueCounts1)
                 }
 
                 // Re-mark secondaries after rescue

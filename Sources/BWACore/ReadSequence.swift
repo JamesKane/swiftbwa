@@ -30,14 +30,6 @@ public struct ReadSequence: Sendable {
 
     /// Reverse complement of this read
     public func reverseComplement() -> [UInt8] {
-        bases.reversed().map { b in
-            switch b {
-            case 0: return 3  // A -> T
-            case 1: return 2  // C -> G
-            case 2: return 1  // G -> C
-            case 3: return 0  // T -> A
-            default: return 4  // N -> N
-            }
-        }
+        bases.reversed().map { b in b < 4 ? 3 - b : 4 }
     }
 }

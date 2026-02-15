@@ -27,17 +27,13 @@ public struct LocalSWPassResult: Sendable {
 public struct LocalSWDispatcher: Sendable {
 
     /// Perform full local SW with start position recovery for a batch of tasks.
-    /// Returns LocalSWResult for each task, nil if overflow or no alignment found.
     /// Uses wavefront kernel (32-thread SIMD groups) when available, falls back to scalar.
     public static func dispatchBatch(
         tasks: [LocalSWTask],
         engine: MetalSWEngine
     ) async -> [LocalSWResult?] {
-        guard !tasks.isEmpty else {
-            return Array(repeating: nil, count: tasks.count)
-        }
+        guard !tasks.isEmpty else { return Array(repeating: nil, count: tasks.count) }
 
-        // Prefer wavefront kernel (32-way parallelism per alignment)
         let useWavefront = engine.localSWWavefrontPipeline != nil
         let pipeline: MTLComputePipelineState
         if useWavefront, let wf = engine.localSWWavefrontPipeline {
@@ -57,30 +53,18 @@ public struct LocalSWDispatcher: Sendable {
         }
 
         // Build reverse tasks for start position recovery
-        var revTasks: [LocalSWTask?] = []
+        var revIndices: [Int] = []
+        var revBatch: [LocalSWTask] = []
         for (i, task) in tasks.enumerated() {
-            guard let fwd = fwdResults[i], fwd.score > 0 else {
-                revTasks.append(nil)
-                continue
-            }
-            // Reverse prefix of query up to qEnd+1 and target up to tEnd+1
+            guard let fwd = fwdResults[i], fwd.score > 0 else { continue }
             let revQLen = Int(fwd.qEnd) + 1
             let revTLen = Int(fwd.tEnd) + 1
             var revQ = [UInt8](repeating: 0, count: revQLen)
             var revT = [UInt8](repeating: 0, count: revTLen)
             for k in 0..<revQLen { revQ[k] = task.query[revQLen - 1 - k] }
             for k in 0..<revTLen { revT[k] = task.target[revTLen - 1 - k] }
-            revTasks.append(LocalSWTask(query: revQ, target: revT, scoring: task.scoring))
-        }
-
-        // Collect non-nil reverse tasks
-        var revIndices: [Int] = []
-        var revBatch: [LocalSWTask] = []
-        for (i, task) in revTasks.enumerated() {
-            if let t = task {
-                revIndices.append(i)
-                revBatch.append(t)
-            }
+            revIndices.append(i)
+            revBatch.append(LocalSWTask(query: revQ, target: revT, scoring: task.scoring))
         }
 
         // Reverse pass
@@ -97,12 +81,8 @@ public struct LocalSWDispatcher: Sendable {
 
         // Combine forward + reverse results
         var results: [LocalSWResult?] = Array(repeating: nil, count: tasks.count)
-        var revIdx = 0
-        for i in revIndices {
-            guard let fwd = fwdResults[i], let rev = revResults[revIdx] else {
-                revIdx += 1
-                continue
-            }
+        for (revIdx, i) in revIndices.enumerated() {
+            guard let fwd = fwdResults[i], let rev = revResults[revIdx] else { continue }
             results[i] = LocalSWResult(
                 score: fwd.score,
                 queryBegin: fwd.qEnd - rev.qEnd,
@@ -110,9 +90,26 @@ public struct LocalSWDispatcher: Sendable {
                 targetBegin: fwd.tEnd - rev.tEnd,
                 targetEnd: fwd.tEnd
             )
-            revIdx += 1
         }
+        return results
+    }
 
+    /// Read local SW pass results from GPU output buffer.
+    private static func readPassResults(
+        buffer: MTLBuffer, taskCount: Int
+    ) -> [LocalSWPassResult?] {
+        let ptr = buffer.contents().bindMemory(to: Int32.self, capacity: taskCount * 3)
+        var results: [LocalSWPassResult?] = []
+        results.reserveCapacity(taskCount)
+        for i in 0..<taskCount {
+            let base = i * 3
+            let score = ptr[base]
+            if score < 0 {
+                results.append(nil)
+            } else {
+                results.append(LocalSWPassResult(score: score, qEnd: ptr[base + 1], tEnd: ptr[base + 2]))
+            }
+        }
         return results
     }
 
@@ -123,60 +120,26 @@ public struct LocalSWDispatcher: Sendable {
         engine: MetalSWEngine
     ) async -> [LocalSWPassResult?] {
         let taskCount = tasks.count
-
-        var allQueries: [UInt8] = []
-        var queryOffsets: [UInt32] = []
-        var queryLengths: [UInt16] = []
-        var allTargets: [UInt8] = []
-        var targetOffsets: [UInt32] = []
-        var targetLengths: [UInt16] = []
-
-        for task in tasks {
-            queryOffsets.append(UInt32(allQueries.count))
-            queryLengths.append(UInt16(task.query.count))
-            allQueries.append(contentsOf: task.query)
-
-            targetOffsets.append(UInt32(allTargets.count))
-            targetLengths.append(UInt16(task.target.count))
-            allTargets.append(contentsOf: task.target)
-        }
+        var packer = QueryTargetPacker()
+        for task in tasks { packer.add(query: task.query, target: task.target) }
 
         let scoring = tasks[0].scoring
         let mat = scoring.scoringMatrix()
         let gapOE = scoring.gapOpenPenalty + scoring.gapExtendPenalty
-        let gapE = scoring.gapExtendPenalty
-        let params: [Int16] = [Int16(gapOE), Int16(gapE)]
+        let params: [Int16] = [Int16(gapOE), Int16(scoring.gapExtendPenalty)]
         var numTasks: UInt32 = UInt32(taskCount)
 
         let pool = engine.bufferPool
+        guard let qtBufs = packer.createBuffers(pool: pool),
+              let extraBufs = acquireBuffers(pool: pool, sizes: [
+                  mat.count, params.count * 2, taskCount * 3 * 4, 4
+              ])
+        else { return Array(repeating: nil, count: taskCount) }
 
-        guard let queriesBuf = pool.acquire(minSize: max(allQueries.count, 1)),
-              let queryOffsetsBuf = pool.acquire(minSize: queryOffsets.count * 4),
-              let queryLengthsBuf = pool.acquire(minSize: queryLengths.count * 2),
-              let targetsBuf = pool.acquire(minSize: max(allTargets.count, 1)),
-              let targetOffsetsBuf = pool.acquire(minSize: targetOffsets.count * 4),
-              let targetLengthsBuf = pool.acquire(minSize: targetLengths.count * 2),
-              let matBuf = pool.acquire(minSize: mat.count),
-              let paramsBuf = pool.acquire(minSize: params.count * 2),
-              let resultsBuf = pool.acquire(minSize: taskCount * 3 * 4),
-              let numTasksBuf = pool.acquire(minSize: 4)
-        else {
-            return Array(repeating: nil, count: taskCount)
-        }
-
-        let allBuffers = [queriesBuf, queryOffsetsBuf, queryLengthsBuf,
-                          targetsBuf, targetOffsetsBuf, targetLengthsBuf,
-                          matBuf, paramsBuf, resultsBuf, numTasksBuf]
-
-        if !allQueries.isEmpty { memcpy(queriesBuf.contents(), allQueries, allQueries.count) }
-        memcpy(queryOffsetsBuf.contents(), queryOffsets, queryOffsets.count * 4)
-        memcpy(queryLengthsBuf.contents(), queryLengths, queryLengths.count * 2)
-        if !allTargets.isEmpty { memcpy(targetsBuf.contents(), allTargets, allTargets.count) }
-        memcpy(targetOffsetsBuf.contents(), targetOffsets, targetOffsets.count * 4)
-        memcpy(targetLengthsBuf.contents(), targetLengths, targetLengths.count * 2)
-        memcpy(matBuf.contents(), mat, mat.count)
-        memcpy(paramsBuf.contents(), params, params.count * 2)
-        memcpy(numTasksBuf.contents(), &numTasks, 4)
+        let allBuffers = qtBufs + extraBufs
+        memcpy(extraBufs[0].contents(), mat, mat.count)
+        memcpy(extraBufs[1].contents(), params, params.count * 2)
+        memcpy(extraBufs[3].contents(), &numTasks, 4)
 
         guard let cmdBuf = engine.queue.makeCommandBuffer(),
               let encoder = cmdBuf.makeComputeCommandEncoder()
@@ -186,22 +149,11 @@ public struct LocalSWDispatcher: Sendable {
         }
 
         encoder.setComputePipelineState(pipeline)
-        encoder.setBuffer(queriesBuf, offset: 0, index: 0)
-        encoder.setBuffer(queryOffsetsBuf, offset: 0, index: 1)
-        encoder.setBuffer(queryLengthsBuf, offset: 0, index: 2)
-        encoder.setBuffer(targetsBuf, offset: 0, index: 3)
-        encoder.setBuffer(targetOffsetsBuf, offset: 0, index: 4)
-        encoder.setBuffer(targetLengthsBuf, offset: 0, index: 5)
-        encoder.setBuffer(matBuf, offset: 0, index: 6)
-        encoder.setBuffer(paramsBuf, offset: 0, index: 7)
-        encoder.setBuffer(resultsBuf, offset: 0, index: 8)
-        encoder.setBuffer(numTasksBuf, offset: 0, index: 9)
+        encoder.setBufferSequence(allBuffers)
 
-        // One SIMD group (32 threads) per task, 4 SIMD groups per threadgroup
         let simdGroupsPerTG = 4
         let threadsPerTG = simdGroupsPerTG * 32
         let numThreadgroups = (taskCount + simdGroupsPerTG - 1) / simdGroupsPerTG
-
         encoder.dispatchThreadgroups(
             MTLSize(width: numThreadgroups, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: threadsPerTG, height: 1, depth: 1)
@@ -209,30 +161,11 @@ public struct LocalSWDispatcher: Sendable {
         encoder.endEncoding()
 
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            cmdBuf.addCompletedHandler { _ in
-                continuation.resume()
-            }
+            cmdBuf.addCompletedHandler { _ in continuation.resume() }
             cmdBuf.commit()
         }
 
-        var results: [LocalSWPassResult?] = []
-        results.reserveCapacity(taskCount)
-        let resultPtr = resultsBuf.contents().bindMemory(to: Int32.self, capacity: taskCount * 3)
-
-        for i in 0..<taskCount {
-            let base = i * 3
-            let score = resultPtr[base]
-            if score < 0 {
-                results.append(nil)
-            } else {
-                results.append(LocalSWPassResult(
-                    score: score,
-                    qEnd: resultPtr[base + 1],
-                    tEnd: resultPtr[base + 2]
-                ))
-            }
-        }
-
+        let results = readPassResults(buffer: extraBufs[2], taskCount: taskCount)
         pool.release(allBuffers)
         return results
     }
@@ -244,70 +177,36 @@ public struct LocalSWDispatcher: Sendable {
         engine: MetalSWEngine
     ) async -> [LocalSWPassResult?] {
         let taskCount = tasks.count
-
-        var allQueries: [UInt8] = []
-        var queryOffsets: [UInt32] = []
-        var queryLengths: [UInt16] = []
-        var allTargets: [UInt8] = []
-        var targetOffsets: [UInt32] = []
-        var targetLengths: [UInt16] = []
+        var packer = QueryTargetPacker()
         var wsOffsets: [UInt32] = []
-        var totalWorkspaceBytes: UInt32 = 0
+        var totalWS: UInt32 = 0
 
         for task in tasks {
-            queryOffsets.append(UInt32(allQueries.count))
-            queryLengths.append(UInt16(task.query.count))
-            allQueries.append(contentsOf: task.query)
-
-            targetOffsets.append(UInt32(allTargets.count))
-            targetLengths.append(UInt16(task.target.count))
-            allTargets.append(contentsOf: task.target)
-
+            packer.add(query: task.query, target: task.target)
             let qlen = task.query.count
-            let wsBytes = UInt32(qlen + qlen + 5 * qlen)  // H + E + profile
-
-            let aligned = (totalWorkspaceBytes + 15) & ~15
+            let wsBytes = UInt32(qlen + qlen + 5 * qlen)
+            let aligned = (totalWS + 15) & ~15
             wsOffsets.append(aligned)
-            totalWorkspaceBytes = aligned + wsBytes
+            totalWS = aligned + wsBytes
         }
 
         let scoring = tasks[0].scoring
         let mat = scoring.scoringMatrix()
         let gapOE = scoring.gapOpenPenalty + scoring.gapExtendPenalty
-        let gapE = scoring.gapExtendPenalty
-        let bias = scoring.mismatchPenalty
-        let params: [Int16] = [Int16(gapOE), Int16(gapE), Int16(bias)]
+        let params: [Int16] = [Int16(gapOE), Int16(scoring.gapExtendPenalty), Int16(scoring.mismatchPenalty)]
 
         let pool = engine.bufferPool
+        guard let qtBufs = packer.createBuffers(pool: pool),
+              let extraBufs = acquireBuffers(pool: pool, sizes: [
+                  mat.count, params.count * 2, taskCount * 3 * 4,
+                  Int(totalWS), wsOffsets.count * 4
+              ])
+        else { return Array(repeating: nil, count: taskCount) }
 
-        guard let queriesBuf = pool.acquire(minSize: max(allQueries.count, 1)),
-              let queryOffsetsBuf = pool.acquire(minSize: queryOffsets.count * 4),
-              let queryLengthsBuf = pool.acquire(minSize: queryLengths.count * 2),
-              let targetsBuf = pool.acquire(minSize: max(allTargets.count, 1)),
-              let targetOffsetsBuf = pool.acquire(minSize: targetOffsets.count * 4),
-              let targetLengthsBuf = pool.acquire(minSize: targetLengths.count * 2),
-              let matBuf = pool.acquire(minSize: mat.count),
-              let paramsBuf = pool.acquire(minSize: params.count * 2),
-              let resultsBuf = pool.acquire(minSize: taskCount * 3 * 4),
-              let wsBuf = pool.acquire(minSize: max(Int(totalWorkspaceBytes), 1)),
-              let wsOffsetsBuf = pool.acquire(minSize: wsOffsets.count * 4)
-        else {
-            return Array(repeating: nil, count: taskCount)
-        }
-
-        let allBuffers = [queriesBuf, queryOffsetsBuf, queryLengthsBuf,
-                          targetsBuf, targetOffsetsBuf, targetLengthsBuf,
-                          matBuf, paramsBuf, resultsBuf, wsBuf, wsOffsetsBuf]
-
-        if !allQueries.isEmpty { memcpy(queriesBuf.contents(), allQueries, allQueries.count) }
-        memcpy(queryOffsetsBuf.contents(), queryOffsets, queryOffsets.count * 4)
-        memcpy(queryLengthsBuf.contents(), queryLengths, queryLengths.count * 2)
-        if !allTargets.isEmpty { memcpy(targetsBuf.contents(), allTargets, allTargets.count) }
-        memcpy(targetOffsetsBuf.contents(), targetOffsets, targetOffsets.count * 4)
-        memcpy(targetLengthsBuf.contents(), targetLengths, targetLengths.count * 2)
-        memcpy(matBuf.contents(), mat, mat.count)
-        memcpy(paramsBuf.contents(), params, params.count * 2)
-        memcpy(wsOffsetsBuf.contents(), wsOffsets, wsOffsets.count * 4)
+        let allBuffers = qtBufs + extraBufs
+        memcpy(extraBufs[0].contents(), mat, mat.count)
+        memcpy(extraBufs[1].contents(), params, params.count * 2)
+        memcpy(extraBufs[4].contents(), wsOffsets, wsOffsets.count * 4)
 
         guard let cmdBuf = engine.queue.makeCommandBuffer(),
               let encoder = cmdBuf.makeComputeCommandEncoder()
@@ -317,49 +216,21 @@ public struct LocalSWDispatcher: Sendable {
         }
 
         encoder.setComputePipelineState(pipeline)
-        encoder.setBuffer(queriesBuf, offset: 0, index: 0)
-        encoder.setBuffer(queryOffsetsBuf, offset: 0, index: 1)
-        encoder.setBuffer(queryLengthsBuf, offset: 0, index: 2)
-        encoder.setBuffer(targetsBuf, offset: 0, index: 3)
-        encoder.setBuffer(targetOffsetsBuf, offset: 0, index: 4)
-        encoder.setBuffer(targetLengthsBuf, offset: 0, index: 5)
-        encoder.setBuffer(matBuf, offset: 0, index: 6)
-        encoder.setBuffer(paramsBuf, offset: 0, index: 7)
-        encoder.setBuffer(resultsBuf, offset: 0, index: 8)
-        encoder.setBuffer(wsBuf, offset: 0, index: 9)
-        encoder.setBuffer(wsOffsetsBuf, offset: 0, index: 10)
+        encoder.setBufferSequence(allBuffers)
 
-        let threadgroupSize = min(64, pipeline.maxTotalThreadsPerThreadgroup)
-        let gridSize = MTLSize(width: taskCount, height: 1, depth: 1)
-        let tgSize = MTLSize(width: threadgroupSize, height: 1, depth: 1)
-        encoder.dispatchThreads(gridSize, threadsPerThreadgroup: tgSize)
+        let tgSize = min(64, pipeline.maxTotalThreadsPerThreadgroup)
+        encoder.dispatchThreads(
+            MTLSize(width: taskCount, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: tgSize, height: 1, depth: 1)
+        )
         encoder.endEncoding()
 
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            cmdBuf.addCompletedHandler { _ in
-                continuation.resume()
-            }
+            cmdBuf.addCompletedHandler { _ in continuation.resume() }
             cmdBuf.commit()
         }
 
-        var results: [LocalSWPassResult?] = []
-        results.reserveCapacity(taskCount)
-        let resultPtr = resultsBuf.contents().bindMemory(to: Int32.self, capacity: taskCount * 3)
-
-        for i in 0..<taskCount {
-            let base = i * 3
-            let score = resultPtr[base]
-            if score < 0 {
-                results.append(nil)  // overflow
-            } else {
-                results.append(LocalSWPassResult(
-                    score: score,
-                    qEnd: resultPtr[base + 1],
-                    tEnd: resultPtr[base + 2]
-                ))
-            }
-        }
-
+        let results = readPassResults(buffer: extraBufs[2], taskCount: taskCount)
         pool.release(allBuffers)
         return results
     }

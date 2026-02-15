@@ -74,26 +74,7 @@ public struct CIGARGenerator: Sendable {
             let md = generateMD(cigar: cigar, query: querySegment,
                                 target: refSegment)
 
-            // Add soft-clips
-            let intQb = Int(qb)
-            let intQe = Int(qe)
-            if isReverse {
-                let clip5 = readLength - intQe
-                let clip3 = intQb
-                if clip5 > 0 {
-                    cigar.insert(UInt32(clip5) << 4 | CIGAROp.softClip.rawValue, at: 0)
-                }
-                if clip3 > 0 {
-                    cigar.append(UInt32(clip3) << 4 | CIGAROp.softClip.rawValue)
-                }
-            } else {
-                if intQb > 0 {
-                    cigar.insert(UInt32(intQb) << 4 | CIGAROp.softClip.rawValue, at: 0)
-                }
-                if intQe < readLength {
-                    cigar.append(UInt32(readLength - intQe) << 4 | CIGAROp.softClip.rawValue)
-                }
-            }
+            addSoftClips(&cigar, qb: qb, qe: qe, readLength: readLength, isReverse: isReverse)
 
             return CIGARResult(cigar: cigar, nm: nm, md: md, score: trueScore, pos: refPos)
         }
@@ -116,58 +97,15 @@ public struct CIGARGenerator: Sendable {
 
         var cigar = result.cigar
         var pos = refPos
-        var refOffset = 0  // bases squeezed from leading deletions
+        let (posAdj, refOffset) = squeezeDeletions(&cigar)
+        pos += posAdj
 
-        // Squeeze leading deletions (adjust position instead)
-        while !cigar.isEmpty {
-            let op = cigar[0] & 0xF
-            if op == CIGAROp.deletion.rawValue {
-                let len = Int(cigar[0] >> 4)
-                pos += Int64(len)
-                refOffset += len
-                cigar.removeFirst()
-            } else {
-                break
-            }
-        }
-
-        // Squeeze trailing deletions
-        while !cigar.isEmpty {
-            let op = cigar[cigar.count - 1] & 0xF
-            if op == CIGAROp.deletion.rawValue {
-                cigar.removeLast()
-            } else {
-                break
-            }
-        }
-
-        // NM and MD are computed on the aligned portion after deletion squeeze.
-        // refOffset accounts for leading bases consumed by squeezed deletions.
         let nm = computeNMFromCigar(cigar: cigar, query: querySegment,
                                      target: refSegment, targetOffset: refOffset)
         let md = generateMD(cigar: cigar, query: querySegment,
                             target: refSegment, targetOffset: refOffset)
 
-        // Add soft-clips
-        let intQb = Int(qb)
-        let intQe = Int(qe)
-        if isReverse {
-            let clip5 = readLength - intQe
-            let clip3 = intQb
-            if clip5 > 0 {
-                cigar.insert(UInt32(clip5) << 4 | CIGAROp.softClip.rawValue, at: 0)
-            }
-            if clip3 > 0 {
-                cigar.append(UInt32(clip3) << 4 | CIGAROp.softClip.rawValue)
-            }
-        } else {
-            if intQb > 0 {
-                cigar.insert(UInt32(intQb) << 4 | CIGAROp.softClip.rawValue, at: 0)
-            }
-            if intQe < readLength {
-                cigar.append(UInt32(readLength - intQe) << 4 | CIGAROp.softClip.rawValue)
-            }
-        }
+        addSoftClips(&cigar, qb: qb, qe: qe, readLength: readLength, isReverse: isReverse)
 
         return CIGARResult(cigar: cigar, nm: nm, md: md, score: result.score, pos: pos)
     }
@@ -190,56 +128,15 @@ public struct CIGARGenerator: Sendable {
     ) -> CIGARResult {
         var cigar = rawCigar
         var pos = refPos
-        var refOffset = 0
-
-        // Squeeze leading deletions
-        while !cigar.isEmpty {
-            let op = cigar[0] & 0xF
-            if op == CIGAROp.deletion.rawValue {
-                let len = Int(cigar[0] >> 4)
-                pos += Int64(len)
-                refOffset += len
-                cigar.removeFirst()
-            } else {
-                break
-            }
-        }
-
-        // Squeeze trailing deletions
-        while !cigar.isEmpty {
-            let op = cigar[cigar.count - 1] & 0xF
-            if op == CIGAROp.deletion.rawValue {
-                cigar.removeLast()
-            } else {
-                break
-            }
-        }
+        let (posAdj, refOffset) = squeezeDeletions(&cigar)
+        pos += posAdj
 
         let nm = computeNMFromCigar(cigar: cigar, query: querySegment,
                                      target: refSegment, targetOffset: refOffset)
         let md = generateMD(cigar: cigar, query: querySegment,
                             target: refSegment, targetOffset: refOffset)
 
-        // Add soft-clips
-        let intQb = Int(qb)
-        let intQe = Int(qe)
-        if isReverse {
-            let clip5 = readLength - intQe
-            let clip3 = intQb
-            if clip5 > 0 {
-                cigar.insert(UInt32(clip5) << 4 | CIGAROp.softClip.rawValue, at: 0)
-            }
-            if clip3 > 0 {
-                cigar.append(UInt32(clip3) << 4 | CIGAROp.softClip.rawValue)
-            }
-        } else {
-            if intQb > 0 {
-                cigar.insert(UInt32(intQb) << 4 | CIGAROp.softClip.rawValue, at: 0)
-            }
-            if intQe < readLength {
-                cigar.append(UInt32(readLength - intQe) << 4 | CIGAROp.softClip.rawValue)
-            }
-        }
+        addSoftClips(&cigar, qb: qb, qe: qe, readLength: readLength, isReverse: isReverse)
 
         return CIGARResult(cigar: cigar, nm: nm, md: md, score: score, pos: pos)
     }
@@ -368,6 +265,58 @@ public struct CIGARGenerator: Sendable {
 
         md += String(matchCount)
         return md
+    }
+
+    /// Remove leading and trailing deletion ops from CIGAR, adjusting position.
+    /// Returns (position adjustment from leading deletions, ref bases consumed by leading deletions).
+    private static func squeezeDeletions(_ cigar: inout [UInt32]) -> (posAdj: Int64, refOffset: Int) {
+        var posAdj: Int64 = 0
+        var refOffset = 0
+        while !cigar.isEmpty {
+            let op = cigar[0] & 0xF
+            if op == CIGAROp.deletion.rawValue {
+                let len = Int(cigar[0] >> 4)
+                posAdj += Int64(len)
+                refOffset += len
+                cigar.removeFirst()
+            } else {
+                break
+            }
+        }
+        while !cigar.isEmpty {
+            let op = cigar[cigar.count - 1] & 0xF
+            if op == CIGAROp.deletion.rawValue {
+                cigar.removeLast()
+            } else {
+                break
+            }
+        }
+        return (posAdj, refOffset)
+    }
+
+    /// Add soft-clip ops to the front/back of CIGAR based on alignment bounds.
+    private static func addSoftClips(
+        _ cigar: inout [UInt32], qb: Int32, qe: Int32, readLength: Int, isReverse: Bool
+    ) {
+        let intQb = Int(qb)
+        let intQe = Int(qe)
+        if isReverse {
+            let clip5 = readLength - intQe
+            let clip3 = intQb
+            if clip5 > 0 {
+                cigar.insert(UInt32(clip5) << 4 | CIGAROp.softClip.rawValue, at: 0)
+            }
+            if clip3 > 0 {
+                cigar.append(UInt32(clip3) << 4 | CIGAROp.softClip.rawValue)
+            }
+        } else {
+            if intQb > 0 {
+                cigar.insert(UInt32(intQb) << 4 | CIGAROp.softClip.rawValue, at: 0)
+            }
+            if intQe < readLength {
+                cigar.append(UInt32(readLength - intQe) << 4 | CIGAROp.softClip.rawValue)
+            }
+        }
     }
 
     /// Convert 2-bit encoded base to character.

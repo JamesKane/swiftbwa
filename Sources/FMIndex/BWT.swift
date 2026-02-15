@@ -115,4 +115,31 @@ public final class BWT: @unchecked Sendable {
         }
         return cCount + occ(pos, c)
     }
+
+    // MARK: - Count tuple accessors
+
+    /// Get cumulative count for base c (accessor for the count tuple).
+    @inlinable
+    public func count(for c: Int) -> Int64 {
+        switch c {
+        case 0: return count.0
+        case 1: return count.1
+        case 2: return count.2
+        case 3: return count.3
+        case 4: return count.4
+        default: return 0
+        }
+    }
+
+    /// Get cumulative count for base c+1 (next base boundary).
+    @inlinable
+    public func count(forNext c: Int) -> Int64 {
+        switch c {
+        case 0: return count.1
+        case 1: return count.2
+        case 2: return count.3
+        case 3: return count.4
+        default: return count.4
+        }
+    }
 }

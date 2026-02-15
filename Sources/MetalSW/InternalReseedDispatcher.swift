@@ -26,12 +26,9 @@ public struct InternalReseedHandle: @unchecked Sendable {
 private let maxOutPerTask = 16
 
 /// Batch dispatcher for GPU-accelerated internal reseeding.
-/// Scans SMEMs for qualifying candidates, dispatches the internal_reseed
-/// Metal kernel, and merges results back into per-read SMEM arrays.
 public struct InternalReseedDispatcher: Sendable {
 
     /// Scan all reads' SMEMs and build reseed tasks for qualifying candidates.
-    /// A candidate qualifies when: len >= splitLen AND count <= splitWidth.
     public static func buildTasks(
         allSMEMs: [[SMEM]],
         scoring: ScoringParameters
@@ -45,18 +42,13 @@ public struct InternalReseedDispatcher: Sendable {
                 let len = Int(smem.queryEnd - smem.queryBegin)
                 if len < splitLen || smem.count > splitWidth { continue }
                 let midpoint = UInt16((Int(smem.queryBegin) + Int(smem.queryEnd)) / 2)
-                tasks.append(ReseedTask(
-                    readIndex: readIdx,
-                    startPos: midpoint,
-                    minIntv: smem.count + 1
-                ))
+                tasks.append(ReseedTask(readIndex: readIdx, startPos: midpoint, minIntv: smem.count + 1))
             }
         }
         return tasks
     }
 
     /// Dispatch GPU internal reseed kernel asynchronously.
-    /// Returns a handle to collect results, or nil if dispatch cannot proceed.
     public static func dispatchBatchAsync(
         tasks: [ReseedTask],
         reads: [ReadSequence],
@@ -68,11 +60,10 @@ public struct InternalReseedDispatcher: Sendable {
               let countsBuf = engine.bwtCountsBuffer,
               let sentBuf = engine.bwtSentinelBuffer,
               !tasks.isEmpty
-        else {
-            return nil
-        }
+        else { return nil }
 
         let taskCount = tasks.count
+        let readCount = reads.count
 
         // Pack all reads' bases contiguously
         var allQueries: [UInt8] = []
@@ -98,74 +89,44 @@ public struct InternalReseedDispatcher: Sendable {
         }
 
         let pool = engine.bufferPool
-        let readCount = reads.count
-
-        // Acquire buffers
-        guard let queriesBuf = pool.acquire(minSize: max(allQueries.count, 1)),
-              let queryOffsetsBuf = pool.acquire(minSize: readCount * 4),
-              let queryLengthsBuf = pool.acquire(minSize: readCount * 2),
-              let taskReadIdxBuf = pool.acquire(minSize: taskCount * 4),
-              let taskStartPosBuf = pool.acquire(minSize: taskCount * 2),
-              let taskMinIntvBuf = pool.acquire(minSize: taskCount * 8),
-              let outKBuf = pool.acquire(minSize: taskCount * maxOutPerTask * 8),
-              let outLBuf = pool.acquire(minSize: taskCount * maxOutPerTask * 8),
-              let outQBeginBuf = pool.acquire(minSize: taskCount * maxOutPerTask * 2),
-              let outQEndBuf = pool.acquire(minSize: taskCount * maxOutPerTask * 2),
-              let outCountBuf = pool.acquire(minSize: taskCount),
-              let numTasksBuf = pool.acquire(minSize: 4),
-              let minSeedLenBuf = pool.acquire(minSize: 2)
-        else {
-            return nil
-        }
-
-        let poolBuffers = [queriesBuf, queryOffsetsBuf, queryLengthsBuf,
-                           taskReadIdxBuf, taskStartPosBuf, taskMinIntvBuf,
-                           outKBuf, outLBuf, outQBeginBuf, outQEndBuf,
-                           outCountBuf, numTasksBuf, minSeedLenBuf]
+        guard let bufs = acquireBuffers(pool: pool, sizes: [
+            max(allQueries.count, 1), readCount * 4, readCount * 2,
+            taskCount * 4, taskCount * 2, taskCount * 8,
+            taskCount * maxOutPerTask * 8, taskCount * maxOutPerTask * 8,
+            taskCount * maxOutPerTask * 2, taskCount * maxOutPerTask * 2,
+            taskCount, 4, 2
+        ]) else { return nil }
 
         // Copy input data
-        if !allQueries.isEmpty {
-            memcpy(queriesBuf.contents(), allQueries, allQueries.count)
-        }
-        memcpy(queryOffsetsBuf.contents(), queryOffsets, readCount * 4)
-        memcpy(queryLengthsBuf.contents(), queryLengths, readCount * 2)
-        memcpy(taskReadIdxBuf.contents(), taskReadIdx, taskCount * 4)
-        memcpy(taskStartPosBuf.contents(), taskStartPos, taskCount * 2)
-        memcpy(taskMinIntvBuf.contents(), taskMinIntv, taskCount * 8)
+        if !allQueries.isEmpty { memcpy(bufs[0].contents(), allQueries, allQueries.count) }
+        memcpy(bufs[1].contents(), queryOffsets, readCount * 4)
+        memcpy(bufs[2].contents(), queryLengths, readCount * 2)
+        memcpy(bufs[3].contents(), taskReadIdx, taskCount * 4)
+        memcpy(bufs[4].contents(), taskStartPos, taskCount * 2)
+        memcpy(bufs[5].contents(), taskMinIntv, taskCount * 8)
         var numTasks = UInt32(taskCount)
-        memcpy(numTasksBuf.contents(), &numTasks, 4)
+        memcpy(bufs[11].contents(), &numTasks, 4)
         var minSeedLen = Int16(scoring.minSeedLength)
-        memcpy(minSeedLenBuf.contents(), &minSeedLen, 2)
-
-        // Zero the output count buffer
-        memset(outCountBuf.contents(), 0, taskCount)
+        memcpy(bufs[12].contents(), &minSeedLen, 2)
+        memset(bufs[10].contents(), 0, taskCount)  // zero output count
 
         guard let cmdBuf = engine.queue.makeCommandBuffer(),
               let encoder = cmdBuf.makeComputeCommandEncoder()
         else {
-            pool.release(poolBuffers)
+            pool.release(bufs)
             return nil
         }
 
         encoder.setComputePipelineState(pipeline)
-        encoder.setBuffer(queriesBuf, offset: 0, index: 0)
-        encoder.setBuffer(queryOffsetsBuf, offset: 0, index: 1)
-        encoder.setBuffer(queryLengthsBuf, offset: 0, index: 2)
-        encoder.setBuffer(taskReadIdxBuf, offset: 0, index: 3)
-        encoder.setBuffer(taskStartPosBuf, offset: 0, index: 4)
-        encoder.setBuffer(taskMinIntvBuf, offset: 0, index: 5)
+        // Bind: queries(0), qOffsets(1), qLengths(2), taskReadIdx(3), taskStartPos(4), taskMinIntv(5)
+        for i in 0..<6 { encoder.setBuffer(bufs[i], offset: 0, index: i) }
+        // BWT data at indices 6-8
         encoder.setBuffer(bwtBuf, offset: 0, index: 6)
         encoder.setBuffer(countsBuf, offset: 0, index: 7)
         encoder.setBuffer(sentBuf, offset: 0, index: 8)
-        encoder.setBuffer(outKBuf, offset: 0, index: 9)
-        encoder.setBuffer(outLBuf, offset: 0, index: 10)
-        encoder.setBuffer(outQBeginBuf, offset: 0, index: 11)
-        encoder.setBuffer(outQEndBuf, offset: 0, index: 12)
-        encoder.setBuffer(outCountBuf, offset: 0, index: 13)
-        encoder.setBuffer(numTasksBuf, offset: 0, index: 14)
-        encoder.setBuffer(minSeedLenBuf, offset: 0, index: 15)
+        // Output buffers at indices 9-13, numTasks at 14, minSeedLen at 15
+        for i in 6..<13 { encoder.setBuffer(bufs[i], offset: 0, index: i + 3) }
 
-        // One thread per task, 256 threads per threadgroup
         let threadsPerTG = min(256, pipeline.maxTotalThreadsPerThreadgroup)
         let numThreadgroups = (taskCount + threadsPerTG - 1) / threadsPerTG
         encoder.dispatchThreadgroups(
@@ -177,14 +138,8 @@ public struct InternalReseedDispatcher: Sendable {
 
         return InternalReseedHandle(
             cmdBuf: cmdBuf,
-            outK: outKBuf,
-            outL: outLBuf,
-            outQBegin: outQBeginBuf,
-            outQEnd: outQEndBuf,
-            outCount: outCountBuf,
-            poolBuffers: poolBuffers,
-            tasks: tasks,
-            pool: pool
+            outK: bufs[6], outL: bufs[7], outQBegin: bufs[8], outQEnd: bufs[9], outCount: bufs[10],
+            poolBuffers: bufs, tasks: tasks, pool: pool
         )
     }
 
@@ -196,40 +151,27 @@ public struct InternalReseedDispatcher: Sendable {
         handle.cmdBuf.waitUntilCompleted()
 
         let taskCount = handle.tasks.count
-        let countPtr = handle.outCount.contents().bindMemory(
-            to: UInt8.self, capacity: taskCount)
-        let kPtr = handle.outK.contents().bindMemory(
-            to: Int64.self, capacity: taskCount * maxOutPerTask)
-        let lPtr = handle.outL.contents().bindMemory(
-            to: Int64.self, capacity: taskCount * maxOutPerTask)
-        let qBeginPtr = handle.outQBegin.contents().bindMemory(
-            to: Int16.self, capacity: taskCount * maxOutPerTask)
-        let qEndPtr = handle.outQEnd.contents().bindMemory(
-            to: Int16.self, capacity: taskCount * maxOutPerTask)
+        let countPtr = handle.outCount.contents().bindMemory(to: UInt8.self, capacity: taskCount)
+        let kPtr = handle.outK.contents().bindMemory(to: Int64.self, capacity: taskCount * maxOutPerTask)
+        let lPtr = handle.outL.contents().bindMemory(to: Int64.self, capacity: taskCount * maxOutPerTask)
+        let qBeginPtr = handle.outQBegin.contents().bindMemory(to: Int16.self, capacity: taskCount * maxOutPerTask)
+        let qEndPtr = handle.outQEnd.contents().bindMemory(to: Int16.self, capacity: taskCount * maxOutPerTask)
 
-        // Track which reads got new SMEMs for re-sorting
         var affectedReads = Set<Int>()
-
         for tid in 0..<taskCount {
             let count = Int(countPtr[tid])
             if count == 0 { continue }
-
             let readIdx = handle.tasks[tid].readIndex
             let baseOff = tid * maxOutPerTask
             affectedReads.insert(readIdx)
-
             for i in 0..<count {
-                let k = kPtr[baseOff + i]
-                let l = lPtr[baseOff + i]
-                let qBegin = Int32(qBeginPtr[baseOff + i])
-                let qEnd = Int32(qEndPtr[baseOff + i])
                 allSMEMs[readIdx].append(SMEM(
-                    k: k, l: l, queryBegin: qBegin, queryEnd: qEnd
+                    k: kPtr[baseOff + i], l: lPtr[baseOff + i],
+                    queryBegin: Int32(qBeginPtr[baseOff + i]), queryEnd: Int32(qEndPtr[baseOff + i])
                 ))
             }
         }
 
-        // Re-sort affected reads' SMEM arrays
         for readIdx in affectedReads {
             allSMEMs[readIdx].sort {
                 if $0.queryBegin != $1.queryBegin { return $0.queryBegin < $1.queryBegin }

@@ -56,26 +56,11 @@ public final class FMIndex: @unchecked Sendable {
     ///
     /// Matches bwa-mem2's `bns_fetch_seq()` / `bns_get_seq()` behavior.
     public func getReference(at pos: Int64, length: Int) -> [UInt8] {
-        let gl = genomeLength
-        if pos >= gl {
-            // Reverse strand: BWT rev range [pos, pos+length)
-            // maps to forward range [2*gl - pos - length, 2*gl - pos)
-            let fwdEnd = 2 * gl - pos
-            let fwdStart = fwdEnd - Int64(length)
-            let safeStart = max(0, fwdStart)
-            let safeEnd = min(fwdEnd, gl)
-            let safeLen = Int(safeEnd - safeStart)
-            guard safeLen > 0 else { return [] }
-            var bases = packedRef.subsequence(from: safeStart, length: safeLen)
-            bases.reverse()
-            for i in 0..<bases.count {
-                bases[i] = 3 - bases[i]  // A↔T, C↔G
-            }
-            return bases
-        } else {
-            let safeLen = min(length, Int(gl - pos))
-            guard safeLen > 0 && pos >= 0 else { return [] }
-            return packedRef.subsequence(from: pos, length: safeLen)
+        var buf = [UInt8](repeating: 0, count: length)
+        let n = buf.withUnsafeMutableBufferPointer { ptr in
+            getReference(at: pos, length: length, into: ptr.baseAddress!)
         }
+        if n < length { buf.removeSubrange(n..<length) }
+        return buf
     }
 }

@@ -28,6 +28,28 @@ public struct PairedEndInfo: Sendable {
         self.tlen = tlen
         self.mateCigarString = mateCigarString
     }
+
+    /// Build a symmetric pe1/pe2 pair from two aligned primaries.
+    static func makePair(
+        isProperPair: Bool,
+        rid1: Int32, localPos1: Int64, cigar1: CIGARInfo,
+        rid2: Int32, localPos2: Int64, cigar2: CIGARInfo,
+        tlen1: Int64, tlen2: Int64
+    ) -> (pe1: PairedEndInfo, pe2: PairedEndInfo) {
+        let pe1 = PairedEndInfo(
+            isRead1: true, isProperPair: isProperPair,
+            mateTid: rid2, matePos: localPos2,
+            mateIsReverse: cigar2.isReverse, mateIsUnmapped: false,
+            tlen: tlen1, mateCigarString: cigar2.cigarString
+        )
+        let pe2 = PairedEndInfo(
+            isRead1: false, isProperPair: isProperPair,
+            mateTid: rid1, matePos: localPos1,
+            mateIsReverse: cigar1.isReverse, mateIsUnmapped: false,
+            tlen: tlen2, mateCigarString: cigar1.cigarString
+        )
+        return (pe1, pe2)
+    }
 }
 
 /// Converts alignment regions to BAM records using swift-htslib.

@@ -27,23 +27,25 @@ public struct SeedSoA: @unchecked Sendable {
         storage.advanced(by: scoreOff).assumingMemoryBound(to: Int32.self)
     }
 
+    /// Round up n Int32 elements to 8-byte alignment.
+    @usableFromInline
+    static func pad4(_ n: Int) -> Int { (n * 4 + 7) & ~7 }
+
     /// Total bytes needed for a given capacity.
     @inlinable
     static func allocationSize(capacity: Int) -> Int {
-        let pad4 = { (n: Int) in (n * 4 + 7) & ~7 }
-        return capacity * 8 + pad4(capacity) * 3
+        capacity * 8 + pad4(capacity) * 3
     }
 
     /// Create an empty container with the given capacity.
     public init(capacity: Int) {
-        let pad4 = { (n: Int) in (n * 4 + 7) & ~7 }
         self.capacity = capacity
         self.count = 0
         let size = Self.allocationSize(capacity: capacity)
         self.storage = UnsafeMutableRawPointer.allocate(byteCount: max(size, 1), alignment: 8)
         self.qbegOff = capacity * 8
-        self.lenOff = qbegOff + pad4(capacity)
-        self.scoreOff = lenOff + pad4(capacity)
+        self.lenOff = qbegOff + Self.pad4(capacity)
+        self.scoreOff = lenOff + Self.pad4(capacity)
     }
 
     /// Scatter AoS → SoA from an array of MemSeed.

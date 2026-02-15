@@ -63,15 +63,12 @@ public struct ScoringParameters: Sendable {
 
     /// Build the scoring matrix (5x5: A,C,G,T,N)
     public func scoringMatrix() -> [Int8] {
-        var mat = [Int8](repeating: 0, count: 25)
+        var mat = [Int8](repeating: -1, count: 25)
         for i in 0..<4 {
             for j in 0..<4 {
                 mat[i * 5 + j] = i == j ? Int8(matchScore) : Int8(-mismatchPenalty)
             }
-            mat[i * 5 + 4] = -1  // vs N
-            mat[4 * 5 + i] = -1  // N vs
         }
-        mat[24] = -1  // N vs N
         return mat
     }
 }
