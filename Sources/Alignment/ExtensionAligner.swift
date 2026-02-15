@@ -29,6 +29,46 @@ public struct SeedExtensionPlan: Sendable {
 /// Reimplements the extension logic from bwa-mem2's `mem_chain2aln_across_reads_V2()`.
 public struct ExtensionAligner: Sendable {
 
+    /// SIMD4-vectorized seedCov: total length of seeds fully contained in a region.
+    /// Query check uses SIMD4<Int32> (4 seeds per NEON instruction);
+    /// reference check remains scalar (Int64 needs SIMD2, limited benefit).
+    @inline(__always)
+    private static func computeSeedCov(
+        seeds: SeedSoA,
+        qb: Int32, qe: Int32, rb: Int64, re: Int64
+    ) -> Int32 {
+        let sq = seeds.qbegs, sl = seeds.lens, sr = seeds.rbegs
+        let n = seeds.count
+        var seedCov: Int32 = 0
+
+        let regQb = SIMD4<Int32>(repeating: qb)
+        let regQe = SIMD4<Int32>(repeating: qe)
+        var i = 0
+        while i + 4 <= n {
+            let sqV = SIMD4(sq[i], sq[i+1], sq[i+2], sq[i+3])
+            let slV = SIMD4(sl[i], sl[i+1], sl[i+2], sl[i+3])
+            let sqEnd = sqV &+ slV
+            let qMask = (sqV .>= regQb) .& (sqEnd .<= regQe)
+            // Reference check requires Int64 — scalar for masked lanes
+            for j in 0..<4 where qMask[j] {
+                let idx = i + j
+                if sr[idx] >= rb && sr[idx] + Int64(sl[idx]) <= re {
+                    seedCov += sl[idx]
+                }
+            }
+            i += 4
+        }
+        // Scalar tail
+        while i < n {
+            if sq[i] >= qb && sq[i] + sl[i] <= qe
+                && sr[i] >= rb && sr[i] + Int64(sl[i]) <= re {
+                seedCov += sl[i]
+            }
+            i += 1
+        }
+        return seedCov
+    }
+
     /// Extend a chain into an alignment region using banded Smith-Waterman.
     ///
     /// - Parameters:
@@ -44,8 +84,10 @@ public struct ExtensionAligner: Sendable {
         scoring: ScoringParameters
     ) -> [MemAlnReg] {
         var regions: [MemAlnReg] = []
-        let seeds = chain.seeds
-        guard !seeds.isEmpty else { return regions }
+        guard !chain.seeds.isEmpty else { return regions }
+
+        let soa = SeedSoA(from: chain.seeds)
+        defer { soa.deallocate() }
 
         let readLen = Int32(read.length)
         let bandWidth = scoring.bandWidth
@@ -61,16 +103,19 @@ public struct ExtensionAligner: Sendable {
         // Within-chain coverage: track query ranges of already-extended regions
         var coveredRegions: [(qb: Int32, qe: Int32)] = []
 
-        for seedIdx in 0..<seeds.count {
-            let seed = seeds[seedIdx]
+        for seedIdx in 0..<soa.count {
+            let seedQbeg = soa.qbegs[seedIdx]
+            let seedLen = soa.lens[seedIdx]
+            let seedRbeg = soa.rbegs[seedIdx]
+            let seedScore = soa.scores[seedIdx]
 
-            let seedQEnd = seed.qbeg + seed.len
-            let seedREnd = seed.rbeg + Int64(seed.len)
+            let seedQEnd = seedQbeg + seedLen
+            let seedREnd = seedRbeg + Int64(seedLen)
 
             // Within-chain coverage check: simple query containment
             var coveringRegIdx = -1
             for (idx, cov) in coveredRegions.enumerated() {
-                if seed.qbeg >= cov.qb && seedQEnd <= cov.qe {
+                if seedQbeg >= cov.qb && seedQEnd <= cov.qe {
                     coveringRegIdx = idx
                     break
                 }
@@ -78,7 +123,7 @@ public struct ExtensionAligner: Sendable {
 
             if coveringRegIdx >= 0 {
                 // Seed is covered within this chain — update sub/subN
-                let seedAlnScore = seed.len * scoring.matchScore
+                let seedAlnScore = seedLen * scoring.matchScore
                 if seedAlnScore > regions[coveringRegIdx].sub {
                     regions[coveringRegIdx].sub = seedAlnScore
                 }
@@ -93,25 +138,25 @@ public struct ExtensionAligner: Sendable {
             reg.rid = chain.rid
             reg.isAlt = chain.isAlt
             reg.fracRep = chain.fracRep
-            reg.seedCov = seed.len
-            reg.seedLen0 = seed.len
+            reg.seedCov = seedLen
+            reg.seedLen0 = seedLen
 
             // Accumulated h0 chains through extensions (matches bwa-mem2's sc0 pattern).
             // Left extension starts from seed.score; right extension starts from left's
             // local best (or seed.score if left didn't run).
-            var accumulatedH0 = seed.score
+            var accumulatedH0 = seedScore
 
             // --- Left extension ---
             var leftScore: Int32 = 0
             var leftQLen: Int32 = 0
             var leftTLen: Int32 = 0
 
-            if seed.qbeg > 0 {
-                let queryLeft = Array(read.bases[0..<Int(seed.qbeg)].reversed())
-                let targetLeftLen = min(Int(seed.qbeg) + Int(bandWidth), Int(seed.rbeg))
+            if seedQbeg > 0 {
+                let queryLeft = Array(read.bases[0..<Int(seedQbeg)].reversed())
+                let targetLeftLen = min(Int(seedQbeg) + Int(bandWidth), Int(seedRbeg))
 
                 if targetLeftLen > 0 {
-                    let targetStart = seed.rbeg - Int64(targetLeftLen)
+                    let targetStart = seedRbeg - Int64(targetLeftLen)
                     let targetLeft = getReference(targetStart, targetLeftLen).reversed()
                     let targetLeftArr = Array(targetLeft)
 
@@ -122,7 +167,7 @@ public struct ExtensionAligner: Sendable {
                                 target: tBuf,
                                 scoring: scoring,
                                 w: bandWidth,
-                                h0: seed.score,
+                                h0: seedScore,
                                 scoringMatrix: mat
                             )
                         }
@@ -140,7 +185,7 @@ public struct ExtensionAligner: Sendable {
                         leftScore = result.score
                     } else {
                         // EXTEND TO END: end-to-end alignment preferred
-                        leftQLen = seed.qbeg       // extends all the way to position 0
+                        leftQLen = seedQbeg       // extends all the way to position 0
                         leftTLen = result.globalTargetEnd
                         leftScore = result.globalScore
                     }
@@ -189,14 +234,14 @@ public struct ExtensionAligner: Sendable {
             }
 
             // Compute final alignment coordinates
-            reg.qb = seed.qbeg - leftQLen
+            reg.qb = seedQbeg - leftQLen
             reg.qe = seedQEnd + rightQLen
-            reg.rb = seed.rbeg - Int64(leftTLen)
+            reg.rb = seedRbeg - Int64(leftTLen)
             reg.re = seedREnd + Int64(rightTLen)
             // Score: matches bwa-mem2's truesc accumulation pattern.
             // truesc starts at seed.score, is replaced by leftChosen (which includes
             // h0=seed.score), then adds rightChosen - rightH0 (rightH0 = accumulatedH0).
-            var trueScore = Int32(seed.len) * scoring.matchScore
+            var trueScore = Int32(seedLen) * scoring.matchScore
             if leftScore > 0 {
                 trueScore = leftScore
             }
@@ -206,16 +251,7 @@ public struct ExtensionAligner: Sendable {
             reg.score = trueScore
             reg.trueScore = trueScore
 
-            // Compute seedCov: total length of seeds fully contained in alignment region
-            // Matches bwa-mem2's seedcov computation in mem_chain2aln_across_reads_V2
-            var seedCov: Int32 = 0
-            for s in seeds {
-                if s.qbeg >= reg.qb && s.qbeg + s.len <= reg.qe
-                    && s.rbeg >= reg.rb && s.rbeg + Int64(s.len) <= reg.re {
-                    seedCov += s.len
-                }
-            }
-            reg.seedCov = seedCov
+            reg.seedCov = computeSeedCov(seeds: soa, qb: reg.qb, qe: reg.qe, rb: reg.rb, re: reg.re)
 
             coveredRegions.append((qb: reg.qb, qe: reg.qe))
             regions.append(reg)
@@ -252,8 +288,10 @@ public struct ExtensionAligner: Sendable {
         targetBuf: UnsafeMutablePointer<UInt8>
     ) -> [MemAlnReg] {
         var regions: [MemAlnReg] = []
-        let seeds = chain.seeds
-        guard !seeds.isEmpty else { return regions }
+        guard !chain.seeds.isEmpty else { return regions }
+
+        let soa = SeedSoA(from: chain.seeds)
+        defer { soa.deallocate() }
 
         let readLen = Int32(read.length)
         let bandWidth = scoring.bandWidth
@@ -267,22 +305,25 @@ public struct ExtensionAligner: Sendable {
 
         var coveredRegions: [(qb: Int32, qe: Int32)] = []
 
-        for seedIdx in 0..<seeds.count {
-            let seed = seeds[seedIdx]
+        for seedIdx in 0..<soa.count {
+            let seedQbeg = soa.qbegs[seedIdx]
+            let seedLen = soa.lens[seedIdx]
+            let seedRbeg = soa.rbegs[seedIdx]
+            let seedScore = soa.scores[seedIdx]
 
-            let seedQEnd = seed.qbeg + seed.len
-            let seedREnd = seed.rbeg + Int64(seed.len)
+            let seedQEnd = seedQbeg + seedLen
+            let seedREnd = seedRbeg + Int64(seedLen)
 
             var coveringRegIdx = -1
             for (idx, cov) in coveredRegions.enumerated() {
-                if seed.qbeg >= cov.qb && seedQEnd <= cov.qe {
+                if seedQbeg >= cov.qb && seedQEnd <= cov.qe {
                     coveringRegIdx = idx
                     break
                 }
             }
 
             if coveringRegIdx >= 0 {
-                let seedAlnScore = seed.len * scoring.matchScore
+                let seedAlnScore = seedLen * scoring.matchScore
                 if seedAlnScore > regions[coveringRegIdx].sub {
                     regions[coveringRegIdx].sub = seedAlnScore
                 }
@@ -297,26 +338,26 @@ public struct ExtensionAligner: Sendable {
             reg.rid = chain.rid
             reg.isAlt = chain.isAlt
             reg.fracRep = chain.fracRep
-            reg.seedCov = seed.len
-            reg.seedLen0 = seed.len
+            reg.seedCov = seedLen
+            reg.seedLen0 = seedLen
 
-            var accumulatedH0 = seed.score
+            var accumulatedH0 = seedScore
 
             // --- Left extension ---
             var leftScore: Int32 = 0
             var leftQLen: Int32 = 0
             var leftTLen: Int32 = 0
 
-            if seed.qbeg > 0 {
-                let queryLeftLen = Int(seed.qbeg)
+            if seedQbeg > 0 {
+                let queryLeftLen = Int(seedQbeg)
                 // Write reversed query into queryBuf
                 for i in 0..<queryLeftLen {
                     queryBuf[i] = read.bases[queryLeftLen - 1 - i]
                 }
 
-                let targetLeftLen = min(queryLeftLen + Int(bandWidth), Int(seed.rbeg))
+                let targetLeftLen = min(queryLeftLen + Int(bandWidth), Int(seedRbeg))
                 if targetLeftLen > 0 {
-                    let targetStart = seed.rbeg - Int64(targetLeftLen)
+                    let targetStart = seedRbeg - Int64(targetLeftLen)
                     let actualTargetLen = getReference(targetStart, targetLeftLen, targetBuf)
 
                     // Reverse targetBuf in-place
@@ -331,7 +372,7 @@ public struct ExtensionAligner: Sendable {
                     let result = bandedSWExtend(
                         query: qBuf, target: tBuf,
                         scoring: scoring, w: bandWidth,
-                        h0: seed.score, scoringMatrix: mat
+                        h0: seedScore, scoringMatrix: mat
                     )
 
                     accumulatedH0 = result.score
@@ -342,7 +383,7 @@ public struct ExtensionAligner: Sendable {
                         leftTLen = result.targetEnd
                         leftScore = result.score
                     } else {
-                        leftQLen = seed.qbeg
+                        leftQLen = seedQbeg
                         leftTLen = result.globalTargetEnd
                         leftScore = result.globalScore
                     }
@@ -386,12 +427,12 @@ public struct ExtensionAligner: Sendable {
                 }
             }
 
-            reg.qb = seed.qbeg - leftQLen
+            reg.qb = seedQbeg - leftQLen
             reg.qe = seedQEnd + rightQLen
-            reg.rb = seed.rbeg - Int64(leftTLen)
+            reg.rb = seedRbeg - Int64(leftTLen)
             reg.re = seedREnd + Int64(rightTLen)
 
-            var trueScore = Int32(seed.len) * scoring.matchScore
+            var trueScore = Int32(seedLen) * scoring.matchScore
             if leftScore > 0 {
                 trueScore = leftScore
             }
@@ -401,14 +442,7 @@ public struct ExtensionAligner: Sendable {
             reg.score = trueScore
             reg.trueScore = trueScore
 
-            var seedCov: Int32 = 0
-            for s in seeds {
-                if s.qbeg >= reg.qb && s.qbeg + s.len <= reg.qe
-                    && s.rbeg >= reg.rb && s.rbeg + Int64(s.len) <= reg.re {
-                    seedCov += s.len
-                }
-            }
-            reg.seedCov = seedCov
+            reg.seedCov = computeSeedCov(seeds: soa, qb: reg.qb, qe: reg.qe, rb: reg.rb, re: reg.re)
 
             coveredRegions.append((qb: reg.qb, qe: reg.qe))
             regions.append(reg)
@@ -483,24 +517,26 @@ public struct ExtensionAligner: Sendable {
     /// different alignment. Matches bwa-mem2 lines 2965-2978.
     private static func hasOverlappingSeedEvidence(
         seedIdx: Int,
-        seeds: [MemSeed],
-        currentSeed: MemSeed
+        seeds: SeedSoA,
+        currentQbeg: Int32,
+        currentLen: Int32,
+        currentRbeg: Int64
     ) -> Bool {
+        let q = seeds.qbegs, r = seeds.rbegs, l = seeds.lens
         for otherIdx in 0..<seeds.count {
             if otherIdx == seedIdx { continue }
-            let t = seeds[otherIdx]
             // Only check seeds of similar length
-            if t.len < Int32(Float(currentSeed.len) * 0.95) { continue }
+            if l[otherIdx] < Int32(Float(currentLen) * 0.95) { continue }
             // Check overlap from current seed's perspective
-            if currentSeed.qbeg <= t.qbeg
-                && currentSeed.qbeg + currentSeed.len - t.qbeg >= currentSeed.len >> 2
-                && t.qbeg - currentSeed.qbeg != Int32(truncatingIfNeeded: t.rbeg - currentSeed.rbeg) {
+            if currentQbeg <= q[otherIdx]
+                && currentQbeg + currentLen - q[otherIdx] >= currentLen >> 2
+                && q[otherIdx] - currentQbeg != Int32(truncatingIfNeeded: r[otherIdx] - currentRbeg) {
                 return true
             }
             // Check overlap from other seed's perspective
-            if t.qbeg <= currentSeed.qbeg
-                && t.qbeg + t.len - currentSeed.qbeg >= currentSeed.len >> 2
-                && currentSeed.qbeg - t.qbeg != Int32(truncatingIfNeeded: currentSeed.rbeg - t.rbeg) {
+            if q[otherIdx] <= currentQbeg
+                && q[otherIdx] + l[otherIdx] - currentQbeg >= currentLen >> 2
+                && currentQbeg - q[otherIdx] != Int32(truncatingIfNeeded: currentRbeg - r[otherIdx]) {
                 return true
             }
         }
@@ -598,9 +634,23 @@ public struct ExtensionAligner: Sendable {
 
         var regions: [MemAlnReg] = []
 
+        // Cache SeedSoA per unique chain index to avoid repeated conversion
+        var chainSoACache: [Int: SeedSoA] = [:]
+        defer { for (_, soa) in chainSoACache { soa.deallocate() } }
+
         for (planIdx, plan) in plans.enumerated() {
             let seed = plan.seed
             let readLen = plan.readLen
+
+            // Get or create SeedSoA for this chain
+            let chainSoA: SeedSoA
+            if let cached = chainSoACache[plan.chainIndex] {
+                chainSoA = cached
+            } else {
+                let soa = SeedSoA(from: plan.chainSeeds)
+                chainSoACache[plan.chainIndex] = soa
+                chainSoA = soa
+            }
 
             // Cross-chain coverage check (matches CPU path)
             var coveringRegIdx = -1
@@ -617,8 +667,8 @@ public struct ExtensionAligner: Sendable {
             if coveringRegIdx >= 0 {
                 // Check for overlapping-seed evidence of different alignment
                 if hasOverlappingSeedEvidence(
-                    seedIdx: plan.seedIndexInChain, seeds: plan.chainSeeds,
-                    currentSeed: seed
+                    seedIdx: plan.seedIndexInChain, seeds: chainSoA,
+                    currentQbeg: seed.qbeg, currentLen: seed.len, currentRbeg: seed.rbeg
                 ) {
                     // Evidence found — keep this extension
                 } else {
@@ -700,15 +750,7 @@ public struct ExtensionAligner: Sendable {
             reg.score = trueScore
             reg.trueScore = trueScore
 
-            // Compute seedCov
-            var seedCov: Int32 = 0
-            for s in plan.chainSeeds {
-                if s.qbeg >= reg.qb && s.qbeg + s.len <= reg.qe
-                    && s.rbeg >= reg.rb && s.rbeg + Int64(s.len) <= reg.re {
-                    seedCov += s.len
-                }
-            }
-            reg.seedCov = seedCov
+            reg.seedCov = computeSeedCov(seeds: chainSoA, qb: reg.qb, qe: reg.qe, rb: reg.rb, re: reg.re)
 
             regions.append(reg)
         }

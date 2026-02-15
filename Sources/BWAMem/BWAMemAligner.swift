@@ -93,6 +93,7 @@ public actor BWAMemAligner {
         defer { queryBuf.deallocate(); targetBuf.deallocate() }
 
         var regions: [MemAlnReg] = []
+        regions.reserveCapacity(chains.count * 2)
         for chain in chains {
             let chainRegions = ExtensionAligner.extend(
                 chain: chain,
@@ -113,7 +114,8 @@ public actor BWAMemAligner {
     /// Align a single read against the reference (CPU path).
     /// Calls phase1to3, CPU extension, then phase4to5.
     nonisolated public func alignRead(_ read: ReadSequence, readId: UInt64 = 0) -> [MemAlnReg] {
-        let chains = alignReadPhase1to3(read)
+        var arena = ReadArena(capacity: 262144)
+        let chains = alignReadPhase1to3(read, arena: &arena)
         guard !chains.isEmpty else { return [] }
 
         let scoring = options.scoring
@@ -124,20 +126,25 @@ public actor BWAMemAligner {
     }
 
     /// Phase 1-3: SMEM finding → chaining → filtering. Returns filtered chains.
-    nonisolated func alignReadPhase1to3(_ read: ReadSequence) -> [MemChain] {
+    /// Arena-backed: all SMEM scratch buffers carved from a single pre-allocated arena.
+    nonisolated func alignReadPhase1to3(_ read: ReadSequence, arena: inout ReadArena) -> [MemChain] {
         let scoring = options.scoring
 
-        // Phase 1: Find SMEMs
-        var smems = SMEMFinder.findAllSMEMs(
+        // Phase 1: Find SMEMs — all scratch buffers from arena
+        var smemBuf = SMEMFinder.findAllSMEMs(
             query: read.bases,
             bwt: index.bwt,
-            minSeedLen: scoring.minSeedLength
+            minSeedLen: scoring.minSeedLength,
+            arena: &arena
         )
 
-        guard !smems.isEmpty else { return [] }
+        guard smemBuf.count > 0 else { return [] }
 
         // Phase 1.25: Internal seeding — split long low-occ SMEMs to find alternative loci
-        internalReseed(smems: &smems, read: read, scoring: scoring)
+        internalReseed(smemBuf: &smemBuf, read: read, scoring: scoring, arena: &arena)
+
+        // Copy SMEMs to [SMEM] for downstream phases (chains need to outlive arena)
+        var smems = Array(UnsafeBufferPointer(start: smemBuf.storage, count: smemBuf.count))
 
         // Phase 1.5: Re-seeding (-y)
         if scoring.reseedLength > 0 {
@@ -244,6 +251,57 @@ public actor BWAMemAligner {
         guard !newSMEMs.isEmpty else { return }
         smems.append(contentsOf: newSMEMs)
         smems.sort {
+            if $0.queryBegin != $1.queryBegin { return $0.queryBegin < $1.queryBegin }
+            return $0.length > $1.length
+        }
+    }
+
+    /// Arena-backed internal seeding: appends new SMEMs directly to smemBuf.
+    nonisolated func internalReseed(
+        smemBuf: inout ArenaBuffer<SMEM>,
+        read: ReadSequence, scoring: ScoringParameters,
+        arena: inout ReadArena
+    ) {
+        let splitLen = Int(Float(scoring.minSeedLength) * scoring.seedSplitRatio + 0.499)
+        let originalCount = smemBuf.count
+
+        // Allocate newSMEMs from arena — sized to smemBuf's remaining capacity
+        // since we can't append more than that back anyway
+        let newCapacity = smemBuf.capacity - originalCount
+        var newSMEMs = ArenaBuffer<SMEM>(
+            base: arena.allocate(SMEM.self, count: newCapacity),
+            capacity: newCapacity
+        )
+        var prevBuf = ArenaBuffer<SMEMFinder.BidiInterval>(
+            base: arena.allocate(SMEMFinder.BidiInterval.self, count: read.length),
+            capacity: read.length
+        )
+
+        for i in 0..<originalCount {
+            let smem = smemBuf[i]
+            let len = Int(smem.queryEnd - smem.queryBegin)
+            if len < splitLen || smem.count > Int64(scoring.splitWidth) { continue }
+
+            let midpoint = Int(smem.queryBegin + smem.queryEnd) / 2
+            prevBuf.removeAll()
+            let _ = SMEMFinder.findSMEMsAtPosition(
+                query: read.bases, bwt: index.bwt,
+                startPos: midpoint, minSeedLen: scoring.minSeedLength,
+                minIntv: smem.count + 1,
+                smemOutput: &newSMEMs, prevBuffer: &prevBuf
+            )
+        }
+
+        guard newSMEMs.count > 0 else { return }
+
+        // Append newSMEMs to smemBuf (bounded by remaining capacity)
+        let remaining = smemBuf.capacity - smemBuf.count
+        let toAppend = min(newSMEMs.count, remaining)
+        for i in 0..<toAppend {
+            smemBuf.append(newSMEMs[i])
+        }
+
+        smemBuf.sort {
             if $0.queryBegin != $1.queryBegin { return $0.queryBegin < $1.queryBegin }
             return $0.length > $1.length
         }
@@ -2346,7 +2404,8 @@ public actor BWAMemAligner {
                     let idx = nextIdx
                     let read = batchReads[idx]
                     group.addTask { [self] in
-                        (idx, self.alignReadPhase1to3(read))
+                        var arena = ReadArena(capacity: 262144)
+                        return (idx, self.alignReadPhase1to3(read, arena: &arena))
                     }
                     nextIdx += 1
                 }
@@ -2356,7 +2415,8 @@ public actor BWAMemAligner {
                         let idx = nextIdx
                         let read = batchReads[idx]
                         group.addTask { [self] in
-                            (idx, self.alignReadPhase1to3(read))
+                            var arena = ReadArena(capacity: 262144)
+                            return (idx, self.alignReadPhase1to3(read, arena: &arena))
                         }
                         nextIdx += 1
                     }

@@ -24,6 +24,7 @@ public struct SeedChainer: Sendable {
         let maxChainGap = scoring.maxChainGap
 
         var chains: [MemChain] = []
+        chains.reserveCapacity(64)
 
         for smem in smems {
             let seedLen = smem.queryEnd - smem.queryBegin
@@ -78,7 +79,9 @@ public struct SeedChainer: Sendable {
 
                 if !merged {
                     var chain = MemChain()
-                    chain.seeds = [seed]
+                    chain.seeds = []
+                    chain.seeds.reserveCapacity(8)
+                    chain.seeds.append(seed)
                     chain.weight = seedLen
                     chain.rid = rid
                     chain.pos = refPos

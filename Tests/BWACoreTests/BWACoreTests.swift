@@ -125,4 +125,204 @@ struct BWACoreTests {
         #expect(rid == 1)
         #expect(pos == 50)
     }
+
+    // MARK: - SeedSoA Tests
+
+    @Test("SeedSoA round-trip preserves all fields")
+    func testSeedSoARoundTrip() {
+        let seeds: [MemSeed] = [
+            MemSeed(rbeg: 1000, qbeg: 10, len: 19, score: 19),
+            MemSeed(rbeg: 2000, qbeg: 50, len: 25, score: 25),
+            MemSeed(rbeg: 3000, qbeg: 80, len: 30, score: 30),
+        ]
+
+        let soa = SeedSoA(from: seeds)
+        defer { soa.deallocate() }
+
+        #expect(soa.count == 3)
+        #expect(soa.capacity == 3)
+
+        let result = soa.toArray()
+        #expect(result == seeds)
+    }
+
+    @Test("SeedSoA column access matches AoS fields")
+    func testSeedSoAColumnAccess() {
+        let seeds: [MemSeed] = [
+            MemSeed(rbeg: 100, qbeg: 5, len: 20, score: 20),
+            MemSeed(rbeg: 200, qbeg: 30, len: 15, score: 15),
+        ]
+
+        let soa = SeedSoA(from: seeds)
+        defer { soa.deallocate() }
+
+        #expect(soa.rbegs[0] == 100)
+        #expect(soa.rbegs[1] == 200)
+        #expect(soa.qbegs[0] == 5)
+        #expect(soa.qbegs[1] == 30)
+        #expect(soa.lens[0] == 20)
+        #expect(soa.lens[1] == 15)
+        #expect(soa.scores[0] == 20)
+        #expect(soa.scores[1] == 15)
+    }
+
+    @Test("SeedSoA empty array")
+    func testSeedSoAEmpty() {
+        let soa = SeedSoA(from: [])
+        defer { soa.deallocate() }
+
+        #expect(soa.count == 0)
+        #expect(soa.toArray().isEmpty)
+    }
+
+    @Test("SeedSoA single element")
+    func testSeedSoASingle() {
+        let seed = MemSeed(rbeg: 42, qbeg: 7, len: 19, score: 19)
+        let soa = SeedSoA(from: [seed])
+        defer { soa.deallocate() }
+
+        #expect(soa.count == 1)
+        #expect(soa.rbegs[0] == 42)
+        #expect(soa.qbegs[0] == 7)
+        #expect(soa.lens[0] == 19)
+        #expect(soa.scores[0] == 19)
+        #expect(soa.toArray() == [seed])
+    }
+
+    @Test("SeedSoA large count exercises SIMD path (5+ elements)")
+    func testSeedSoALargeCount() {
+        let seeds = (0..<13).map { i in
+            MemSeed(rbeg: Int64(i) * 100, qbeg: Int32(i) * 10, len: 19, score: 19)
+        }
+
+        let soa = SeedSoA(from: seeds)
+        defer { soa.deallocate() }
+
+        #expect(soa.count == 13)
+        let roundTripped = soa.toArray()
+        #expect(roundTripped == seeds)
+    }
+
+    @Test("SeedSoA capacity-only init")
+    func testSeedSoACapacityInit() {
+        let soa = SeedSoA(capacity: 10)
+        defer { soa.deallocate() }
+
+        #expect(soa.count == 0)
+        #expect(soa.capacity == 10)
+    }
+
+    // MARK: - ReadArena Tests
+
+    @Test("ReadArena basic allocation and reset")
+    func testReadArenaBasic() {
+        var arena = ReadArena(capacity: 4096)
+        let ptr1 = arena.allocate(Int64.self, count: 10)
+        ptr1[0] = 42
+        ptr1[9] = 99
+        #expect(ptr1[0] == 42)
+        #expect(ptr1[9] == 99)
+
+        let ptr2 = arena.allocate(UInt8.self, count: 100)
+        ptr2[0] = 7
+        #expect(ptr2[0] == 7)
+
+        // Reset reuses the same buffer
+        arena.reset()
+        let ptr3 = arena.allocate(Int64.self, count: 10)
+        ptr3[0] = 123
+        #expect(ptr3[0] == 123)
+    }
+
+    @Test("ReadArena alignment")
+    func testReadArenaAlignment() {
+        var arena = ReadArena(capacity: 4096)
+        // Allocate a byte to offset, then allocate Int64 which needs 8-byte alignment
+        let _ = arena.allocate(UInt8.self, count: 1)
+        let ptr = arena.allocate(Int64.self, count: 1)
+        #expect(Int(bitPattern: ptr) % MemoryLayout<Int64>.alignment == 0)
+    }
+
+    // MARK: - ArenaBuffer Tests
+
+    @Test("ArenaBuffer append and subscript")
+    func testArenaBufferAppendSubscript() {
+        var arena = ReadArena(capacity: 4096)
+        var buf = ArenaBuffer<Int32>(
+            base: arena.allocate(Int32.self, count: 10),
+            capacity: 10
+        )
+        #expect(buf.count == 0)
+
+        buf.append(10)
+        buf.append(20)
+        buf.append(30)
+        #expect(buf.count == 3)
+        #expect(buf[0] == 10)
+        #expect(buf[1] == 20)
+        #expect(buf[2] == 30)
+
+        buf[1] = 99
+        #expect(buf[1] == 99)
+    }
+
+    @Test("ArenaBuffer removeAll resets count")
+    func testArenaBufferRemoveAll() {
+        var arena = ReadArena(capacity: 4096)
+        var buf = ArenaBuffer<Int32>(
+            base: arena.allocate(Int32.self, count: 10),
+            capacity: 10
+        )
+        buf.append(1)
+        buf.append(2)
+        #expect(buf.count == 2)
+
+        buf.removeAll()
+        #expect(buf.count == 0)
+
+        // Can reuse capacity
+        buf.append(3)
+        #expect(buf.count == 1)
+        #expect(buf[0] == 3)
+    }
+
+    @Test("ArenaBuffer sort")
+    func testArenaBufferSort() {
+        var arena = ReadArena(capacity: 4096)
+        var buf = ArenaBuffer<Int32>(
+            base: arena.allocate(Int32.self, count: 10),
+            capacity: 10
+        )
+        buf.append(30)
+        buf.append(10)
+        buf.append(20)
+
+        buf.sort(by: <)
+        #expect(buf[0] == 10)
+        #expect(buf[1] == 20)
+        #expect(buf[2] == 30)
+    }
+
+    @Test("ArenaBuffer with SMEM type")
+    func testArenaBufferSMEM() {
+        var arena = ReadArena(capacity: 4096)
+        var buf = ArenaBuffer<SMEM>(
+            base: arena.allocate(SMEM.self, count: 10),
+            capacity: 10
+        )
+
+        buf.append(SMEM(k: 100, l: 200, queryBegin: 5, queryEnd: 15))
+        buf.append(SMEM(k: 300, l: 400, queryBegin: 0, queryEnd: 10))
+        #expect(buf.count == 2)
+
+        // Sort by queryBegin
+        buf.sort { $0.queryBegin < $1.queryBegin }
+        #expect(buf[0].queryBegin == 0)
+        #expect(buf[1].queryBegin == 5)
+
+        // Convert to Array
+        let arr = Array(UnsafeBufferPointer(start: buf.storage, count: buf.count))
+        #expect(arr.count == 2)
+        #expect(arr[0].k == 300)
+    }
 }

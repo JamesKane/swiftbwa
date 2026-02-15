@@ -13,15 +13,16 @@ public struct ChainFilter: Sendable {
     /// Compute chain weight as min(non-overlapping query coverage, non-overlapping reference coverage).
     /// Matches bwa-mem2's `mem_chain_weight()` (bwamem.cpp:429-448).
     /// Seeds must already be sorted by reference position.
-    private static func chainWeight(_ chain: MemChain) -> Int32 {
+    private static func chainWeight(_ seeds: SeedSoA) -> Int32 {
+        let q = seeds.qbegs, r = seeds.rbegs, l = seeds.lens
         // Pass 1: non-overlapping query coverage
         var w: Int32 = 0
         var end: Int64 = 0
-        for seed in chain.seeds {
-            let sb = Int64(seed.qbeg)
-            let se = sb + Int64(seed.len)
+        for i in 0..<seeds.count {
+            let sb = Int64(q[i])
+            let se = sb + Int64(l[i])
             if sb >= end {
-                w += seed.len
+                w += l[i]
             } else if se > end {
                 w += Int32(se - end)
             }
@@ -32,11 +33,11 @@ public struct ChainFilter: Sendable {
         // Pass 2: non-overlapping reference coverage
         w = 0
         end = 0
-        for seed in chain.seeds {
-            let sb = seed.rbeg
-            let se = sb + Int64(seed.len)
+        for i in 0..<seeds.count {
+            let sb = r[i]
+            let se = sb + Int64(l[i])
             if sb >= end {
-                w += seed.len
+                w += l[i]
             } else if se > end {
                 w += Int32(se - end)
             }
@@ -59,7 +60,9 @@ public struct ChainFilter: Sendable {
 
         // Recompute chain weight properly (bwa-mem2 line 515: c->w = mem_chain_weight(c))
         for i in 0..<chains.count {
-            chains[i].weight = chainWeight(chains[i])
+            let soa = SeedSoA(from: chains[i].seeds)
+            chains[i].weight = chainWeight(soa)
+            soa.deallocate()
         }
 
         // Remove chains below minimum weight

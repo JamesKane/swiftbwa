@@ -170,14 +170,14 @@ public struct SMEMFinder: Sendable {
         return seeds
     }
 
-    /// Bidirectional SMEM interval used internally during search.
+    /// Bidirectional SMEM interval used during search.
     /// Tracks both forward (k) and reverse (l) SA intervals plus query span.
-    private struct BidiInterval {
-        var k: Int64    // Forward SA interval start
-        var l: Int64    // Reverse SA interval position
-        var s: Int64    // Interval size (same in both directions)
-        var m: Int32    // Query begin (inclusive)
-        var n: Int32    // Query end (inclusive, i.e., last matched position)
+    public struct BidiInterval {
+        public var k: Int64    // Forward SA interval start
+        public var l: Int64    // Reverse SA interval position
+        public var s: Int64    // Interval size (same in both directions)
+        public var m: Int32    // Query begin (inclusive)
+        public var n: Int32    // Query end (inclusive, i.e., last matched position)
     }
 
     /// Find SMEMs starting from a specific query position.
@@ -362,6 +362,197 @@ public struct SMEMFinder: Sendable {
         }
 
         return (smems, nextPos)
+    }
+
+    // MARK: - Arena-backed overloads
+
+    /// Arena-backed overload: appends to caller's buffers, zero per-call allocations.
+    public static func findSMEMsAtPosition(
+        query: [UInt8],
+        bwt: BWT,
+        startPos: Int,
+        minSeedLen: Int32,
+        minIntv: Int64,
+        smemOutput: inout ArenaBuffer<SMEM>,
+        prevBuffer: inout ArenaBuffer<BidiInterval>
+    ) -> Int {
+        let readLength = query.count
+        var nextPos = startPos + 1
+
+        let a = query[startPos]
+        guard a < 4 else {
+            return nextPos
+        }
+
+        var smem = BidiInterval(
+            k: bwt.count(for: Int(a)),
+            l: bwt.count(for: Int(3 - a)),
+            s: bwt.count(forNext: Int(a)) - bwt.count(for: Int(a)),
+            m: Int32(startPos),
+            n: Int32(startPos)
+        )
+
+        var numPrev = 0
+
+        // === Forward phase: extend rightward ===
+        var j = startPos + 1
+        while j < readLength {
+            let base = query[j]
+            nextPos = j + 1
+
+            guard base < 4 else { break }
+
+            let swapped = BidiInterval(k: smem.l, l: smem.k, s: smem.s, m: smem.m, n: smem.n)
+            let ext = BackwardSearch.backwardExt(
+                bwt: bwt,
+                interval: (swapped.k, swapped.l, swapped.s),
+                base: Int(3 - base)
+            )
+            let newSmem = BidiInterval(k: ext.l, l: ext.k, s: ext.s, m: smem.m, n: Int32(j))
+
+            if newSmem.s != smem.s {
+                prevBuffer.append(smem)
+                numPrev += 1
+            }
+
+            if newSmem.s < minIntv {
+                nextPos = j
+                break
+            }
+
+            smem = newSmem
+            j += 1
+        }
+
+        if smem.s >= minIntv {
+            prevBuffer.append(smem)
+            numPrev += 1
+        }
+
+        // Reverse prevBuffer portion in-place
+        let base0 = prevBuffer.count - numPrev
+        var lo = base0, hi = prevBuffer.count - 1
+        while lo < hi {
+            let tmp = prevBuffer[lo]
+            prevBuffer[lo] = prevBuffer[hi]
+            prevBuffer[hi] = tmp
+            lo += 1; hi -= 1
+        }
+
+        // === Backward phase: extend leftward from each candidate ===
+        for bj in stride(from: startPos - 1, through: 0, by: -1) {
+            let base = query[bj]
+            guard base < 4 else { break }
+
+            var numCurr = 0
+            var currS: Int64 = -1
+
+            var p = 0
+            while p < numPrev {
+                let interval = prevBuffer[base0 + p]
+                let ext = BackwardSearch.backwardExt(
+                    bwt: bwt,
+                    interval: (interval.k, interval.l, interval.s),
+                    base: Int(base)
+                )
+                let newInterval = BidiInterval(k: ext.k, l: ext.l, s: ext.s, m: Int32(bj), n: interval.n)
+
+                if newInterval.s < minIntv && (interval.n - interval.m + 1) >= minSeedLen {
+                    let emitSmem = SMEM(
+                        k: interval.k,
+                        l: interval.k + interval.s - 1,
+                        queryBegin: interval.m,
+                        queryEnd: interval.n + 1
+                    )
+                    smemOutput.append(emitSmem)
+                    break
+                }
+
+                if newInterval.s >= minIntv && newInterval.s != currS {
+                    currS = newInterval.s
+                    prevBuffer[base0 + numCurr] = newInterval
+                    numCurr += 1
+                    break
+                }
+                p += 1
+            }
+
+            p += 1
+            while p < numPrev {
+                let interval = prevBuffer[base0 + p]
+                let ext = BackwardSearch.backwardExt(
+                    bwt: bwt,
+                    interval: (interval.k, interval.l, interval.s),
+                    base: Int(base)
+                )
+                let newInterval = BidiInterval(k: ext.k, l: ext.l, s: ext.s, m: Int32(bj), n: interval.n)
+
+                if newInterval.s >= minIntv && newInterval.s != currS {
+                    currS = newInterval.s
+                    prevBuffer[base0 + numCurr] = newInterval
+                    numCurr += 1
+                }
+                p += 1
+            }
+
+            numPrev = numCurr
+            if numCurr == 0 { break }
+        }
+
+        if numPrev != 0 {
+            let interval = prevBuffer[base0]
+            if (interval.n - interval.m + 1) >= minSeedLen {
+                let emitSmem = SMEM(
+                    k: interval.k,
+                    l: interval.k + interval.s - 1,
+                    queryBegin: interval.m,
+                    queryEnd: interval.n + 1
+                )
+                smemOutput.append(emitSmem)
+            }
+        }
+
+        return nextPos
+    }
+
+    /// Arena-backed: allocates SMEM + prev buffers from arena, returns ArenaBuffer<SMEM>.
+    public static func findAllSMEMs(
+        query: [UInt8],
+        bwt: BWT,
+        minSeedLen: Int32,
+        minIntv: Int64 = 1,
+        arena: inout ReadArena
+    ) -> ArenaBuffer<SMEM> {
+        let readLen = query.count
+        guard readLen > 0 else {
+            return ArenaBuffer(base: arena.allocate(SMEM.self, count: 1), capacity: 1)
+        }
+
+        let smemCapacity = max(readLen * 16, 4096)
+        var smems = ArenaBuffer<SMEM>(
+            base: arena.allocate(SMEM.self, count: smemCapacity),
+            capacity: smemCapacity
+        )
+        var prevBuf = ArenaBuffer<BidiInterval>(
+            base: arena.allocate(BidiInterval.self, count: readLen),
+            capacity: readLen
+        )
+
+        var pos = 0
+        while pos < readLen {
+            prevBuf.removeAll()
+            pos = findSMEMsAtPosition(
+                query: query, bwt: bwt, startPos: pos,
+                minSeedLen: minSeedLen, minIntv: minIntv,
+                smemOutput: &smems, prevBuffer: &prevBuf
+            )
+        }
+
+        smems.sort {
+            if $0.queryBegin != $1.queryBegin { return $0.queryBegin < $1.queryBegin }
+            return $0.length > $1.length
+        }
+        return smems
     }
 }
 
