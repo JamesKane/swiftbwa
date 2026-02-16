@@ -95,7 +95,7 @@ public struct BandedSWDispatcher: Sendable {
                 results.append(SWResult(
                     score: score, queryEnd: resultPtr[base + 1],
                     targetEnd: resultPtr[base + 2], globalTargetEnd: resultPtr[base + 3],
-                    globalScore: resultPtr[base + 4]
+                    globalScore: resultPtr[base + 4], maxOff: resultPtr[base + 5]
                 ))
             }
         }
@@ -150,7 +150,7 @@ public struct BandedSWDispatcher: Sendable {
             results.append(SWResult(
                 score: resultPtr[base], queryEnd: resultPtr[base + 1],
                 targetEnd: resultPtr[base + 2], globalTargetEnd: resultPtr[base + 3],
-                globalScore: resultPtr[base + 4]
+                globalScore: resultPtr[base + 4], maxOff: resultPtr[base + 5]
             ))
         }
         pool.release(allBuffers)

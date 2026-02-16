@@ -23,15 +23,15 @@ struct BandedSW8MetalTests {
         let query: [UInt8] = [0, 1, 2, 3, 0, 1, 2, 3, 0, 1]  // ACGTACGTAC
         let target: [UInt8] = [0, 1, 2, 3, 0, 1, 2, 3, 0, 1]
 
-        // CPU result
+        // CPU result (h0 must be > 0 for extension SW)
         let cpuResult = query.withUnsafeBufferPointer { qBuf in
             target.withUnsafeBufferPointer { tBuf in
-                BandedSW8.align(query: qBuf, target: tBuf, scoring: scoring, w: 100, h0: 0)
+                BandedSW8.align(query: qBuf, target: tBuf, scoring: scoring, w: 100, h0: 1)
             }
         }
 
         // GPU result
-        let task = BandedSWTask(query: query, target: target, h0: 0, w: 100, scoring: scoring)
+        let task = BandedSWTask(query: query, target: target, h0: 1, w: 100, scoring: scoring)
         let gpuResults = BandedSWDispatcher.dispatchBatch8(tasks: [task], engine: engine)
 
         #expect(gpuResults.count == 1)
@@ -57,11 +57,11 @@ struct BandedSW8MetalTests {
 
         let cpuResult = query.withUnsafeBufferPointer { qBuf in
             target.withUnsafeBufferPointer { tBuf in
-                BandedSW8.align(query: qBuf, target: tBuf, scoring: scoring, w: 100, h0: 0)
+                BandedSW8.align(query: qBuf, target: tBuf, scoring: scoring, w: 100, h0: 1)
             }
         }
 
-        let task = BandedSWTask(query: query, target: target, h0: 0, w: 100, scoring: scoring)
+        let task = BandedSWTask(query: query, target: target, h0: 1, w: 100, scoring: scoring)
         let gpuResults = BandedSWDispatcher.dispatchBatch8(tasks: [task], engine: engine)
 
         #expect(gpuResults.count == 1)
@@ -103,10 +103,10 @@ struct BandedSW8MetalTests {
 
         let scoring = ScoringParameters()
         let testCases: [(query: [UInt8], target: [UInt8], h0: Int32)] = [
-            ([0, 1, 2, 3], [0, 1, 2, 3], 0),
+            ([0, 1, 2, 3], [0, 1, 2, 3], 1),
             ([0, 1, 2, 3, 0, 1, 2, 3], [0, 1, 2, 3, 0, 1, 2, 3], 5),
-            ([0, 0, 0, 0, 0], [0, 0, 0, 0, 0], 0),
-            ([0, 1, 2, 3, 0, 1], [3, 2, 1, 0, 3, 2], 0),  // all mismatches
+            ([0, 0, 0, 0, 0], [0, 0, 0, 0, 0], 1),
+            ([0, 1, 2, 3, 0, 1], [3, 2, 1, 0, 3, 2], 1),  // all mismatches
         ]
 
         var tasks: [BandedSWTask] = []
@@ -156,11 +156,11 @@ struct BandedSW8MetalTests {
 
         let cpuResult = query.withUnsafeBufferPointer { qBuf in
             target.withUnsafeBufferPointer { tBuf in
-                BandedSW8.align(query: qBuf, target: tBuf, scoring: scoring, w: 100, h0: 0)
+                BandedSW8.align(query: qBuf, target: tBuf, scoring: scoring, w: 100, h0: 1)
             }
         }
 
-        let task = BandedSWTask(query: query, target: target, h0: 0, w: 100, scoring: scoring)
+        let task = BandedSWTask(query: query, target: target, h0: 1, w: 100, scoring: scoring)
         let gpuResults = BandedSWDispatcher.dispatchBatch8(tasks: [task], engine: engine)
 
         if let cpuR = cpuResult, let gpuR = gpuResults[0] {
@@ -184,11 +184,11 @@ struct BandedSW8MetalTests {
 
         let cpuResult = query.withUnsafeBufferPointer { qBuf in
             target.withUnsafeBufferPointer { tBuf in
-                BandedSW8.align(query: qBuf, target: tBuf, scoring: scoring, w: 100, h0: 0)
+                BandedSW8.align(query: qBuf, target: tBuf, scoring: scoring, w: 100, h0: 1)
             }
         }
 
-        let task = BandedSWTask(query: query, target: target, h0: 0, w: 100, scoring: scoring)
+        let task = BandedSWTask(query: query, target: target, h0: 1, w: 100, scoring: scoring)
         let gpuResults = BandedSWDispatcher.dispatchBatch8(tasks: [task], engine: engine)
 
         // Both should overflow (return nil)
@@ -206,15 +206,15 @@ struct BandedSW8MetalTests {
         let query: [UInt8] = Array(repeating: 0, count: 50)
         let target: [UInt8] = Array(repeating: 0, count: 50)
 
-        // CPU 16-bit result
+        // CPU 16-bit result (h0 must be > 0 for extension SW)
         let cpuResult = query.withUnsafeBufferPointer { qBuf in
             target.withUnsafeBufferPointer { tBuf in
-                BandedSW16.align(query: qBuf, target: tBuf, scoring: scoring, w: 100, h0: 0)
+                BandedSW16.align(query: qBuf, target: tBuf, scoring: scoring, w: 100, h0: 1)
             }
         }
 
         // GPU 16-bit result
-        let task = BandedSWTask(query: query, target: target, h0: 0, w: 100, scoring: scoring)
+        let task = BandedSWTask(query: query, target: target, h0: 1, w: 100, scoring: scoring)
         let gpuResults = BandedSWDispatcher.dispatchBatch16(tasks: [task], engine: engine)
 
         #expect(gpuResults.count == 1)
@@ -239,11 +239,11 @@ struct BandedSW8MetalTests {
 
         let cpuResult = query.withUnsafeBufferPointer { qBuf in
             target.withUnsafeBufferPointer { tBuf in
-                BandedSW16.align(query: qBuf, target: tBuf, scoring: scoring, w: 100, h0: 0)
+                BandedSW16.align(query: qBuf, target: tBuf, scoring: scoring, w: 100, h0: 1)
             }
         }
 
-        let task = BandedSWTask(query: query, target: target, h0: 0, w: 100, scoring: scoring)
+        let task = BandedSWTask(query: query, target: target, h0: 1, w: 100, scoring: scoring)
         let gpuResults = BandedSWDispatcher.dispatchBatch16(tasks: [task], engine: engine)
 
         #expect(gpuResults.count == 1)

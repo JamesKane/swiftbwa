@@ -51,14 +51,15 @@ struct AlignmentTests {
         let query: [UInt8] = [0, 1, 2, 3, 0, 1]  // ACGTAC
         let target: [UInt8] = [0, 1, 2, 3, 0, 1]  // ACGTAC
 
+        // h0 must be > 0 for extension SW (bwa-mem2 asserts h0 > 0)
         let result = query.withUnsafeBufferPointer { qBuf in
             target.withUnsafeBufferPointer { tBuf in
-                BandedSWScalar.align(query: qBuf, target: tBuf, scoring: scoring, w: 10, h0: 0)
+                BandedSWScalar.align(query: qBuf, target: tBuf, scoring: scoring, w: 10, h0: 1)
             }
         }
 
-        // Perfect match: score = 6 * 1 (matchScore) = 6
-        #expect(result.score == 6)
+        // h0 = 1, plus 6 matches = 7
+        #expect(result.score == 7)
     }
 
     @Test("BandedSWScalar with mismatch")
@@ -67,14 +68,14 @@ struct AlignmentTests {
         let query: [UInt8] = [0, 1, 2, 3]  // ACGT
         let target: [UInt8] = [0, 1, 0, 3]  // ACAT (G->A mismatch)
 
+        // h0 must be > 0 for extension SW (bwa-mem2 asserts h0 > 0)
         let result = query.withUnsafeBufferPointer { qBuf in
             target.withUnsafeBufferPointer { tBuf in
-                BandedSWScalar.align(query: qBuf, target: tBuf, scoring: scoring, w: 10, h0: 0)
+                BandedSWScalar.align(query: qBuf, target: tBuf, scoring: scoring, w: 10, h0: 1)
             }
         }
 
-        // 3 matches (3) - 1 mismatch penalty (4) = max of local alignments
-        // With local alignment, best is either first 2 bases (score 2) or various combos
+        // h0=1, 3 matches (3) - 1 mismatch (-4) = best segment varies
         #expect(result.score > 0)
     }
 
@@ -103,7 +104,7 @@ struct AlignmentTests {
 
         let result = query.withUnsafeBufferPointer { qBuf in
             target.withUnsafeBufferPointer { tBuf in
-                BandedSW8.align(query: qBuf, target: tBuf, scoring: scoring, w: 10, h0: 0)
+                BandedSW8.align(query: qBuf, target: tBuf, scoring: scoring, w: 10, h0: 1)
             }
         }
 
@@ -119,17 +120,18 @@ struct AlignmentTests {
 
         let scalarResult = query.withUnsafeBufferPointer { qBuf in
             target.withUnsafeBufferPointer { tBuf in
-                BandedSWScalar.align(query: qBuf, target: tBuf, scoring: scoring, w: 10, h0: 0)
+                BandedSWScalar.align(query: qBuf, target: tBuf, scoring: scoring, w: 10, h0: 1)
             }
         }
 
         let simdResult = query.withUnsafeBufferPointer { qBuf in
             target.withUnsafeBufferPointer { tBuf in
-                BandedSW16.align(query: qBuf, target: tBuf, scoring: scoring, w: 10, h0: 0)
+                BandedSW16.align(query: qBuf, target: tBuf, scoring: scoring, w: 10, h0: 1)
             }
         }
 
-        #expect(scalarResult.score == 8)
+        // h0=1 + 8 matches = 9
+        #expect(scalarResult.score == 9)
         #expect(simdResult.score == scalarResult.score)
     }
 
@@ -143,13 +145,13 @@ struct AlignmentTests {
 
         let scalar = query.withUnsafeBufferPointer { qBuf in
             target.withUnsafeBufferPointer { tBuf in
-                BandedSWScalar.align(query: qBuf, target: tBuf, scoring: scoring, w: 10, h0: 0)
+                BandedSWScalar.align(query: qBuf, target: tBuf, scoring: scoring, w: 10, h0: 1)
             }
         }
 
         let simd16 = query.withUnsafeBufferPointer { qBuf in
             target.withUnsafeBufferPointer { tBuf in
-                BandedSW16.align(query: qBuf, target: tBuf, scoring: scoring, w: 10, h0: 0)
+                BandedSW16.align(query: qBuf, target: tBuf, scoring: scoring, w: 10, h0: 1)
             }
         }
 
@@ -189,13 +191,13 @@ struct AlignmentTests {
 
         let scalar = query.withUnsafeBufferPointer { qBuf in
             target.withUnsafeBufferPointer { tBuf in
-                BandedSWScalar.align(query: qBuf, target: tBuf, scoring: scoring, w: 10, h0: 0)
+                BandedSWScalar.align(query: qBuf, target: tBuf, scoring: scoring, w: 10, h0: 1)
             }
         }
 
         let simd8 = query.withUnsafeBufferPointer { qBuf in
             target.withUnsafeBufferPointer { tBuf in
-                BandedSW8.align(query: qBuf, target: tBuf, scoring: scoring, w: 10, h0: 0)
+                BandedSW8.align(query: qBuf, target: tBuf, scoring: scoring, w: 10, h0: 1)
             }
         }
 
@@ -212,19 +214,19 @@ struct AlignmentTests {
 
         let scalar = query.withUnsafeBufferPointer { qBuf in
             target.withUnsafeBufferPointer { tBuf in
-                BandedSWScalar.align(query: qBuf, target: tBuf, scoring: scoring, w: 10, h0: 0)
+                BandedSWScalar.align(query: qBuf, target: tBuf, scoring: scoring, w: 10, h0: 1)
             }
         }
 
         let simd16 = query.withUnsafeBufferPointer { qBuf in
             target.withUnsafeBufferPointer { tBuf in
-                BandedSW16.align(query: qBuf, target: tBuf, scoring: scoring, w: 10, h0: 0)
+                BandedSW16.align(query: qBuf, target: tBuf, scoring: scoring, w: 10, h0: 1)
             }
         }
 
         let simd8 = query.withUnsafeBufferPointer { qBuf in
             target.withUnsafeBufferPointer { tBuf in
-                BandedSW8.align(query: qBuf, target: tBuf, scoring: scoring, w: 10, h0: 0)
+                BandedSW8.align(query: qBuf, target: tBuf, scoring: scoring, w: 10, h0: 1)
             }
         }
 
@@ -247,12 +249,12 @@ struct AlignmentTests {
 
         let result = query.withUnsafeBufferPointer { qBuf in
             target.withUnsafeBufferPointer { tBuf in
-                BandedSW16.align(query: qBuf, target: tBuf, scoring: scoring, w: 5, h0: 0)
+                BandedSW16.align(query: qBuf, target: tBuf, scoring: scoring, w: 5, h0: 1)
             }
         }
 
-        // Score should be from the matching prefix (5 matches = 5)
-        #expect(result.score == 5)
+        // Score should be from the matching prefix (h0=1 + 5 matches = 6)
+        #expect(result.score == 6)
         // Z-dropoff should have stopped extension early, so targetEnd should be
         // well short of the full 105
         #expect(result.targetEnd < 50)
@@ -270,12 +272,13 @@ struct AlignmentTests {
 
         let result = query.withUnsafeBufferPointer { qBuf in
             target.withUnsafeBufferPointer { tBuf in
-                BandedSW8.align(query: qBuf, target: tBuf, scoring: scoring, w: 5, h0: 0)
+                BandedSW8.align(query: qBuf, target: tBuf, scoring: scoring, w: 5, h0: 1)
             }
         }
 
         #expect(result != nil)
-        #expect(result!.score == 5)
+        // h0=1 + 5 matches = 6
+        #expect(result!.score == 6)
         #expect(result!.targetEnd < 50)
     }
 

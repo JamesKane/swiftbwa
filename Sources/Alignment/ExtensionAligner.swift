@@ -128,7 +128,20 @@ public struct ExtensionAligner: Sendable {
 
         let readLen = Int32(read.length)
         let bandWidth = scoring.bandWidth
-        let mat = scoringMatrix
+        let lQuery = Int(readLen)
+
+        // Compute chain-level reference range (bwa-mem2 bwamem.cpp:2146-2157)
+        var rmax0: Int64 = Int64.max
+        var rmax1: Int64 = 0
+        for i in 0..<soa.count {
+            let t = (qbeg: soa.qbegs[i], len: soa.lens[i], rbeg: soa.rbegs[i])
+            let b = t.rbeg - Int64(Int(t.qbeg) + calMaxGap(queryLen: Int(t.qbeg), scoring: scoring))
+            let remaining = lQuery - Int(t.qbeg) - Int(t.len)
+            let e = t.rbeg + Int64(t.len) + Int64(remaining + calMaxGap(queryLen: remaining, scoring: scoring))
+            if b < rmax0 { rmax0 = b }
+            if e > rmax1 { rmax1 = e }
+        }
+        if rmax0 < 0 { rmax0 = 0 }
 
         let tmp = max(
             scoring.matchScore + scoring.mismatchPenalty,
@@ -136,20 +149,29 @@ public struct ExtensionAligner: Sendable {
                 scoring.gapOpenPenaltyDeletion + scoring.gapExtendPenaltyDeletion)
         )
 
-        var coveredRegions: [(qb: Int32, qe: Int32)] = []
+        // Sort seeds by score descending (bwa-mem2 bwamem.cpp:2189-2207)
+        // Highest-scoring (longest) seeds get extended first, matching bwa-mem2's
+        // `srt[i] = score<<32 | i` with reverse iteration.
+        var seedOrder = Array(0..<soa.count)
+        if soa.count > 1 {
+            seedOrder.sort { soa.scores[$0] > soa.scores[$1] }
+        }
 
-        for seedIdx in 0..<soa.count {
-            let seedQbeg = soa.qbegs[seedIdx]
-            let seedLen = soa.lens[seedIdx]
-            let seedRbeg = soa.rbegs[seedIdx]
-            let seedScore = soa.scores[seedIdx]
+        for sortedIdx in seedOrder {
+            let seedQbeg = soa.qbegs[sortedIdx]
+            let seedLen = soa.lens[sortedIdx]
+            let seedRbeg = soa.rbegs[sortedIdx]
+            let seedScore = soa.scores[sortedIdx]
 
             let seedQEnd = seedQbeg + seedLen
             let seedREnd = seedRbeg + Int64(seedLen)
 
+            // Covered-region check: query containment
+            // Seed ordering by score (above) ensures longest (best-scoring) seeds
+            // get extended first, matching bwa-mem2's seed processing order.
             var coveringRegIdx = -1
-            for (idx, cov) in coveredRegions.enumerated() {
-                if seedQbeg >= cov.qb && seedQEnd <= cov.qe {
+            for (idx, reg) in regions.enumerated() {
+                if seedQbeg >= reg.qb && seedQEnd <= reg.qe {
                     coveringRegIdx = idx
                     break
                 }
@@ -176,7 +198,7 @@ public struct ExtensionAligner: Sendable {
 
             var accumulatedH0 = seedScore
 
-            // --- Left extension ---
+            // --- Left extension (with band retry, MAX_BAND_TRY=2) ---
             var leftScore: Int32 = 0
             var leftQLen: Int32 = 0
             var leftTLen: Int32 = 0
@@ -188,7 +210,8 @@ public struct ExtensionAligner: Sendable {
                     queryBuf[i] = read.bases[queryLeftLen - 1 - i]
                 }
 
-                let targetLeftLen = min(queryLeftLen + Int(bandWidth), Int(seedRbeg))
+                // Target length from chain rmax (bwa-mem2 bwamem.cpp:2281)
+                let targetLeftLen = min(Int(seedRbeg - rmax0), 10000)
                 if targetLeftLen > 0 {
                     let targetStart = seedRbeg - Int64(targetLeftLen)
                     let actualTargetLen = getReference(targetStart, targetLeftLen, targetBuf)
@@ -202,28 +225,43 @@ public struct ExtensionAligner: Sendable {
 
                     let qBuf = UnsafeBufferPointer(start: queryBuf, count: queryLeftLen)
                     let tBuf = UnsafeBufferPointer(start: targetBuf, count: actualTargetLen)
-                    let result = bandedSWExtend(
-                        query: qBuf, target: tBuf,
-                        scoring: scoring, w: bandWidth,
-                        h0: seedScore, scoringMatrix: mat
-                    )
 
-                    accumulatedH0 = result.score
+                    // Band retry loop (bwa-mem2 bwamem.cpp:2473-2527)
+                    var w = bandWidth
+                    var prevScore = seedScore
+                    var leftResult = SWResult()
+                    for tryIdx: Int32 in 0..<2 {
+                        leftResult = BandedSWScalar.align(
+                            query: qBuf, target: tBuf,
+                            scoring: scoring, w: w, h0: seedScore,
+                            endBonus: scoring.penClip5
+                        )
+                        if leftResult.score == prevScore
+                            || leftResult.maxOff < (w >> 1) + (w >> 2)
+                            || tryIdx == 1 {
+                            break
+                        }
+                        prevScore = leftResult.score
+                        w = w << 1
+                    }
 
-                    if result.globalScore <= 0
-                        || result.globalScore <= result.score - scoring.penClip5 {
-                        leftQLen = result.queryEnd
-                        leftTLen = result.targetEnd
-                        leftScore = result.score
+                    accumulatedH0 = leftResult.score
+                    reg.w = max(reg.w, w)
+
+                    if leftResult.globalScore <= 0
+                        || leftResult.globalScore <= leftResult.score - scoring.penClip5 {
+                        leftQLen = leftResult.queryEnd
+                        leftTLen = leftResult.targetEnd
+                        leftScore = leftResult.score
                     } else {
                         leftQLen = seedQbeg
-                        leftTLen = result.globalTargetEnd
-                        leftScore = result.globalScore
+                        leftTLen = leftResult.globalTargetEnd
+                        leftScore = leftResult.globalScore
                     }
                 }
             }
 
-            // --- Right extension ---
+            // --- Right extension (with band retry, MAX_BAND_TRY=2) ---
             var rightScore: Int32 = 0
             var rightQLen: Int32 = 0
             var rightTLen: Int32 = 0
@@ -235,27 +273,44 @@ public struct ExtensionAligner: Sendable {
                     queryBuf[i] = read.bases[Int(seedQEnd) + i]
                 }
 
-                let targetRightLen = min(Int(readLen - seedQEnd) + Int(bandWidth), 10000)
+                // Target length from chain rmax (bwa-mem2 bwamem.cpp:2357)
+                let targetRightLen = min(Int(rmax1 - seedREnd), 10000)
                 if targetRightLen > 0 {
                     let actualTargetLen = getReference(seedREnd, targetRightLen, targetBuf)
 
                     let qBuf = UnsafeBufferPointer(start: queryBuf, count: queryRightLen)
                     let tBuf = UnsafeBufferPointer(start: targetBuf, count: actualTargetLen)
-                    let result = bandedSWExtend(
-                        query: qBuf, target: tBuf,
-                        scoring: scoring, w: bandWidth,
-                        h0: accumulatedH0, scoringMatrix: mat
-                    )
 
-                    if result.globalScore <= 0
-                        || result.globalScore <= result.score - scoring.penClip3 {
-                        rightQLen = result.queryEnd
-                        rightTLen = result.targetEnd
-                        rightScore = result.score
+                    // Band retry loop (bwa-mem2 bwamem.cpp:2605-2660)
+                    var w = bandWidth
+                    var prevScore = accumulatedH0
+                    var rightResult = SWResult()
+                    for tryIdx: Int32 in 0..<2 {
+                        rightResult = BandedSWScalar.align(
+                            query: qBuf, target: tBuf,
+                            scoring: scoring, w: w, h0: accumulatedH0,
+                            endBonus: scoring.penClip3
+                        )
+                        if rightResult.score == prevScore
+                            || rightResult.maxOff < (w >> 1) + (w >> 2)
+                            || tryIdx == 1 {
+                            break
+                        }
+                        prevScore = rightResult.score
+                        w = w << 1
+                    }
+
+                    reg.w = max(reg.w, w)
+
+                    if rightResult.globalScore <= 0
+                        || rightResult.globalScore <= rightResult.score - scoring.penClip3 {
+                        rightQLen = rightResult.queryEnd
+                        rightTLen = rightResult.targetEnd
+                        rightScore = rightResult.score
                     } else {
                         rightQLen = readLen - seedQEnd
-                        rightTLen = result.globalTargetEnd
-                        rightScore = result.globalScore
+                        rightTLen = rightResult.globalTargetEnd
+                        rightScore = rightResult.globalScore
                     }
                 }
             }
@@ -277,7 +332,6 @@ public struct ExtensionAligner: Sendable {
 
             reg.seedCov = computeSeedCov(seeds: soa, qb: reg.qb, qe: reg.qe, rb: reg.rb, re: reg.re)
 
-            coveredRegions.append((qb: reg.qb, qe: reg.qe))
             regions.append(reg)
         }
 
@@ -599,25 +653,4 @@ public struct ExtensionAligner: Sendable {
         return regions
     }
 
-    /// Tiered SIMD Smith-Waterman extension: try 8-bit SIMD first, fall back to 16-bit.
-    /// Matches bwa-mem2's ksw_extend2() dispatch: 8-bit → 16-bit SIMD.
-    private static func bandedSWExtend(
-        query: UnsafeBufferPointer<UInt8>,
-        target: UnsafeBufferPointer<UInt8>,
-        scoring: ScoringParameters,
-        w: Int32,
-        h0: Int32,
-        scoringMatrix: [Int8]
-    ) -> SWResult {
-        if let result = BandedSW8.align(
-            query: query, target: target, scoring: scoring, w: w, h0: h0,
-            scoringMatrix: scoringMatrix
-        ) {
-            return result
-        }
-        return BandedSW16.align(
-            query: query, target: target, scoring: scoring, w: w, h0: h0,
-            scoringMatrix: scoringMatrix
-        )
-    }
 }

@@ -79,7 +79,6 @@ kernel void banded_sw8(
     uchar maxScore = uchar(clamp(int(h0), 0, 255));
     int maxI = -1;
     int maxJ = -1;
-    int maxIE = -1;
     int gScore = -1;
     int gTle = -1;
     int maxOff = 0;
@@ -91,11 +90,13 @@ kernel void banded_sw8(
         // Process each query position
         uchar hDiag = (i == 0) ? uchar(clamp(max(0, int(h0)), 0, 255)) : 0;
         uchar f = 0;
-        uchar rowMax = 0;
+        int rowMax = 0;
+        int rowMaxJ = -1;
 
         for (int j = 0; j < qlen; j++) {
             // Diagonal + profile - bias
-            int hNew = int(hDiag) + int(prof[j]) - int(bias);
+            // Zero out when hDiag == 0 to prevent alignment restart (bwa-mem2: M = M? M + q[j] : 0)
+            int hNew = (hDiag != 0) ? int(hDiag) + int(prof[j]) - int(bias) : 0;
             if (hNew < 0) hNew = 0;
 
             uchar hPrev = H[j];
@@ -125,17 +126,11 @@ kernel void banded_sw8(
             int fOpen = max(hNew, int(oDel)) - int(oDel);
             f = uchar(max(max(fOpen, int(f)), int(eDel)) - int(eDel));
 
-            if (uchar(hNew) > rowMax) rowMax = uchar(hNew);
-
-            if (uchar(hNew) > maxScore) {
-                maxScore = uchar(hNew);
-                maxI = i;
-                maxJ = j;
-                maxIE = i;
-                int off = abs(maxI - maxJ);
-                if (off > maxOff) maxOff = off;
-            }
+            if (hNew > rowMax) { rowMax = hNew; rowMaxJ = j; }
         }
+
+        // Early termination when row max is 0 (bwa-mem2 ksw.cpp:511)
+        if (rowMax == 0) break;
 
         // Global score (alignment consuming entire query)
         int hAtEnd = int(H[qlen - 1]);
@@ -144,9 +139,21 @@ kernel void banded_sw8(
             gTle = i;
         }
 
-        // Z-dropoff
-        if (int(maxScore) - int(rowMax) > int(zDrop) && i - maxIE > int(w)) {
-            break;
+        // Track overall maximum and z-drop (bwa-mem2 ksw.cpp:512-520)
+        if (rowMax > int(maxScore)) {
+            maxScore = uchar(rowMax);
+            maxI = i;
+            maxJ = rowMaxJ;
+            int off = abs(rowMaxJ - i);
+            if (off > maxOff) maxOff = off;
+        } else if (int(zDrop) > 0) {
+            int deltaI = i - maxI;
+            int deltaJ = rowMaxJ - maxJ;
+            if (deltaI > deltaJ) {
+                if (int(maxScore) - rowMax - (deltaI - deltaJ) * int(eDel) > int(zDrop)) break;
+            } else {
+                if (int(maxScore) - rowMax - (deltaJ - deltaI) * int(eIns) > int(zDrop)) break;
+            }
         }
     }
 

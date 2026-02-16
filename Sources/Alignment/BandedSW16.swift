@@ -80,9 +80,9 @@ public struct BandedSW16: Sendable {
         var maxScore: Int32 = h0
         var maxI: Int32 = -1
         var maxJ: Int32 = -1
-        var maxIE: Int32 = -1
         var gScore: Int32 = -1
         var gTle: Int32 = -1
+        var maxOff: Int32 = 0
 
         for i in 0..<tlen {
             let targetBase = Int(target[i])
@@ -101,6 +101,9 @@ public struct BandedSW16: Sendable {
                 // Diagonal contribution
                 var hNew = vH &+ prof[s]
                 hNew = hNew.replacing(with: zero, where: hNew .< zero)
+                // Zero out diagonal contribution where vH was 0 (prevents alignment restart).
+                // Matches bwa-mem2's ksw_extend2: M = M? M + q[j] : 0
+                hNew = hNew.replacing(with: zero, where: vH .== zero)
 
                 // Save H_prev[s] and set vH for next stripe's diagonal
                 let hPrev = H[s]
@@ -137,25 +140,44 @@ public struct BandedSW16: Sendable {
                 corrF = corrF.replacing(with: zero, where: corrF .< zero)
             }
 
-            // Tracking pass: row max, overall max, global score, max offset
+            // Tracking pass: row max (and its column), overflow check
             var rowMax: Int32 = 0
+            var rowMaxJ: Int32 = -1
             for s in 0..<stripeCount {
                 let localMax = H[s].max()
                 let localMax32 = Int32(localMax)
-                if localMax32 > rowMax { rowMax = localMax32 }
-                if localMax32 > maxScore {
-                    maxScore = localMax32
-                    maxI = Int32(i)
-                    maxIE = Int32(i)
+                if localMax32 > rowMax {
+                    rowMax = localMax32
                     for lane in 0..<lanes {
                         if H[s][lane] == localMax {
                             let j = s + lane * stripeCount
                             if j < qlen {
-                                maxJ = Int32(j)
+                                rowMaxJ = Int32(j)
                                 break
                             }
                         }
                     }
+                }
+            }
+
+            // Early termination when row max is 0 (bwa-mem2 ksw.cpp:511)
+            if rowMax == 0 { break }
+
+            // Track overall maximum and z-drop
+            if rowMax > maxScore {
+                maxScore = rowMax
+                maxI = Int32(i)
+                maxJ = rowMaxJ
+                let off = abs(rowMaxJ - Int32(i))
+                if off > maxOff { maxOff = off }
+            } else if zDrop > 0 {
+                // Z-drop: gap-cost-adjusted formula (bwa-mem2 ksw.cpp:515-520)
+                let deltaI = Int32(i) - maxI
+                let deltaJ = rowMaxJ - maxJ
+                if deltaI > deltaJ {
+                    if maxScore - rowMax - (deltaI - deltaJ) * eDel > zDrop { break }
+                } else {
+                    if maxScore - rowMax - (deltaJ - deltaI) * eIns > zDrop { break }
                 }
             }
 
@@ -168,11 +190,6 @@ public struct BandedSW16: Sendable {
                 gScore = hAtEnd
                 gTle = Int32(i)
             }
-
-            // Z-dropoff: terminate if score has dropped too far past the peak
-            if maxScore - rowMax > zDrop && Int32(i) - maxIE > w {
-                break
-            }
         }
 
         return SWResult(
@@ -180,7 +197,8 @@ public struct BandedSW16: Sendable {
             queryEnd: maxJ + 1,
             targetEnd: maxI + 1,
             globalTargetEnd: gTle + 1,
-            globalScore: gScore
+            globalScore: gScore,
+            maxOff: maxOff
         )
     }
 

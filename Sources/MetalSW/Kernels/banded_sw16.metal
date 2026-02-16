@@ -75,7 +75,6 @@ kernel void banded_sw16(
     int maxScore = int(h0);
     int maxI = -1;
     int maxJ = -1;
-    int maxIE = -1;
     int gScore = -1;
     int gTle = -1;
     int maxOff = 0;
@@ -87,10 +86,12 @@ kernel void banded_sw16(
         short hDiag = (i == 0) ? short(clamp(max(0, int(h0)), 0, 32767)) : 0;
         short f = 0;
         int rowMax = 0;
+        int rowMaxJ = -1;
 
         for (int j = 0; j < qlen; j++) {
             // Diagonal + profile
-            int hNew = int(hDiag) + int(prof[j]);
+            // Zero out when hDiag == 0 to prevent alignment restart (bwa-mem2: M = M? M + q[j] : 0)
+            int hNew = (hDiag != 0) ? int(hDiag) + int(prof[j]) : 0;
             if (hNew < 0) hNew = 0;
 
             short hPrev = H[j];
@@ -115,17 +116,11 @@ kernel void banded_sw16(
             if (fVal < 0) fVal = 0;
             f = short(clamp(fVal, 0, 32767));
 
-            if (hNew > rowMax) rowMax = hNew;
-
-            if (hNew > maxScore) {
-                maxScore = hNew;
-                maxI = i;
-                maxJ = j;
-                maxIE = i;
-                int off = abs(maxI - maxJ);
-                if (off > maxOff) maxOff = off;
-            }
+            if (hNew > rowMax) { rowMax = hNew; rowMaxJ = j; }
         }
+
+        // Early termination when row max is 0 (bwa-mem2 ksw.cpp:511)
+        if (rowMax == 0) break;
 
         // Global score
         int hAtEnd = int(H[qlen - 1]);
@@ -134,9 +129,21 @@ kernel void banded_sw16(
             gTle = i;
         }
 
-        // Z-dropoff
-        if (maxScore - rowMax > int(zDrop) && i - maxIE > int(w)) {
-            break;
+        // Track overall maximum and z-drop (bwa-mem2 ksw.cpp:512-520)
+        if (rowMax > maxScore) {
+            maxScore = rowMax;
+            maxI = i;
+            maxJ = rowMaxJ;
+            int off = abs(rowMaxJ - i);
+            if (off > maxOff) maxOff = off;
+        } else if (int(zDrop) > 0) {
+            int deltaI = i - maxI;
+            int deltaJ = rowMaxJ - maxJ;
+            if (deltaI > deltaJ) {
+                if (maxScore - rowMax - (deltaI - deltaJ) * int(eDel) > int(zDrop)) break;
+            } else {
+                if (maxScore - rowMax - (deltaJ - deltaI) * int(eIns) > int(zDrop)) break;
+            }
         }
     }
 

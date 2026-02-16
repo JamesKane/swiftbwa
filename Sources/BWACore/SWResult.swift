@@ -10,13 +10,16 @@ public struct SWResult: Sendable, Equatable {
     public var globalTargetEnd: Int32
     /// Global score (alignment score when reaching end of query)
     public var globalScore: Int32
+    /// Maximum diagonal offset |maxJ - maxI| at best score position
+    public var maxOff: Int32
 
     public init(score: Int32 = 0, queryEnd: Int32 = 0, targetEnd: Int32 = 0,
-                globalTargetEnd: Int32 = 0, globalScore: Int32 = 0) {
+                globalTargetEnd: Int32 = 0, globalScore: Int32 = 0, maxOff: Int32 = 0) {
         self.score = score
         self.queryEnd = queryEnd
         self.targetEnd = targetEnd
         self.globalTargetEnd = globalTargetEnd
         self.globalScore = globalScore
+        self.maxOff = maxOff
     }
 }
